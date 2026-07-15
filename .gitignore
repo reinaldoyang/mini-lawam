@@ -249,3 +249,4 @@ tmp/
 *.log
 qwen3_weights
 .codex_*
+weights/

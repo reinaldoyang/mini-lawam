@@ -12,9 +12,6 @@ from .utils.lam_decoder import LAMDecoder_v2, StatePredictor
 from .utils.modules import PatchEmbed
 
 
-
-
-
 class LatentLAMModel(nn.Module):
     """LAM model with a shared vision encoder, latent action bottleneck, and state decoder."""
 

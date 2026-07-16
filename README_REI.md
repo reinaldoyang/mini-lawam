@@ -3,6 +3,7 @@ REI LAWAM Documentation
 ## Installation
 Follow the official README for installation and setup
 
+Only do this step if your application for DINOv3 on huggingface is pending or not accepted!
 If you don't have DINOv3 access, you can apply in the facebook webpage, and then use this converter to convert to huggingface format, note that this doesn't guarantee that it will become the same as the original DINOv3 from huggingface
 ```bash
 cd /home/iclu200/reinaldoyang/LaWAM
@@ -10,6 +11,17 @@ CUDA_VISIBLE_DEVICES="" /home/iclu200/miniconda3/envs/lawam/bin/python \
   scripts/dinov3_convert/convert_local.py \
   --pth weights/dinov3-vitb16-pretrain-lvd1689m/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth \
   --save-dir weights/dinov3-vitb16-pretrain-lvd1689m
+```
+
+This will convert pth file to a huggingface folder, dir: weights/dinov3-vitb16-pretrain-lvd1689m
+
+## Smoke Test
+```bash
+cd /home/ovxuser02@itriovx.local/reinaldoyang/lawam_rei
+CUDA_VISIBLE_DEVICES=0 /home/ovxuser02@itriovx.local/miniconda3/envs/lawam/bin/python \
+  -m mini_lawam.train \
+  --hdf5 /home/ovxuser02@itriovx.local/reinaldoyang/dataset/multi_egg_83ep.hdf5 \
+  --steps 300 --eval-every 100 --log-every 20
 
 ```
 

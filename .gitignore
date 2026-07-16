@@ -250,3 +250,5 @@ tmp/
 qwen3_weights
 .codex_*
 weights/
+*.hdf5
+*.pth

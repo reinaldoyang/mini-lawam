@@ -43,14 +43,18 @@ deployable: `o_t → u_t → ẑ → û_T → action chunk`.
 |---|---|
 | `mini_lawam/model.py` | `MiniLaWAMConfig`, `ConvPrior` (u_t→ẑ), `MLPActionHead`, `MiniLaWAM` (frozen LAM + prior + head, `forward()` train, `predict()` infer) |
 | `mini_lawam/data.py` | `MiniLaWAMDataset` (HDF5 pair loader), `build_index`, `compute_action_stats`, `split_o_t_o_T` |
-| `mini_lawam/train.py` | single-GPU AdamW loop (trains prior+head only), cosine LR, val + best-checkpoint saving |
+| `mini_lawam/train.py` | single-GPU AdamW loop (trains prior+head only), cosine LR, val + best-checkpoint saving. **Logging:** always writes a CSV (`--csv-log`); optional wandb (`--wandb`, online by default, fails fast if not `wandb login`'d; `--wandb-offline` to skip login). |
+| `mini_lawam/rollout.py` | **Deployment adapter.** `MiniLaWAMPolicy(ckpt).act(frame_hwc_u8) -> [H,4] physical action chunk` (venue-independent core, stops at the 4D action; venue-specific command mapping left as a `>>> SEAM`). Also a CLI: `--mode single` (eyeball one frame) / `--mode eval` (batched train-vs-val error). |
+| `mini_lawam/plot_log.py` | Offline loss-curve plotter — reads `train_log.csv`, writes `train_curves.png` (train vs val, 4 losses). No wandb needed. |
 | `mini_lawam/__init__.py` | exports `MiniLaWAM`, `MiniLaWAMConfig` |
 
 ## 4. Data (the target dataset)
 
 Real-world **UR7e** teleop, collected by `~/reinaldoyang/ur7e_ramen_il/scripts/real_world/record_real.py`.
-File: `dataset/multi_egg.hdf5` (currently **~83 demos**; pick-and-place location
-varies across demos). robomimic/IsaacLab HDF5 layout:
+File (this session): `/home/ovxuser02@itriovx.local/reinaldoyang/dataset/multi_egg_83ep.hdf5`
+(**83 demos**, ~11,860 usable pairs at stride 2; pick-and-place location varies across
+demos). NB: the full file is ~4.17 GB — a truncated copy will fail with an h5py
+`truncated file` EOF error, so verify size after transferring. robomimic/IsaacLab HDF5 layout:
 
 ```
 data/demo_k/obs/table_cam      (T,168,224,3) uint8   # fixed external RealSense  <-- USED (primary view)
@@ -101,27 +105,42 @@ double-normalize.
 
 ## 6. Environment & how to run
 
-- Python: `/home/iclu200/miniconda3/envs/lawam/bin/python` (conda env `lawam`).
-- **GPU: RTX 5090 (sm_120)** → requires **torch 2.7.1 + cu128** (2.6/cu124 has no
-  sm_120 kernels; upgraded already). torchvision 0.22.1.
+> **Machine note:** this session ran on host `ove02`, repo at
+> `/home/ovxuser02@itriovx.local/reinaldoyang/lawam_rei`. Paths below are for that
+> box. Older revisions of this doc referenced an `iclu200` machine — ignore those.
+> **When you move to another PC (e.g. the 5090 inference box), re-derive every
+> absolute path** (python, repo, dataset, LAM ckpt) for that machine.
+
+- Python: `/home/ovxuser02@itriovx.local/miniconda3/envs/lawam/bin/python` (conda env `lawam`).
+- **GPU: train on L40S (48 GB, big batches); infer on RTX 5090 (sm_120, low latency).**
+  The 5090 requires **torch 2.7.1 + cu128** (2.6/cu124 has no sm_120 kernels).
+  torchvision 0.22.1. Weights are fp32 → outputs are identical across GPUs; only
+  latency differs. Checkpoint is fully portable (state_dicts + numpy stats).
 - Always run **as a module from the repo root** (imports `latent_action_model`):
   ```bash
-  cd /home/iclu200/reinaldoyang/LaWAM
-  CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_lawam.train \
-      --hdf5 dataset/multi_egg.hdf5 --steps 300 --eval-every 100 --log-every 20
+  cd /home/ovxuser02@itriovx.local/reinaldoyang/lawam_rei
+  CUDA_VISIBLE_DEVICES=0 /home/ovxuser02@itriovx.local/miniconda3/envs/lawam/bin/python \
+      -m mini_lawam.train \
+      --hdf5 /home/ovxuser02@itriovx.local/reinaldoyang/dataset/multi_egg_83ep.hdf5 \
+      --steps 20000 --eval-every 500 --log-every 100 --wandb --run-name multi_egg_full
   ```
 - Model shape smoke test: `python -m mini_lawam.model`
 - Checkpoint saved to `results/mini_lawam/ckpt.pt` = `{prior, action_head, cfg,
-  action_mean, action_std, step}`.
+  action_mean, action_std, step}`. **Only best-val is kept and overwritten in place**
+  — copy it aside before a new run if you want to preserve it.
 
-### Frozen-LAM dependency (must be present)
-- LAM checkpoint + yaml: `latent_action_model/logs/dino_large_vae/lam_release/`
-  (`checkpoints/pytorch_model.pt`, `dino_large_vae.yaml`).
-- The yaml's `model.vision_model_id` must point at a **HF-format DINOv3 ViT-B/16**.
-  The gated HF repo (`facebook/dinov3-vitb16-pretrain-lvd1689m`) was **converted
-  locally** from the `.pth` into `weights/dinov3-vitb16-pretrain-lvd1689m/` via
-  `scripts/dinov3_convert/convert_local.py` (validated against HF reference outputs).
-  See the repo-root `summary.md` for how to regenerate or revert to official weights.
+### Frozen-LAM dependency (must be present) — SET UP THIS SESSION
+On a fresh machine you must recreate all three of these (they are NOT auto-downloaded):
+1. **Converted DINOv3 weights** — the gated HF repo `facebook/dinov3-vitb16-pretrain-lvd1689m`
+   is 403 without access, so it was **converted locally** from the `.pth` into
+   `weights/dinov3-vitb16-pretrain-lvd1689m/` via `scripts/dinov3_convert/convert_local.py`
+   (validated against HF reference outputs). See repo-root `summary.md` / `README_REI.md`.
+2. **LAM checkpoint + yaml** at `latent_action_model/logs/dino_large_vae/lam_release/`:
+   `checkpoints/pytorch_model.pt` and `dino_large_vae.yaml` (copied in manually).
+3. **yaml `model.vision_model_id`** must be the ABSOLUTE path to the converted weights,
+   NOT the HF repo id (else it hits the gated repo and 403s). Currently set to:
+   `/home/ovxuser02@itriovx.local/reinaldoyang/lawam_rei/weights/dinov3-vitb16-pretrain-lvd1689m`.
+   **On the new PC, update this line to that machine's path.**
 
 ## 7. Stage-1 validation status (already done)
 
@@ -137,19 +156,52 @@ more of the frame.
 
 ## 8. Current status & next steps
 
-- **Status:** scaffold complete, **not yet trained** (only the shape smoke test path
-  exists). Committed to git (`aa64811`).
-- **Next:** run the 300-step training smoke, confirm `loss_act`/`loss_distill` fall,
-  then a full run.
-- **Deployment (later):** write a UR7e rollout adapter — call `model.predict(o_t)`,
-  un-normalize (`pred*std + mean`), convert to `servoL` delta, threshold gripper at 0.
+- **Status: TRAINED.** Full 20k-step run complete; best-val checkpoint at
+  `results/mini_lawam/ckpt.pt` (step 19500). Trains only prior+head (~4.07M params).
+- **Offline eval on real data** (`rollout.py --mode eval`, 200 frames/split, split
+  matches train.py): **val pos err ≈ 1.98 cm, train ≈ 1.42 cm; gripper sign ≈ 99%.**
+  Small train→val gap → not badly overfitting. Passes the "did it learn" gate.
+  ⚠️ Caveats: val split is **random-frame (leaky)** so ~2 cm is optimistic; and this
+  is **open-loop offline** (doesn't capture compounding drift). Real verdict needs a
+  held-out-demo split + closed-loop eval.
+- **Loss curves:** `results/mini_lawam/train_log.csv`; plot with `python -m mini_lawam.plot_log`.
 
-## 9. Known upgrade paths (if v0 underperforms)
+## 9. Deployment / inference (rollout adapter)
+
+`rollout.py` is the **venue-independent core**: `frame -> preprocess -> predict ->
+un-normalize -> [H=32, 4] action chunk in physical units [eef_pos_base(3), gripper(1)]`.
+It intentionally **stops at the 4D action** — the venue-specific part is a `>>> SEAM`.
+
+```python
+from mini_lawam.rollout import MiniLaWAMPolicy
+policy = MiniLaWAMPolicy("results/mini_lawam/ckpt.pt", device="cuda")
+chunk = policy.act(frame_hwc_uint8)   # np [32,4], physical units
+```
+
+**What you still implement per venue (the SEAM):**
+- **target → command:** real UR7e: `delta = pred_eef_pos_base − current_TCP` → `servoL`.
+  Sim: set the controller target pose (frame/interface differ from real). Not built yet.
+- **gripper:** threshold channel 3 at 0 (`<0` open, `>0` close).
+- **execution cadence (chunk = 32 steps = 1.6 s @ 20 Hz):** do NOT execute the whole
+  chunk open-loop. Use **receding horizon** — execute first ~8–16 steps, then re-plan
+  from a fresh frame. Absolute-pose targets + deterministic MSE head make frequent
+  re-planning safe (no drift accumulation, no mode-jumping). Bootstrap with full-chunk
+  to get the loop running, then reduce. **Execute at 20 Hz** to match the LaWM's
+  trained τ=1.6 s (different rate ⇒ physically-wrong motion scale).
+- **obs source:** grab `table_cam`, feed to `act()` (it resizes to 256 + ImageNet-norm
+  internally, matching training). `wrist_cam` is NOT used (moves with arm; §5 limitation).
+
+**Recommended sequence:** sim closed-loop first (safe, sweep cadence k), THEN real UR7e.
+Note: a policy trained on REAL RealSense frames won't transfer to SIM renders (DINO
+domain gap) — sim validates the *pipeline/method*, real needs a real-data checkpoint.
+
+## 10. Known upgrade paths (if v0 underperforms)
 
 - ConvPrior → **attention-query prior** (QFormer-style, mirrors repo's
   `VLMToLAMQFormer`) if `loss_distill` plateaus high — global token relations suit
   the varying-location task.
 - MLP head → **flow-matching head** (adapt repo's `ConditionalFlowMatchingHead`,
   drop VLM/CFG/physical-time) if rollouts show multimodal averaging.
-- Random-frame val split → **held-out-demo split** to measure location generalization.
+- Random-frame val split → **held-out-demo split** to measure location generalization
+  (honest generalization number; not yet added to train.py or rollout eval).
 - **Cache DINO features to disk** to speed up training (DINO currently runs every step).

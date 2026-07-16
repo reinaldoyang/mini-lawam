@@ -8,6 +8,7 @@ Example:
 """
 
 import argparse
+import csv
 import os
 
 import numpy as np
@@ -71,7 +72,25 @@ def main():
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--out", default="results/mini_lawam/ckpt.pt")
+    ap.add_argument("--csv-log", default="results/mini_lawam/train_log.csv",
+                    help="Per-step metric log (always written). Plot via mini_lawam.plot_log.")
+    ap.add_argument("--wandb", action="store_true",
+                    help="Also log to Weights & Biases (online; requires `wandb login`).")
+    ap.add_argument("--wandb-project", default="mini_lawam")
+    ap.add_argument("--wandb-offline", action="store_true",
+                    help="Log wandb offline instead of online (no login; sync later).")
+    ap.add_argument("--run-name", default=None, help="wandb/CSV run name.")
     args = ap.parse_args()
+
+    # Fail fast on wandb login BEFORE the expensive dataset/model setup.
+    if args.wandb and not args.wandb_offline:
+        import wandb
+        if not wandb.api.api_key:
+            raise SystemExit(
+                "[wandb] online logging requested but you are not logged in.\n"
+                "        Run `wandb login` (or set WANDB_API_KEY), or pass "
+                "--wandb-offline to log locally."
+            )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = MiniLaWAMConfig()
@@ -91,6 +110,31 @@ def main():
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps, eta_min=args.lr * 0.05)
 
+    # --- logging: CSV always, wandb optional ---
+    os.makedirs(os.path.dirname(args.csv_log) or ".", exist_ok=True)
+    csv_file = open(args.csv_log, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["step", "split", "loss_total", "loss_act",
+                         "loss_distill", "loss_wm", "lr"])
+    csv_file.flush()
+
+    def log_row(step, split, metrics, lr=""):
+        csv_writer.writerow([step, split,
+                             metrics.get("loss_total", ""), metrics.get("loss_act", ""),
+                             metrics.get("loss_distill", ""), metrics.get("loss_wm", ""), lr])
+        csv_file.flush()
+
+    run = None
+    if args.wandb:
+        import wandb
+        mode = "offline" if args.wandb_offline else "online"
+        run = wandb.init(
+            project=args.wandb_project, name=args.run_name, mode=mode,
+            config={**cfg.__dict__, "steps": args.steps, "batch": args.batch,
+                    "lr": args.lr, "hdf5": args.hdf5, "n_pairs": len(ds)},
+        )
+        print(f"[wandb] logging ({mode}) project={args.wandb_project}")
+
     step, best_val = 0, float("inf")
     while step < args.steps:
         for batch in train_loader:
@@ -103,12 +147,21 @@ def main():
             step += 1
 
             if step % args.log_every == 0:
-                print(f"step {step:>6} | total {float(out['loss_total']):.4f} "
-                      f"act {float(out['loss_act']):.4f} distill {float(out['loss_distill']):.4f} "
-                      f"wm {float(out['loss_wm']):.4f} | lr {sched.get_last_lr()[0]:.2e}")
+                lr = sched.get_last_lr()[0]
+                train_m = {k: float(v) for k, v in out.items() if k != "pred"}
+                print(f"step {step:>6} | total {train_m['loss_total']:.4f} "
+                      f"act {train_m['loss_act']:.4f} distill {train_m['loss_distill']:.4f} "
+                      f"wm {train_m['loss_wm']:.4f} | lr {lr:.2e}")
+                log_row(step, "train", train_m, lr)
+                if run is not None:
+                    run.log({**{f"train/{k}": v for k, v in train_m.items()},
+                             "train/lr": lr}, step=step)
             if step % args.eval_every == 0:
                 val = evaluate(model, val_loader, device)
                 print(f"  [val] " + " ".join(f"{k}={v:.4f}" for k, v in val.items()))
+                log_row(step, "val", val)
+                if run is not None:
+                    run.log({f"val/{k}": v for k, v in val.items()}, step=step)
                 if val.get("loss_act", 1e9) < best_val:
                     best_val = val["loss_act"]
                     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -123,7 +176,11 @@ def main():
                     print(f"  [ckpt] saved best (val loss_act={best_val:.4f}) -> {args.out}")
             if step >= args.steps:
                 break
-    print("done.")
+    csv_file.close()
+    if run is not None:
+        run.finish()
+    print(f"done. metrics -> {args.csv_log}"
+          + ("  (wandb run saved)" if run is not None else ""))
 
 
 if __name__ == "__main__":

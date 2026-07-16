@@ -39,7 +39,11 @@ def to_inputs(batch, device):
     o_t, o_T = split_o_t_o_T(vids)
     actions = batch["actions"].to(device, non_blocking=True)
     mask = batch["actions_mask"].to(device, non_blocking=True)
-    return o_t, o_T, actions, mask
+    wrist = None
+    if "wrist_u8" in batch:
+        w_u8 = batch["wrist_u8"].to(device, non_blocking=True).unsqueeze(1)  # [B,1,3,256,256]
+        wrist, _ = gpu_two_view_video_aug(w_u8, training=False)              # same ImageNet norm
+    return o_t, o_T, actions, mask, wrist
 
 
 @torch.no_grad()
@@ -49,8 +53,8 @@ def evaluate(model, loader, device, max_batches=20):
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        o_t, o_T, actions, mask = to_inputs(batch, device)
-        out = model(o_t, o_T, actions, actions_mask=mask)
+        o_t, o_T, actions, mask, wrist = to_inputs(batch, device)
+        out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist)
         for k, v in out.items():
             if k != "pred":
                 tot[k] = tot.get(k, 0.0) + float(v)
@@ -69,6 +73,8 @@ def main():
     ap.add_argument("--val-frac", type=float, default=0.05)
     ap.add_argument("--sample-stride", type=int, default=2,
                     help="Subsample start frames to cut redundancy between neighbors.")
+    ap.add_argument("--use-wrist", action="store_true",
+                    help="Add wrist_cam as an aux view to the action head (paper §C.2).")
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--out", default="results/mini_lawam/ckpt.pt")
@@ -93,11 +99,11 @@ def main():
             )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = MiniLaWAMConfig()
+    cfg = MiniLaWAMConfig(use_wrist=args.use_wrist)
 
     ds = MiniLaWAMDataset(
         args.hdf5, gap=cfg.action_horizon, horizon=cfg.action_horizon,
-        sample_stride=args.sample_stride,
+        sample_stride=args.sample_stride, use_wrist=args.use_wrist,
     )
     print(f"dataset: {len(ds)} pairs | action stats mean={np.round(ds.action_mean,4)} "
           f"std={np.round(ds.action_std,4)}")
@@ -138,8 +144,8 @@ def main():
     step, best_val = 0, float("inf")
     while step < args.steps:
         for batch in train_loader:
-            o_t, o_T, actions, mask = to_inputs(batch, device)
-            out = model(o_t, o_T, actions, actions_mask=mask)
+            o_t, o_T, actions, mask, wrist = to_inputs(batch, device)
+            out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist)
             opt.zero_grad(set_to_none=True)
             out["loss_total"].backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)

@@ -37,6 +37,8 @@ class MiniLaWAMConfig:
     action_horizon: int = 32          # 1.6 s @ 20 Hz; keep == frame gap used for pairs
     use_state: bool = False
     state_dim: int = 0
+    use_wrist: bool = False           # add wrist_cam as aux view to the ACTION HEAD only
+                                      # (never the prior/LaWM -- paper §C.2; wrist moves w/ arm)
     hidden: int = 512
     lambda_distill: float = 1.0
     lambda_wm: float = 0.1            # subgoal supervision weight (0 to disable)
@@ -92,7 +94,12 @@ class MiniLaWAM(nn.Module):
         vdim = int(self.lam.input_dim)   # DINOv3 ViT-B -> 768
         cdim = int(self.lam.code_dim)    # LAM latent action dim -> 32
         self.prior = ConvPrior(vdim, cdim)
-        cond_dim = 2 * vdim + (cfg.state_dim if cfg.use_state else 0)
+        # cond = [pool(u_t), pool(u_hat_T), (pool(wrist)), (state)]
+        cond_dim = 2 * vdim
+        if cfg.use_wrist:
+            cond_dim += vdim          # pooled DINO features of the wrist view
+        if cfg.use_state:
+            cond_dim += cfg.state_dim
         self.action_head = MLPActionHead(cond_dim, cfg.action_dim, cfg.action_horizon, cfg.hidden)
 
     def _feat(self, imgs: torch.Tensor) -> torch.Tensor:
@@ -114,6 +121,7 @@ class MiniLaWAM(nn.Module):
         actions: torch.Tensor,      # [B, H, action_dim]
         actions_mask: Optional[torch.Tensor] = None,  # [B, H, action_dim] or None
         state: Optional[torch.Tensor] = None,         # [B, state_dim] or None
+        wrist: Optional[torch.Tensor] = None,         # [B, 1, 3, 256, 256] or None (aux view)
     ):
         u_t = self._feat(o_t)[:, :1]                    # [B,1,K,D] (grad-usable constant)
         pair = torch.cat([o_t, o_T], dim=1)             # [B,2,3,256,256]
@@ -128,6 +136,10 @@ class MiniLaWAM(nn.Module):
         loss_wm = F.mse_loss(u_hat_T, u_T_target)
 
         cond = torch.cat([u_t[:, 0].mean(1), u_hat_T[:, 0].mean(1)], dim=-1)  # [B, 2D]
+        if self.cfg.use_wrist:
+            assert wrist is not None, "cfg.use_wrist=True but no wrist image was passed"
+            w_feat = self._feat(wrist)[:, 0].mean(1)    # DINO(wrist) pooled -> [B, D]
+            cond = torch.cat([cond, w_feat], dim=-1)
         if self.cfg.use_state and state is not None:
             cond = torch.cat([cond, state], dim=-1)
         pred = self.action_head(cond)                   # [B,H,action_dim]
@@ -148,30 +160,40 @@ class MiniLaWAM(nn.Module):
         }
 
     @torch.no_grad()
-    def predict(self, o_t: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Inference: current frame -> action chunk (no future frame needed)."""
+    def predict(self, o_t: torch.Tensor, state: Optional[torch.Tensor] = None,
+                wrist: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Inference: current frame (+ optional wrist view) -> action chunk.
+
+        No future frame needed. Pass `wrist` [B,1,3,256,256] iff cfg.use_wrist.
+        """
         u_t = self._feat(o_t)[:, :1]
         z_hat = self.prior(u_t[:, 0])
         u_hat_T = self.lam.decoder(u_t, z_hat)
         if isinstance(u_hat_T, tuple):
             u_hat_T = u_hat_T[0]
         cond = torch.cat([u_t[:, 0].mean(1), u_hat_T[:, 0].mean(1)], dim=-1)
+        if self.cfg.use_wrist:
+            assert wrist is not None, "cfg.use_wrist=True but no wrist image was passed"
+            cond = torch.cat([cond, self._feat(wrist)[:, 0].mean(1)], dim=-1)
         if self.cfg.use_state and state is not None:
             cond = torch.cat([cond, state], dim=-1)
         return self.action_head(cond)
 
 
 if __name__ == "__main__":
-    # Shape smoke test on random ImageNet-normalized inputs.
-    cfg = MiniLaWAMConfig()
+    # Shape smoke test on random ImageNet-normalized inputs (both wrist on/off).
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    model = MiniLaWAM(cfg).to(dev)
-    model.prior.train(); model.action_head.train()
-    B, H = 2, cfg.action_horizon
-    o_t = torch.randn(B, 1, 3, 256, 256, device=dev)
-    o_T = torch.randn(B, 1, 3, 256, 256, device=dev)
-    acts = torch.randn(B, H, cfg.action_dim, device=dev)
-    out = model(o_t, o_T, acts)
-    print({k: round(float(v), 4) for k, v in out.items() if k != "pred"})
-    print("pred", tuple(out["pred"].shape))
-    print("trainable params:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+    for use_wrist in (False, True):
+        cfg = MiniLaWAMConfig(use_wrist=use_wrist)
+        model = MiniLaWAM(cfg).to(dev)
+        model.prior.train(); model.action_head.train()
+        B, H = 2, cfg.action_horizon
+        o_t = torch.randn(B, 1, 3, 256, 256, device=dev)
+        o_T = torch.randn(B, 1, 3, 256, 256, device=dev)
+        wrist = torch.randn(B, 1, 3, 256, 256, device=dev) if use_wrist else None
+        acts = torch.randn(B, H, cfg.action_dim, device=dev)
+        out = model(o_t, o_T, acts, wrist=wrist)
+        print(f"\n[use_wrist={use_wrist}]")
+        print({k: round(float(v), 4) for k, v in out.items() if k != "pred"})
+        print("pred", tuple(out["pred"].shape))
+        print("trainable params:", sum(p.numel() for p in model.parameters() if p.requires_grad))

@@ -27,6 +27,7 @@ from torchvision.transforms import v2
 
 POS_KEY_DEFAULT = "eef_pos_base"  # absolute EEF position (3), base frame
 GRIP_ACTION_COL = 6               # gripper command column in raw `actions` (no gripper obs here)
+WRIST_KEY_DEFAULT = "wrist_cam"   # arm-mounted aux view (action head only, current frame t)
 
 
 def build_index(hdf5_path: str, gap: int, horizon: int, sample_stride: int = 1
@@ -78,6 +79,8 @@ class MiniLaWAMDataset(Dataset):
         action_mean: Optional[np.ndarray] = None,
         action_std: Optional[np.ndarray] = None,
         image_hw: Tuple[int, int] = (256, 256),
+        use_wrist: bool = False,
+        wrist_key: str = WRIST_KEY_DEFAULT,
     ):
         self.hdf5_path = hdf5_path
         self.gap = int(gap)
@@ -85,6 +88,8 @@ class MiniLaWAMDataset(Dataset):
         self.pos_key = pos_key
         self.grip_col = grip_col
         self.image_hw = image_hw
+        self.use_wrist = use_wrist
+        self.wrist_key = wrist_key
         self.resize = v2.Resize(image_hw, antialias=True)
         self.index = build_index(hdf5_path, self.gap, self.horizon, sample_stride)
         if action_mean is None or action_std is None:
@@ -121,11 +126,15 @@ class MiniLaWAMDataset(Dataset):
         actions[:h] = raw
         mask[:h] = 1.0
 
-        return {
+        out = {
             "frames_u8": frames,
             "actions": torch.from_numpy(actions),
             "actions_mask": torch.from_numpy(mask),
         }
+        if self.use_wrist:
+            # Aux view: wrist_cam at the CURRENT frame t only (not the pair).
+            out["wrist_u8"] = self._frame(g["obs"][self.wrist_key], t)  # [3,256,256]
+        return out
 
 
 def split_o_t_o_T(vids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

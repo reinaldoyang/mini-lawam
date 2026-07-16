@@ -68,15 +68,22 @@ class MiniLaWAMPolicy:
 
     # ---- the venue-independent output ----
     @torch.no_grad()
-    def act(self, frame_hwc_uint8: np.ndarray) -> np.ndarray:
+    def act(self, frame_hwc_uint8: np.ndarray,
+            wrist_hwc_uint8: Optional[np.ndarray] = None) -> np.ndarray:
         """Frame -> physical 4D action chunk [H, 4] = [eef_pos_base(3), gripper(1)].
 
         Absolute EEF positions (meters, base frame) + raw gripper channel. This is
         the clean hand-off point. Downstream (venue-specific) code decides what to
-        do with it.
+        do with it. If the checkpoint was trained with use_wrist=True, you MUST pass
+        `wrist_hwc_uint8` (the aux wrist_cam frame at the same timestep).
         """
         o_t = self.preprocess(frame_hwc_uint8)
-        pred = self.model.predict(o_t)                 # [1,H,4], z-scored
+        wrist = None
+        if self.cfg.use_wrist:
+            if wrist_hwc_uint8 is None:
+                raise ValueError("checkpoint trained with use_wrist=True -> pass wrist_hwc_uint8")
+            wrist = self.preprocess(wrist_hwc_uint8)
+        pred = self.model.predict(o_t, wrist=wrist)    # [1,H,4], z-scored
         pred = pred[0].cpu().numpy().astype(np.float32)
         return pred * self.action_std + self.action_mean   # un-normalize -> [H,4]
 
@@ -119,7 +126,8 @@ if __name__ == "__main__":
     policy = MiniLaWAMPolicy(args.ckpt)
     step = torch.load(args.ckpt, map_location="cpu", weights_only=False).get("step")
     H = policy.cfg.action_horizon
-    print(f"loaded ckpt (step {step}) | action_dim={policy.cfg.action_dim} horizon={H}")
+    print(f"loaded ckpt (step {step}) | action_dim={policy.cfg.action_dim} horizon={H} "
+          f"use_wrist={policy.cfg.use_wrist}")
     print(f"action_mean={np.round(policy.action_mean,4)} action_std={np.round(policy.action_std,4)}")
 
     if args.mode == "single":
@@ -127,9 +135,10 @@ if __name__ == "__main__":
             demo = args.demo or list(f["data"].keys())[0]
             g = f["data"][demo]
             frame = g["obs"]["table_cam"][args.t]
+            wrist = g["obs"]["wrist_cam"][args.t] if policy.cfg.use_wrist else None
             gt_pos = g["obs"]["eef_pos_base"][args.t + 1].astype(np.float32)
             gt_grip = float(g["actions"][args.t + 1, 6])
-        chunk = policy.act(frame)
+        chunk = policy.act(frame, wrist)
         print(f"\ndemo={demo} t={args.t}  chunk shape={chunk.shape}")
         print(f"pred step0 : eef_pos={np.round(chunk[0,:3],4)}  gripper={chunk[0,3]:+.3f}")
         print(f"gt   step0 : eef_pos={np.round(gt_pos,4)}  gripper={gt_grip:+.3f}")
@@ -154,8 +163,9 @@ if __name__ == "__main__":
                 demo, t = ds.index[int(i)]
                 g = data[demo]
                 frame = g["obs"]["table_cam"][t]                       # (H,W,3) u8
+                wrist = g["obs"]["wrist_cam"][t] if policy.cfg.use_wrist else None
                 gt = _read_target(g, t + 1, H, "eef_pos_base", 6)      # [H,4] physical
-                pred = policy.act(frame)                               # [H,4] physical
+                pred = policy.act(frame, wrist)                        # [H,4] physical
                 pos_l2 += np.linalg.norm(pred[:, :3] - gt[:, :3], axis=1).mean()
                 step0_l2 += np.linalg.norm(pred[0, :3] - gt[0, :3])
                 mae += np.abs(pred - gt).mean(axis=0)

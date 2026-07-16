@@ -98,7 +98,12 @@ double-normalize.
   pick/place locations. At deploy: `delta = pred_eef_pos_base − current_TCP` → UR `servoL`.
 - **`table_cam` only for the world model** — LaWM assumes a stable camera; `wrist_cam`
   moves with the arm and would corrupt the latent action (paper §5 limitation).
-  `wrist_cam` may later be added as an *auxiliary* input to the action head only.
+  **`wrist_cam` is now an OPTIONAL aux view via `--use-wrist`** (config `use_wrist`):
+  its DINO features (current frame t) are concatenated into the **action head only**
+  (`[pool(u_t), pool(û_T), pool(wrist)]`) — NEVER the ConvPrior or LaWM path
+  (paper §C.2). Default off. `rollout.py` reads `use_wrist` from the checkpoint and
+  requires a wrist frame in `act(frame, wrist)` when it's on. Train with:
+  `... -m mini_lawam.train --use-wrist ...`.
 - **gap = horizon = 32** — matches the LaWM's native τ=1.6 s at 20 Hz.
 - **Everything frozen except prior + head** — reuse the validated LaWM; small
   trainable surface for a small dataset.

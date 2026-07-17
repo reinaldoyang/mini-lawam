@@ -73,6 +73,10 @@ def main():
     ap.add_argument("--val-frac", type=float, default=0.05)
     ap.add_argument("--sample-stride", type=int, default=2,
                     help="Subsample start frames to cut redundancy between neighbors.")
+    ap.add_argument("--horizon", type=int, default=24,
+                    help="Horizon in FRAMES for BOTH the LaWM future pair (o_{t+H} -> "
+                         "z_teacher, u_T, loss_wm) and the action chunk. "
+                         "1.2s @ 20Hz = 24 (paper §C.5).")
     ap.add_argument("--use-wrist", action="store_true",
                     help="Add wrist_cam as an aux view to the action head (paper §C.2).")
     ap.add_argument("--log-every", type=int, default=100)
@@ -99,12 +103,17 @@ def main():
             )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = MiniLaWAMConfig(use_wrist=args.use_wrist)
+    # One horizon for both the LaWM future pair and the action chunk.
+    cfg = MiniLaWAMConfig(use_wrist=args.use_wrist,
+                          future_horizon=args.horizon, action_horizon=args.horizon)
 
+    # gap = future horizon (LaWM pair, o_{t+future_horizon}); horizon = action chunk.
     ds = MiniLaWAMDataset(
-        args.hdf5, gap=cfg.action_horizon, horizon=cfg.action_horizon,
+        args.hdf5, gap=cfg.future_horizon, horizon=cfg.action_horizon,
         sample_stride=args.sample_stride, use_wrist=args.use_wrist,
     )
+    print(f"horizons: future(LaWM)={cfg.future_horizon}  action_chunk={cfg.action_horizon} "
+          f"(gap between o_t and o_T = {cfg.future_horizon} frames)")
     print(f"dataset: {len(ds)} pairs | action stats mean={np.round(ds.action_mean,4)} "
           f"std={np.round(ds.action_std,4)}")
     train_loader, val_loader = make_loaders(ds, args.batch, args.workers, args.val_frac)

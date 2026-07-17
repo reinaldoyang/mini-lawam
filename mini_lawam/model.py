@@ -34,7 +34,11 @@ class MiniLaWAMConfig:
     lam_ckpt: str = "latent_action_model/logs/dino_large_vae/lam_release/checkpoints/pytorch_model.pt"
     lam_yaml: str = "latent_action_model/logs/dino_large_vae/lam_release/dino_large_vae.yaml"
     action_dim: int = 4              # target = absolute [eef_pos(3), gripper_pos(1)]
-    action_horizon: int = 32          # 1.6 s @ 20 Hz; keep == frame gap used for pairs
+    # Horizon in FRAMES = 1.2 s @ 20 Hz = 24 (paper §C.5 robot horizon). Same value
+    # for the action chunk (MLP head output) and the LaWM future pair (o_{t+H} ->
+    # z_teacher, u_T, loss_wm).
+    action_horizon: int = 24
+    future_horizon: int = 24
     use_state: bool = False
     state_dim: int = 0
     use_wrist: bool = False           # add wrist_cam as aux view to the ACTION HEAD only

@@ -12,7 +12,10 @@ Losses:
     loss_wm      = MSE(u_hat_T, u_T)                          # subgoal supervision (light)
 
 Everything in the LAM (DINO encoder, inverse-dynamics teacher, LaWM decoder) is
-frozen; only ConvPrior + the MLP action head train.
+frozen; only ConvPrior + the MLP action head train. Training can be joint or
+two-phase (see mini_lawam.train --phase): phase 1 trains ConvPrior alone with
+loss_distill (forward(..., prior_only=True)); phase 2 loads that prior
+(frozen or finetuned) and trains the action head with the full loss.
 
 Inputs are expected already preprocessed to the LAM's contract:
     o_t, o_T: float [B, 1, 3, 256, 256], ImageNet-normalized 256x256
@@ -122,10 +125,11 @@ class MiniLaWAM(nn.Module):
         self,
         o_t: torch.Tensor,          # [B, 1, 3, 256, 256]
         o_T: torch.Tensor,          # [B, 1, 3, 256, 256]
-        actions: torch.Tensor,      # [B, H, action_dim]
+        actions: Optional[torch.Tensor] = None,       # [B, H, action_dim] (unused if prior_only)
         actions_mask: Optional[torch.Tensor] = None,  # [B, H, action_dim] or None
         state: Optional[torch.Tensor] = None,         # [B, state_dim] or None
         wrist: Optional[torch.Tensor] = None,         # [B, 1, 3, 256, 256] or None (aux view)
+        prior_only: bool = False,   # Phase 1: only L_distill; skip decoder + action head
     ):
         u_t = self._feat(o_t)[:, :1]                    # [B,1,K,D] (grad-usable constant)
         pair = torch.cat([o_t, o_T], dim=1)             # [B,2,3,256,256]
@@ -134,6 +138,12 @@ class MiniLaWAM(nn.Module):
         z_hat = self.prior(u_t[:, 0])                   # [B,1,code]
         loss_distill = F.mse_loss(z_hat, z_teacher)
 
+        if prior_only:
+            zero = z_hat.new_zeros(())
+            return {"loss_total": loss_distill, "loss_act": zero,
+                    "loss_distill": loss_distill, "loss_wm": zero, "pred": None}
+
+        assert actions is not None, "actions required unless prior_only=True"
         u_hat_T = self.lam.decoder(u_t, z_hat)          # [B,1,K,D]
         if isinstance(u_hat_T, tuple):
             u_hat_T = u_hat_T[0]

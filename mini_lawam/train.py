@@ -1,10 +1,23 @@
 """Minimal single-GPU training loop for the LaWAM-inspired BC policy.
 
-Trains only the ConvPrior + MLP action head; DINO and LaWM stay frozen.
+DINO, the LAM IDM (teacher), and the LaWM decoder are ALWAYS frozen.
+
+Modes (--phase):
+    1     : train ConvPrior only.  loss = L_distill = MSE(z_hat, z_teacher).
+            Action head untouched. Saves a prior-only checkpoint
+            (default results/mini_lawam/prior_phase1.pt), best on val loss_distill.
+    2     : load the phase-1 prior (--prior-ckpt), train the action head.
+            Prior frozen by default; --finetune-prior keeps it trainable.
+            loss = L_act + 0.1*L_distill + 0.1*L_wm (weights overridable).
+            Saves the full rollout checkpoint, best on val loss_act.
+    joint : original single-phase behavior (prior + head together,
+            L_act + 1.0*L_distill + 0.1*L_wm).
 
 Example:
-    CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
-        --hdf5 dataset/demo_dataset_100.hdf5 --steps 20000 --batch 32
+    CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg.hdf5 \
+        --phase 1 --steps 10000 --batch 32
+    CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg.hdf5 \
+        --phase 2 --prior-ckpt results/mini_lawam/prior_phase1.pt --steps 20000 --batch 32
 """
 
 import argparse
@@ -47,18 +60,21 @@ def to_inputs(batch, device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, max_batches=20):
+def evaluate(model, loader, device, max_batches=20, prior_only=False, set_train_mode=None):
     model.prior.eval(); model.action_head.eval()
     tot = {}
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
         o_t, o_T, actions, mask, wrist = to_inputs(batch, device)
-        out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist)
+        out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist, prior_only=prior_only)
         for k, v in out.items():
             if k != "pred":
                 tot[k] = tot.get(k, 0.0) + float(v)
-    model.prior.train(); model.action_head.train()
+    if set_train_mode is not None:
+        set_train_mode(True)  # restore per-phase train/eval flags
+    else:
+        model.prior.train(); model.action_head.train()
     n = min(max_batches, len(loader)) or 1
     return {k: v / n for k, v in tot.items()}
 
@@ -79,9 +95,23 @@ def main():
                          "1.2s @ 20Hz = 24 (paper §C.5).")
     ap.add_argument("--use-wrist", action="store_true",
                     help="Add wrist_cam as an aux view to the action head (paper §C.2).")
+    ap.add_argument("--phase", choices=["1", "2", "joint"], default="joint",
+                    help="1: train prior only (L_distill). 2: load --prior-ckpt, train "
+                         "action head (L_act + 0.1*L_distill + 0.1*L_wm). joint: original "
+                         "single-phase training.")
+    ap.add_argument("--prior-ckpt", default="results/mini_lawam/prior_phase1.pt",
+                    help="Phase 2: path to the phase-1 prior checkpoint to load.")
+    ap.add_argument("--finetune-prior", action="store_true",
+                    help="Phase 2: keep the loaded prior trainable (default: frozen).")
+    ap.add_argument("--lambda-distill", type=float, default=None,
+                    help="Override distill weight (default: 1.0 joint, 0.1 phase 2).")
+    ap.add_argument("--lambda-wm", type=float, default=None,
+                    help="Override wm/subgoal weight (default: 0.1).")
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--eval-every", type=int, default=1000)
-    ap.add_argument("--out", default="results/mini_lawam/ckpt.pt")
+    ap.add_argument("--out", default=None,
+                    help="Checkpoint path (default: results/mini_lawam/prior_phase1.pt "
+                         "for phase 1, results/mini_lawam/ckpt.pt otherwise).")
     ap.add_argument("--csv-log", default="results/mini_lawam/train_log.csv",
                     help="Per-step metric log (always written). Plot via mini_lawam.plot_log.")
     ap.add_argument("--wandb", action="store_true",
@@ -103,9 +133,24 @@ def main():
             )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # --- phase resolution ---
+    prior_only = args.phase == "1"                      # phase 1: L_distill only
+    train_prior = args.phase != "2" or args.finetune_prior
+    if args.out is None:
+        args.out = ("results/mini_lawam/prior_phase1.pt" if prior_only
+                    else "results/mini_lawam/ckpt.pt")
+    lambda_distill = args.lambda_distill if args.lambda_distill is not None else (
+        0.1 if args.phase == "2" else 1.0)
+    lambda_wm = args.lambda_wm if args.lambda_wm is not None else 0.1
+    print(f"phase={args.phase} | prior {'trains' if train_prior else 'FROZEN'} | "
+          f"action head {'skipped' if prior_only else 'trains'} | "
+          f"lambda_distill={lambda_distill} lambda_wm={lambda_wm} | out={args.out}")
+
     # One horizon for both the LaWM future pair and the action chunk.
     cfg = MiniLaWAMConfig(use_wrist=args.use_wrist,
-                          future_horizon=args.horizon, action_horizon=args.horizon)
+                          future_horizon=args.horizon, action_horizon=args.horizon,
+                          lambda_distill=lambda_distill, lambda_wm=lambda_wm)
 
     # gap = future horizon (LaWM pair, o_{t+future_horizon}); horizon = action chunk.
     ds = MiniLaWAMDataset(
@@ -119,7 +164,24 @@ def main():
     train_loader, val_loader = make_loaders(ds, args.batch, args.workers, args.val_frac)
 
     model = MiniLaWAM(cfg).to(device)
-    model.prior.train(); model.action_head.train()
+    if prior_only:
+        # Phase 1: action head is untouched (not in the optimizer, never run).
+        model.action_head.requires_grad_(False)
+    if args.phase == "2":
+        prior_sd = torch.load(args.prior_ckpt, map_location="cpu", weights_only=False)
+        model.prior.load_state_dict(prior_sd["prior"])
+        print(f"[phase 2] loaded prior from {args.prior_ckpt} "
+              f"(phase-1 step {prior_sd.get('step', '?')})")
+        if not args.finetune_prior:
+            model.prior.requires_grad_(False)
+            model.prior.eval()
+
+    def set_train_mode(training: bool):
+        # Frozen prior stays in eval() so its GroupNorm/etc. behave as at load time.
+        model.prior.train(training and train_prior)
+        model.action_head.train(training and not prior_only)
+
+    set_train_mode(True)
     params = [p for p in model.parameters() if p.requires_grad]
     print(f"trainable params: {sum(p.numel() for p in params):,}")
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
@@ -146,15 +208,19 @@ def main():
         run = wandb.init(
             project=args.wandb_project, name=args.run_name, mode=mode,
             config={**cfg.__dict__, "steps": args.steps, "batch": args.batch,
-                    "lr": args.lr, "hdf5": args.hdf5, "n_pairs": len(ds)},
+                    "lr": args.lr, "hdf5": args.hdf5, "n_pairs": len(ds),
+                    "phase": args.phase, "finetune_prior": args.finetune_prior},
         )
         print(f"[wandb] logging ({mode}) project={args.wandb_project}")
 
+    # Phase 1 selects best on val loss_distill; phases 2/joint on val loss_act.
+    best_key = "loss_distill" if prior_only else "loss_act"
     step, best_val = 0, float("inf")
     while step < args.steps:
         for batch in train_loader:
             o_t, o_T, actions, mask, wrist = to_inputs(batch, device)
-            out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist)
+            out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist,
+                        prior_only=prior_only)
             opt.zero_grad(set_to_none=True)
             out["loss_total"].backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -172,23 +238,30 @@ def main():
                     run.log({**{f"train/{k}": v for k, v in train_m.items()},
                              "train/lr": lr}, step=step)
             if step % args.eval_every == 0:
-                val = evaluate(model, val_loader, device)
+                val = evaluate(model, val_loader, device,
+                               prior_only=prior_only, set_train_mode=set_train_mode)
                 print(f"  [val] " + " ".join(f"{k}={v:.4f}" for k, v in val.items()))
                 log_row(step, "val", val)
                 if run is not None:
                     run.log({f"val/{k}": v for k, v in val.items()}, step=step)
-                if val.get("loss_act", 1e9) < best_val:
-                    best_val = val["loss_act"]
+                if val.get(best_key, 1e9) < best_val:
+                    best_val = val[best_key]
                     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-                    torch.save({
+                    ckpt = {
                         "prior": model.prior.state_dict(),
-                        "action_head": model.action_head.state_dict(),
                         "cfg": cfg.__dict__,
-                        "action_mean": ds.action_mean,
-                        "action_std": ds.action_std,
                         "step": step,
-                    }, args.out)
-                    print(f"  [ckpt] saved best (val loss_act={best_val:.4f}) -> {args.out}")
+                        "phase": args.phase,
+                    }
+                    if not prior_only:
+                        # Full rollout checkpoint (same keys as before).
+                        ckpt.update(
+                            action_head=model.action_head.state_dict(),
+                            action_mean=ds.action_mean,
+                            action_std=ds.action_std,
+                        )
+                    torch.save(ckpt, args.out)
+                    print(f"  [ckpt] saved best (val {best_key}={best_val:.4f}) -> {args.out}")
             if step >= args.steps:
                 break
     csv_file.close()

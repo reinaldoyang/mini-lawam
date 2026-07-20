@@ -33,7 +33,7 @@ class MiniLaWAMPolicy:
     """Loads a trained checkpoint and maps frames -> physical 4D action chunks."""
 
     def __init__(self, ckpt_path: str, device: Optional[str] = None,
-                 image_hw=(256, 256)):
+                 image_hw=(256, 256), train_frame_hw=(168, 224)):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
@@ -52,6 +52,14 @@ class MiniLaWAMPolicy:
         # Same resize the Dataset applied before normalization (data.py:_frame).
         self.resize = v2.Resize(image_hw, antialias=True)
         self.image_hw = image_hw
+        # Training images were RECORDED at train_frame_hw (record_real.py stores
+        # 224x168), then upscaled to 256 by the Dataset. A live 640x480 camera
+        # frame downscaled straight to 256 has different sharpness/aliasing, so
+        # first drop live frames to the recorded size to match training
+        # statistics exactly. None disables; dataset-sized inputs are a no-op.
+        self.train_frame_hw = tuple(train_frame_hw) if train_frame_hw else None
+        self.pre_resize = (v2.Resize(self.train_frame_hw, antialias=True)
+                           if self.train_frame_hw else None)
 
     # ---- preprocessing: raw frame -> model input (must match training) ----
     def preprocess(self, frame_hwc_uint8: np.ndarray) -> torch.Tensor:
@@ -61,6 +69,8 @@ class MiniLaWAMPolicy:
         (gpu_two_view_video_aug(training=False)) so features match training.
         """
         x = torch.from_numpy(np.ascontiguousarray(frame_hwc_uint8)).permute(2, 0, 1)  # [3,H,W]
+        if self.pre_resize is not None and tuple(x.shape[-2:]) != self.train_frame_hw:
+            x = self.pre_resize(x).to(torch.uint8)            # live cam -> recorded size
         x = self.resize(x).to(torch.uint8)                    # [3,256,256]
         frames_u8 = x.view(1, 1, 3, *self.image_hw).to(self.device)  # [B=1,T=1,3,256,256]
         vids, _ = gpu_two_view_video_aug(frames_u8, training=False)  # normalize on GPU

@@ -120,6 +120,11 @@ def build_parser():
                    help="chunk[:,3] <= thr => open, > thr => close (open=-1, close=+1)")
 
     # camera
+    p.add_argument("--train-frame-hw", type=int, nargs=2, default=[168, 224],
+                   metavar=("H", "W"),
+                   help="Recorded size of the TRAINING images (record_real.py stores "
+                        "224x168). Live camera frames are first resized to this, then "
+                        "to 256x256 -- the exact training pipeline. Pass 0 0 to disable.")
     p.add_argument("--table-cam-serial", default="", help="RealSense serial for table_cam")
     p.add_argument("--wrist-cam-serial", default="",
                    help="RealSense serial for wrist_cam (REQUIRED if the checkpoint "
@@ -386,7 +391,11 @@ def main():
     from mini_lawam.rollout import MiniLaWAMPolicy  # loads LAM; run from repo root
 
     print(f"[INFO] execute={args.execute} ({'ROBOT COMMANDS ENABLED' if args.execute else 'dry-run'})")
-    policy = MiniLaWAMPolicy(args.ckpt, device=args.device)
+    train_hw = None if args.train_frame_hw[0] <= 0 else tuple(args.train_frame_hw)
+    policy = MiniLaWAMPolicy(args.ckpt, device=args.device, train_frame_hw=train_hw)
+    if train_hw:
+        print(f"[POLICY] live frames matched to training resolution {train_hw} (h, w) "
+              "before the 256x256 resize")
     H = policy.cfg.action_horizon
     k = int(min(max(1, args.exec_steps), H))
     dt = 1.0 / float(args.control_hz)

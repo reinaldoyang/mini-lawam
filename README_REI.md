@@ -12,6 +12,11 @@ CUDA_VISIBLE_DEVICES="" /home/iclu200/miniconda3/envs/lawam/bin/python \
   --save-dir weights/dinov3-vitb16-pretrain-lvd1689m
 ```
 
+### View data
+```bash
+python3 scripts/view_hdf5_gui.py --input /home/iclu200/reinaldoyang/LaWAM/dataset/multi_egg_114ep.hdf5
+```
+
 ## Evaluation
 
 ```bash
@@ -72,10 +77,10 @@ CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_la
   --trace-dir results/mini_lawam/traces
 ```
 
-### Smoother movement
+### Run camera + robot, with interpolation for smoother movement
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt.pt \
+  --ckpt results/mini_lawam/ckpt_phase2.pt \
   --table-cam-serial 244422300964 \
   --robot-ip 140.96.93.125 --execute --use-gripper-control \
   --max-reach 0.005 --target-deadband 0.004 --target-ema 0.3 \
@@ -83,11 +88,10 @@ CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_la
   --trace-dir results/mini_lawam/traces --show-camera
 ```
 
-
 ### use wrist cam + table cam
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_114ep_wrist.pt \
+  --ckpt results/mini_lawam/ckpt_phase2.pt \
   --table-cam-serial 244422300964 \
   --wrist-cam-serial 252122300792 \
   --robot-ip 140.96.93.125 --execute --use-gripper-control \
@@ -97,20 +101,44 @@ CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_la
   --show-camera
 ```
 
-
-## Train 2 phase pipeline
+## Train 2 Phase: ConvPrior and Action expert
 ```bash
 # GPU 0: two-phase pipeline
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg_114ep.hdf5 \
-    --phase 1 --steps 10000 --out results/mini_lawam/prior_phase1.pt
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg_30_moved_256.hdf5 \
+    --phase 1 --steps 10000 --out results/mini_lawam/phase1_mult_egg_256.pt
+```
 
-# GPU 1, at the same time: joint baseline for comparison
+### Phase 2 (without wrist cam), use GPU 1
+```bash
 CUDA_VISIBLE_DEVICES=1 python -m mini_lawam.train --hdf5 dataset/multi_egg.hdf5 \
     --phase joint --steps 20000 --out results/mini_lawam/ckpt_joint.pt \
     --csv-log results/mini_lawam/train_log_joint.csv
 ```
 
-### To do evaluation 
+### Phase 2 (with wrist cam)
 ```bash
-python -m mini_lawam.eval_prior --ckpt results/mini_lawam/prior_phase1.pt --hdf5 dataset/multi_egg.hdf5
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg_30_moved_256.hdf5 \
+    --phase 2 --use-wrist --prior-ckpt results/mini_lawam/phase1_mult_egg_30_moved_256.pt \
+    --steps 10000 --batch 32 \
+    --out results/mini_lawam/ckpt_mult_egg_30_moved_256.pt \
+    --csv-log results/mini_lawam/train_log_phase2_wrist.csv
+```
+
+## Evaluation 
+### Phase 1 evaluation
+```bash
+python -m mini_lawam.eval_prior --ckpt results/mini_lawam/prior_phase1.pt --hdf5 dataset/multi_egg_114ep.hdf5
+```
+
+### Phase 2 evaluation
+```bash
+python -m mini_lawam.rollout --mode eval --ckpt results/mini_lawam/ckpt_phase2.pt \
+    --hdf5 dataset/multi_egg_114ep.hdf5
+```
+
+### Evaluate subgoal
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.viz_subgoal \
+    --ckpt results/mini_lawam/prior_phase1.pt \
+    --hdf5 dataset/multi_egg.hdf5 --demo demo_0 --t 40 80 120
 ```

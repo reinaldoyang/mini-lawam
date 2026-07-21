@@ -81,6 +81,7 @@ class MiniLaWAMDataset(Dataset):
         image_hw: Tuple[int, int] = (256, 256),
         use_wrist: bool = False,
         wrist_key: str = WRIST_KEY_DEFAULT,
+        use_state: bool = False,
     ):
         self.hdf5_path = hdf5_path
         self.gap = int(gap)
@@ -90,6 +91,7 @@ class MiniLaWAMDataset(Dataset):
         self.image_hw = image_hw
         self.use_wrist = use_wrist
         self.wrist_key = wrist_key
+        self.use_state = use_state   # proprioception = current eef_pos at frame t
         self.resize = v2.Resize(image_hw, antialias=True)
         self.index = build_index(hdf5_path, self.gap, self.horizon, sample_stride)
         if action_mean is None or action_std is None:
@@ -134,6 +136,12 @@ class MiniLaWAMDataset(Dataset):
         if self.use_wrist:
             # Aux view: wrist_cam at the CURRENT frame t only (not the pair).
             out["wrist_u8"] = self._frame(g["obs"][self.wrist_key], t)  # [3,256,256]
+        if self.use_state:
+            # Proprioception: current eef_pos at frame t, z-scored with the position
+            # part of the action stats (same units/frame as the target positions).
+            cur = g["obs"][self.pos_key][t].astype(np.float32)          # [3]
+            state = (cur - self.action_mean[:3]) / self.action_std[:3]
+            out["state"] = torch.from_numpy(state.astype(np.float32))   # [3]
         return out
 
 

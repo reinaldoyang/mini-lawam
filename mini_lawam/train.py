@@ -56,7 +56,8 @@ def to_inputs(batch, device):
     if "wrist_u8" in batch:
         w_u8 = batch["wrist_u8"].to(device, non_blocking=True).unsqueeze(1)  # [B,1,3,256,256]
         wrist, _ = gpu_two_view_video_aug(w_u8, training=False)              # same ImageNet norm
-    return o_t, o_T, actions, mask, wrist
+    state = batch["state"].to(device, non_blocking=True) if "state" in batch else None
+    return o_t, o_T, actions, mask, wrist, state
 
 
 @torch.no_grad()
@@ -66,8 +67,9 @@ def evaluate(model, loader, device, max_batches=20, prior_only=False, set_train_
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        o_t, o_T, actions, mask, wrist = to_inputs(batch, device)
-        out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist, prior_only=prior_only)
+        o_t, o_T, actions, mask, wrist, state = to_inputs(batch, device)
+        out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist, state=state,
+                    prior_only=prior_only)
         for k, v in out.items():
             if k != "pred":
                 tot[k] = tot.get(k, 0.0) + float(v)
@@ -95,6 +97,12 @@ def main():
                          "1.2s @ 20Hz = 24 (paper §C.5).")
     ap.add_argument("--use-wrist", action="store_true",
                     help="Add wrist_cam as an aux view to the action head (paper §C.2).")
+    ap.add_argument("--head", choices=["mlp", "attn"], default="mlp",
+                    help="Action head: 'mlp' = pooled-features MLP (v0); 'attn' = "
+                         "token-level cross-attention (no mean-pooling, fixes precision).")
+    ap.add_argument("--use-state", action="store_true",
+                    help="Feed proprioception (current eef_pos, z-scored) to the head. "
+                         "Helps 'how far to descend' but risks BC copycat -- try both.")
     ap.add_argument("--phase", choices=["1", "2", "joint"], default="joint",
                     help="1: train prior only (L_distill). 2: load --prior-ckpt, train "
                          "action head (L_act + 0.1*L_distill + 0.1*L_wm). joint: original "
@@ -148,14 +156,18 @@ def main():
           f"lambda_distill={lambda_distill} lambda_wm={lambda_wm} | out={args.out}")
 
     # One horizon for both the LaWM future pair and the action chunk.
-    cfg = MiniLaWAMConfig(use_wrist=args.use_wrist,
+    state_dim = 3 if args.use_state else 0   # proprioception = current eef_pos [x,y,z]
+    cfg = MiniLaWAMConfig(use_wrist=args.use_wrist, head_type=args.head,
+                          use_state=args.use_state, state_dim=state_dim,
                           future_horizon=args.horizon, action_horizon=args.horizon,
                           lambda_distill=lambda_distill, lambda_wm=lambda_wm)
+    print(f"head={args.head} | use_wrist={args.use_wrist} | use_state={args.use_state}")
 
     # gap = future horizon (LaWM pair, o_{t+future_horizon}); horizon = action chunk.
     ds = MiniLaWAMDataset(
         args.hdf5, gap=cfg.future_horizon, horizon=cfg.action_horizon,
         sample_stride=args.sample_stride, use_wrist=args.use_wrist,
+        use_state=args.use_state,
     )
     print(f"horizons: future(LaWM)={cfg.future_horizon}  action_chunk={cfg.action_horizon} "
           f"(gap between o_t and o_T = {cfg.future_horizon} frames)")
@@ -218,8 +230,8 @@ def main():
     step, best_val = 0, float("inf")
     while step < args.steps:
         for batch in train_loader:
-            o_t, o_T, actions, mask, wrist = to_inputs(batch, device)
-            out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist,
+            o_t, o_T, actions, mask, wrist, state = to_inputs(batch, device)
+            out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist, state=state,
                         prior_only=prior_only)
             opt.zero_grad(set_to_none=True)
             out["loss_total"].backward()

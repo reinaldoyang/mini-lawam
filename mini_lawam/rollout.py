@@ -79,13 +79,16 @@ class MiniLaWAMPolicy:
     # ---- the venue-independent output ----
     @torch.no_grad()
     def act(self, frame_hwc_uint8: np.ndarray,
-            wrist_hwc_uint8: Optional[np.ndarray] = None) -> np.ndarray:
+            wrist_hwc_uint8: Optional[np.ndarray] = None,
+            state_xyz: Optional[np.ndarray] = None) -> np.ndarray:
         """Frame -> physical 4D action chunk [H, 4] = [eef_pos_base(3), gripper(1)].
 
         Absolute EEF positions (meters, base frame) + raw gripper channel. This is
         the clean hand-off point. Downstream (venue-specific) code decides what to
         do with it. If the checkpoint was trained with use_wrist=True, you MUST pass
-        `wrist_hwc_uint8` (the aux wrist_cam frame at the same timestep).
+        `wrist_hwc_uint8` (the aux wrist_cam frame at the same timestep). If trained
+        with use_state=True, pass `state_xyz` = current eef_pos [x,y,z] in meters
+        (base frame); it is z-scored here with the same stats as training.
         """
         o_t = self.preprocess(frame_hwc_uint8)
         wrist = None
@@ -93,7 +96,13 @@ class MiniLaWAMPolicy:
             if wrist_hwc_uint8 is None:
                 raise ValueError("checkpoint trained with use_wrist=True -> pass wrist_hwc_uint8")
             wrist = self.preprocess(wrist_hwc_uint8)
-        pred = self.model.predict(o_t, wrist=wrist)    # [1,H,4], z-scored
+        state = None
+        if getattr(self.cfg, "use_state", False):
+            if state_xyz is None:
+                raise ValueError("checkpoint trained with use_state=True -> pass state_xyz")
+            s = (np.asarray(state_xyz, np.float32) - self.action_mean[:3]) / self.action_std[:3]
+            state = torch.from_numpy(s).view(1, 3).to(self.device)
+        pred = self.model.predict(o_t, wrist=wrist, state=state)    # [1,H,4], z-scored
         pred = pred[0].cpu().numpy().astype(np.float32)
         return pred * self.action_std + self.action_mean   # un-normalize -> [H,4]
 
@@ -146,9 +155,11 @@ if __name__ == "__main__":
             g = f["data"][demo]
             frame = g["obs"]["table_cam"][args.t]
             wrist = g["obs"]["wrist_cam"][args.t] if policy.cfg.use_wrist else None
+            st = (g["obs"]["eef_pos_base"][args.t].astype(np.float32)
+                  if getattr(policy.cfg, "use_state", False) else None)
             gt_pos = g["obs"]["eef_pos_base"][args.t + 1].astype(np.float32)
             gt_grip = float(g["actions"][args.t + 1, 6])
-        chunk = policy.act(frame, wrist)
+        chunk = policy.act(frame, wrist, state_xyz=st)
         print(f"\ndemo={demo} t={args.t}  chunk shape={chunk.shape}")
         print(f"pred step0 : eef_pos={np.round(chunk[0,:3],4)}  gripper={chunk[0,3]:+.3f}")
         print(f"gt   step0 : eef_pos={np.round(gt_pos,4)}  gripper={gt_grip:+.3f}")
@@ -174,8 +185,10 @@ if __name__ == "__main__":
                 g = data[demo]
                 frame = g["obs"]["table_cam"][t]                       # (H,W,3) u8
                 wrist = g["obs"]["wrist_cam"][t] if policy.cfg.use_wrist else None
+                st = (g["obs"]["eef_pos_base"][t].astype(np.float32)
+                      if getattr(policy.cfg, "use_state", False) else None)
                 gt = _read_target(g, t + 1, H, "eef_pos_base", 6)      # [H,4] physical
-                pred = policy.act(frame, wrist)                        # [H,4] physical
+                pred = policy.act(frame, wrist, state_xyz=st)          # [H,4] physical
                 pos_l2 += np.linalg.norm(pred[:, :3] - gt[:, :3], axis=1).mean()
                 step0_l2 += np.linalg.norm(pred[0, :3] - gt[0, :3])
                 mae += np.abs(pred - gt).mean(axis=0)

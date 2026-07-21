@@ -433,7 +433,16 @@ def main():
     pygame = screen = font = clock = None
 
     need_wrist = bool(policy.cfg.use_wrist)
-    print(f"[INFO] checkpoint use_wrist={need_wrist}")
+    need_state = bool(getattr(policy.cfg, "use_state", False))
+    print(f"[INFO] checkpoint use_wrist={need_wrist} use_state={need_state}")
+
+    def cur_state():
+        # proprioception for the head: current eef xyz (base frame), meters
+        if not need_state:
+            return None
+        if not args.execute:
+            return np.zeros(3, dtype=np.float64)   # dry-run: no robot to read
+        return np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)[:3]
 
     try:
         if args.offline_image:
@@ -584,7 +593,7 @@ def main():
                     # chunks' predictions for THIS timestep (newest weighted most).
                     frame, wrist_frame = read_frames()
                     t_inf = time.time()
-                    chunk = policy.act(frame, wrist_frame)
+                    chunk = policy.act(frame, wrist_frame, state_xyz=cur_state())
                     inf_ms = (time.time() - t_inf) * 1e3
                     for j in range(H):
                         ensemble.setdefault(step + j, []).append(chunk[j])
@@ -614,7 +623,7 @@ def main():
                 # --- default: receding horizon, execute k waypoints per re-plan ---
                 frame, wrist_frame = read_frames()
                 t_inf = time.time()
-                chunk = policy.act(frame, wrist_frame)
+                chunk = policy.act(frame, wrist_frame, state_xyz=cur_state())
                 inf_ms = (time.time() - t_inf) * 1e3
                 for i in range(k):
                     t0 = time.time()

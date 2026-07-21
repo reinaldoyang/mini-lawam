@@ -42,11 +42,16 @@ class MiniLaWAMConfig:
     # z_teacher, u_T, loss_wm).
     action_horizon: int = 24
     future_horizon: int = 24
-    use_state: bool = False
-    state_dim: int = 0
+    use_state: bool = False          # feed proprioception (current eef_pos) to the head
+    state_dim: int = 0               # e.g. 3 for [x,y,z]; set with use_state
     use_wrist: bool = False           # add wrist_cam as aux view to the ACTION HEAD only
                                       # (never the prior/LaWM -- paper §C.2; wrist moves w/ arm)
-    hidden: int = 512
+    head_type: str = "mlp"           # "mlp" = pooled-features MLP (v0);
+                                      # "attn" = token-level cross-attention (no pooling)
+    hidden: int = 512                # MLP head width
+    attn_hidden: int = 384           # attn head width
+    attn_layers: int = 3
+    attn_heads: int = 6
     lambda_distill: float = 1.0
     lambda_wm: float = 0.1            # subgoal supervision weight (0 to disable)
 
@@ -93,6 +98,68 @@ class MLPActionHead(nn.Module):
         return self.net(cond).view(b, self.horizon, self.action_dim)
 
 
+class _CrossAttnBlock(nn.Module):
+    """Pre-norm decoder block: queries self-attend, then cross-attend to context."""
+
+    def __init__(self, hidden: int, n_heads: int):
+        super().__init__()
+        self.n1 = nn.LayerNorm(hidden)
+        self.sa = nn.MultiheadAttention(hidden, n_heads, batch_first=True)
+        self.n2 = nn.LayerNorm(hidden)
+        self.ca = nn.MultiheadAttention(hidden, n_heads, batch_first=True)
+        self.n3 = nn.LayerNorm(hidden)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden, hidden * 4), nn.GELU(), nn.Linear(hidden * 4, hidden),
+        )
+
+    def forward(self, q: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        qn = self.n1(q)
+        q = q + self.sa(qn, qn, qn, need_weights=False)[0]
+        q = q + self.ca(self.n2(q), ctx, ctx, need_weights=False)[0]
+        q = q + self.ffn(self.n3(q))
+        return q
+
+
+class AttnActionHead(nn.Module):
+    """Token-level cross-attention head (no mean-pooling).
+
+    One learned query per output timestep cross-attends to the DINO patch tokens
+    of every view (u_t, u_hat_T, [wrist]) -- so the head reads *where* things are
+    (arm/egg patches) instead of a single averaged vector. Optional proprioception
+    (current eef_pos) enters as an extra context token. Deterministic; MSE loss.
+    """
+
+    def __init__(self, token_dim: int, action_dim: int, horizon: int,
+                 n_views: int, hidden: int = 384, n_layers: int = 3,
+                 n_heads: int = 6, state_dim: int = 0):
+        super().__init__()
+        self.horizon = horizon
+        self.action_dim = action_dim
+        self.in_proj = nn.Linear(token_dim, hidden)        # DINO token 768 -> hidden
+        self.view_emb = nn.Parameter(torch.zeros(n_views, hidden))   # per-view tag
+        self.queries = nn.Parameter(torch.zeros(horizon, hidden))    # per-step query
+        self.state_proj = nn.Linear(state_dim, hidden) if state_dim > 0 else None
+        self.layers = nn.ModuleList(
+            [_CrossAttnBlock(hidden, n_heads) for _ in range(n_layers)]
+        )
+        self.norm = nn.LayerNorm(hidden)
+        self.out = nn.Linear(hidden, action_dim)
+        nn.init.normal_(self.queries, std=0.02)
+        nn.init.normal_(self.view_emb, std=0.02)
+
+    def forward(self, view_tokens, state: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # view_tokens: list of [B, K, token_dim] (one per view, in a fixed order)
+        b = view_tokens[0].shape[0]
+        ctx = [self.in_proj(v) + self.view_emb[i] for i, v in enumerate(view_tokens)]
+        ctx = torch.cat(ctx, dim=1)                        # [B, n_views*K, hidden]
+        if self.state_proj is not None and state is not None:
+            ctx = torch.cat([self.state_proj(state).unsqueeze(1), ctx], dim=1)
+        q = self.queries.unsqueeze(0).expand(b, -1, -1)    # [B, horizon, hidden]
+        for layer in self.layers:
+            q = layer(q, ctx)
+        return self.out(self.norm(q))                      # [B, horizon, action_dim]
+
+
 class MiniLaWAM(nn.Module):
     def __init__(self, cfg: MiniLaWAMConfig):
         super().__init__()
@@ -101,13 +168,21 @@ class MiniLaWAM(nn.Module):
         vdim = int(self.lam.input_dim)   # DINOv3 ViT-B -> 768
         cdim = int(self.lam.code_dim)    # LAM latent action dim -> 32
         self.prior = ConvPrior(vdim, cdim)
-        # cond = [pool(u_t), pool(u_hat_T), (pool(wrist)), (state)]
-        cond_dim = 2 * vdim
-        if cfg.use_wrist:
-            cond_dim += vdim          # pooled DINO features of the wrist view
-        if cfg.use_state:
-            cond_dim += cfg.state_dim
-        self.action_head = MLPActionHead(cond_dim, cfg.action_dim, cfg.action_horizon, cfg.hidden)
+        n_views = 2 + (1 if cfg.use_wrist else 0)   # u_t, u_hat_T, [wrist]
+        state_dim = cfg.state_dim if cfg.use_state else 0
+        if cfg.head_type == "attn":
+            self.action_head = AttnActionHead(
+                token_dim=vdim, action_dim=cfg.action_dim, horizon=cfg.action_horizon,
+                n_views=n_views, hidden=cfg.attn_hidden, n_layers=cfg.attn_layers,
+                n_heads=cfg.attn_heads, state_dim=state_dim,
+            )
+        elif cfg.head_type == "mlp":
+            # cond = [pool(u_t), pool(u_hat_T), (pool(wrist)), (state)]
+            cond_dim = n_views * vdim + state_dim
+            self.action_head = MLPActionHead(cond_dim, cfg.action_dim,
+                                             cfg.action_horizon, cfg.hidden)
+        else:
+            raise ValueError(f"unknown head_type {cfg.head_type!r} (use 'mlp' or 'attn')")
 
     def _feat(self, imgs: torch.Tensor) -> torch.Tensor:
         # no_grad frozen DINO features, usable as constants in the autograd graph.
@@ -120,6 +195,29 @@ class MiniLaWAM(nn.Module):
         )
         # get_latent_action runs under inference_mode -> materialize normal tensors.
         return out["quantized"].detach().clone(), out["tgt"].detach().clone()
+
+    def _action_pred(self, u_t_tok, u_hat_tok, wrist=None, state=None):
+        """(u_t, u_hat_T) patch tokens [B,K,D] -> action chunk [B,H,action_dim].
+
+        Branches on cfg.head_type: 'attn' consumes tokens directly (no pooling);
+        'mlp' mean-pools each view first. Wrist/state added if configured.
+        """
+        wrist_tok = None
+        if self.cfg.use_wrist:
+            assert wrist is not None, "cfg.use_wrist=True but no wrist image was passed"
+            wrist_tok = self._feat(wrist)[:, 0]         # [B,K,D]
+        st = state if (self.cfg.use_state and state is not None) else None
+        if self.cfg.head_type == "attn":
+            views = [u_t_tok, u_hat_tok]
+            if wrist_tok is not None:
+                views.append(wrist_tok)
+            return self.action_head(views, state=st)
+        cond = torch.cat([u_t_tok.mean(1), u_hat_tok.mean(1)], dim=-1)
+        if wrist_tok is not None:
+            cond = torch.cat([cond, wrist_tok.mean(1)], dim=-1)
+        if st is not None:
+            cond = torch.cat([cond, st], dim=-1)
+        return self.action_head(cond)
 
     def forward(
         self,
@@ -149,14 +247,7 @@ class MiniLaWAM(nn.Module):
             u_hat_T = u_hat_T[0]
         loss_wm = F.mse_loss(u_hat_T, u_T_target)
 
-        cond = torch.cat([u_t[:, 0].mean(1), u_hat_T[:, 0].mean(1)], dim=-1)  # [B, 2D]
-        if self.cfg.use_wrist:
-            assert wrist is not None, "cfg.use_wrist=True but no wrist image was passed"
-            w_feat = self._feat(wrist)[:, 0].mean(1)    # DINO(wrist) pooled -> [B, D]
-            cond = torch.cat([cond, w_feat], dim=-1)
-        if self.cfg.use_state and state is not None:
-            cond = torch.cat([cond, state], dim=-1)
-        pred = self.action_head(cond)                   # [B,H,action_dim]
+        pred = self._action_pred(u_t[:, 0], u_hat_T[:, 0], wrist=wrist, state=state)
 
         if actions_mask is None:
             loss_act = F.mse_loss(pred, actions)
@@ -185,29 +276,30 @@ class MiniLaWAM(nn.Module):
         u_hat_T = self.lam.decoder(u_t, z_hat)
         if isinstance(u_hat_T, tuple):
             u_hat_T = u_hat_T[0]
-        cond = torch.cat([u_t[:, 0].mean(1), u_hat_T[:, 0].mean(1)], dim=-1)
-        if self.cfg.use_wrist:
-            assert wrist is not None, "cfg.use_wrist=True but no wrist image was passed"
-            cond = torch.cat([cond, self._feat(wrist)[:, 0].mean(1)], dim=-1)
-        if self.cfg.use_state and state is not None:
-            cond = torch.cat([cond, state], dim=-1)
-        return self.action_head(cond)
+        return self._action_pred(u_t[:, 0], u_hat_T[:, 0], wrist=wrist, state=state)
 
 
 if __name__ == "__main__":
-    # Shape smoke test on random ImageNet-normalized inputs (both wrist on/off).
+    # Shape smoke test: both head types x wrist on/off x state on/off.
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    for use_wrist in (False, True):
-        cfg = MiniLaWAMConfig(use_wrist=use_wrist)
-        model = MiniLaWAM(cfg).to(dev)
-        model.prior.train(); model.action_head.train()
-        B, H = 2, cfg.action_horizon
-        o_t = torch.randn(B, 1, 3, 256, 256, device=dev)
-        o_T = torch.randn(B, 1, 3, 256, 256, device=dev)
-        wrist = torch.randn(B, 1, 3, 256, 256, device=dev) if use_wrist else None
-        acts = torch.randn(B, H, cfg.action_dim, device=dev)
-        out = model(o_t, o_T, acts, wrist=wrist)
-        print(f"\n[use_wrist={use_wrist}]")
-        print({k: round(float(v), 4) for k, v in out.items() if k != "pred"})
-        print("pred", tuple(out["pred"].shape))
-        print("trainable params:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+    for head_type in ("mlp", "attn"):
+        for use_wrist in (False, True):
+            for use_state in (False, True):
+                cfg = MiniLaWAMConfig(head_type=head_type, use_wrist=use_wrist,
+                                      use_state=use_state, state_dim=3 if use_state else 0)
+                model = MiniLaWAM(cfg).to(dev)
+                model.prior.train(); model.action_head.train()
+                B, H = 2, cfg.action_horizon
+                o_t = torch.randn(B, 1, 3, 256, 256, device=dev)
+                o_T = torch.randn(B, 1, 3, 256, 256, device=dev)
+                wrist = torch.randn(B, 1, 3, 256, 256, device=dev) if use_wrist else None
+                state = torch.randn(B, 3, device=dev) if use_state else None
+                acts = torch.randn(B, H, cfg.action_dim, device=dev)
+                out = model(o_t, o_T, acts, wrist=wrist, state=state)
+                out["loss_total"].backward()  # check gradients flow to the head
+                gh = sum(p.grad.abs().sum().item() for p in model.action_head.parameters()
+                         if p.grad is not None)
+                n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                print(f"[{head_type} wrist={use_wrist} state={use_state}] "
+                      f"pred={tuple(out['pred'].shape)} act={float(out['loss_act']):.3f} "
+                      f"head_grad={gh:.1f} trainable={n:,}")

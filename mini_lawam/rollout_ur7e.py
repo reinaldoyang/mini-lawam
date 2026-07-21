@@ -47,8 +47,12 @@ TABLE_CAM_KEY = "table_cam"
 CAM_WIDTH, CAM_HEIGHT, CAM_FPS = 640, 480, 30
 ROBOTIQ_SOCKET_PORT = 63352
 
-# Same home joint pose as record_real.py / real_servo_utils.move_robot_home.
-HOME_Q = [0.0, -np.pi / 2, -np.pi / 2, -np.pi / 2, np.pi / 2, np.pi / 2]
+# Home joint pose the robot returns to before each rollout. This MUST match the
+# training dataset's joint_pos[0], or the first observation is out-of-distribution.
+#   multi_egg_30_moved_256 : [0.4076, -1.4255, -1.7052, -1.5821, 1.5703, 1.9768]
+#   old multi_egg_114ep    : [0, -pi/2, -pi/2, -pi/2, pi/2, pi/2]
+# Override at runtime with --home-q. Default below is the moved-256 dataset.
+HOME_Q = [0.4076, -1.4255, -1.7052, -1.5821, 1.5703, 1.9768]
 
 # Fixed locked TCP orientation (axis-angle rotvec, base frame): measured from the
 # dataset's eef_quat_base across ALL demo frames (constant within 0.24 deg).
@@ -67,7 +71,18 @@ def build_parser():
     p.add_argument("--control-hz", type=float, default=20.0,
                    help="waypoint rate; MUST match training rate (20 Hz)")
     p.add_argument("--exec-steps", type=int, default=8,
-                   help="chunk steps executed before re-planning (receding horizon)")
+                   help="chunk steps executed before re-planning (receding horizon). "
+                        "Ignored when --temporal-ensemble is set (re-plans every step).")
+    p.add_argument("--temporal-ensemble", action="store_true",
+                   help="ACT-style temporal ensembling: re-plan EVERY step and execute a "
+                        "weighted average of all overlapping chunk predictions for the "
+                        "current timestep. Cancels the per-chunk oscillation (smooth motion) "
+                        "and keeps the arm on the predicted path (in-distribution feedback). "
+                        "Needs inference << control period (15ms vs 50ms here -> fine).")
+    p.add_argument("--te-m", type=float, default=0.1,
+                   help="Temporal-ensemble weight decay: newest prediction weight 1, a "
+                        "prediction made 'age' steps ago gets exp(-te_m*age). Larger = more "
+                        "responsive/less smooth; smaller = smoother/laggier. ACT uses ~0.01.")
     p.add_argument("--max-steps", type=int, default=2000, help="max control steps per rollout")
     p.add_argument("--num-rollouts", type=int, default=10)
     p.add_argument("--startup-wait-sec", type=float, default=1.0)
@@ -85,6 +100,11 @@ def build_parser():
     p.add_argument("--servol-max-rot-step", type=float, default=0.02)
     p.add_argument("--home-movej-speed", type=float, default=0.6)
     p.add_argument("--home-movej-acc", type=float, default=1.2)
+    p.add_argument("--home-q", type=float, nargs=6, default=HOME_Q,
+                   metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+                   help="Home joint pose (rad) to return to before each rollout. "
+                        "MUST match the training dataset's joint_pos[0]. Default = "
+                        "moved-256 dataset; pass the old home for old checkpoints.")
 
     # safety (absolute targets)
     # Defaults = multi_egg demo eef_pos_base range (+3cm margin, HARD z-floor at
@@ -485,7 +505,8 @@ def main():
                     if gripper is not None:
                         gripper.command("open")
                     move_robot_home(rtde_c, rtde_r, servo_state,
-                                    args.home_movej_speed, args.home_movej_acc)
+                                    args.home_movej_speed, args.home_movej_acc,
+                                    home_q=args.home_q)
                 if cmd == "quit":
                     quit_all = True
                     break
@@ -502,95 +523,127 @@ def main():
                      "exec_steps": k, "control_hz": args.control_hz, "steps": []}
             result = "completed"
             step = 0
-            ema_xyz = None      # EMA state across waypoints (reset per rollout)
-            last_cmd_xyz = None  # last commanded target (for the deadband)
+            smooth = {"ema_xyz": None, "last_cmd_xyz": None}  # per-rollout smoothing state
+
+            def apply_waypoint(pred_xyz, grip_val, step, sub):
+                """One control tick: smooth -> clamp -> servo target + gripper + trace."""
+                pred_xyz = np.asarray(pred_xyz, dtype=np.float64)
+                grip_cmd = "open" if grip_val <= args.gripper_threshold else "close"
+                beta = float(args.target_ema)
+                smooth["ema_xyz"] = pred_xyz if smooth["ema_xyz"] is None else \
+                    beta * pred_xyz + (1.0 - beta) * smooth["ema_xyz"]
+                smoothed_xyz = smooth["ema_xyz"]
+                if (args.target_deadband > 0.0 and smooth["last_cmd_xyz"] is not None
+                        and np.linalg.norm(smoothed_xyz - smooth["last_cmd_xyz"])
+                        < args.target_deadband):
+                    smoothed_xyz = smooth["last_cmd_xyz"]
+                if args.execute:
+                    cur = np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)
+                    tgt_xyz = clamp_abs_target(smoothed_xyz, cur[:3],
+                                               args.ws_min, args.ws_max, args.max_reach)
+                    update_shared_servo_target(servo_state,
+                                               np.concatenate([tgt_xyz, locked_rotvec]))
+                    if gripper is not None:
+                        try:
+                            gripper.command(grip_cmd)
+                        except Exception as exc:
+                            print(f"[GRIPPER] failed: {exc}")
+                else:
+                    tgt_xyz = smoothed_xyz
+                smooth["last_cmd_xyz"] = np.asarray(tgt_xyz, dtype=np.float64)
+                trace["steps"].append({
+                    "step": step, "sub": sub,
+                    "pred_xyz": pred_xyz.tolist(),
+                    "tgt_xyz": np.asarray(tgt_xyz, dtype=float).tolist(),
+                    "grip": float(grip_val), "grip_cmd": grip_cmd,
+                })
+                return grip_cmd
+
+            def read_frames():
+                fr = offline_frame if offline_frame is not None else reader.read_rgb()
+                wf = None
+                if need_wrist:
+                    wf = (wrist_offline_frame if wrist_offline_frame is not None
+                          else wrist_reader.read_rgb())
+                return fr, wf
+
+            ensemble = {}   # temporal-ensemble buffer: abs step -> list of chunk rows (oldest..newest)
+            stop_cmd = None
             while step < args.max_steps:
-                # keyboard control
+                t0 = time.time()
                 draw_status(pygame, screen, font, "ROLLOUT",
                             f"step {step}  E=end H=home Q=quit",
                             frame_rgb=live_frame(), video_scale=args.video_scale)
                 cmd = poll_cmd(pygame)
                 if cmd in ("end", "home", "quit"):
-                    result = {"end": "ended", "home": "go_home", "quit": "quit"}[cmd]
+                    stop_cmd = cmd
                     break
 
-                # 1) fresh frame(s) -> absolute action chunk [H,4]
-                frame = offline_frame if offline_frame is not None else reader.read_rgb()
-                wrist_frame = None
-                if need_wrist:
-                    wrist_frame = (wrist_offline_frame if wrist_offline_frame is not None
-                                   else wrist_reader.read_rgb())
-                t_inf = time.time()
-                chunk = policy.act(frame, wrist_frame)          # physical units
-                inf_ms = (time.time() - t_inf) * 1e3
+                if args.temporal_ensemble:
+                    # Re-plan every step; execute a weighted average over all overlapping
+                    # chunks' predictions for THIS timestep (newest weighted most).
+                    frame, wrist_frame = read_frames()
+                    t_inf = time.time()
+                    chunk = policy.act(frame, wrist_frame)
+                    inf_ms = (time.time() - t_inf) * 1e3
+                    for j in range(H):
+                        ensemble.setdefault(step + j, []).append(chunk[j])
+                    preds = np.asarray(ensemble.pop(step, [chunk[0]]))   # [n,4] oldest..newest
+                    n = len(preds)
+                    age = np.arange(n - 1, -1, -1)                        # newest -> 0
+                    w = np.exp(-float(args.te_m) * age)
+                    w /= w.sum()
+                    avg = (preds * w[:, None]).sum(0)                     # [4]
+                    # Ensemble-average the XYZ (smooth), but NOT the gripper: it is a
+                    # near-discrete -1/+1 switch, and averaging in far-horizon "+1 close"
+                    # predictions trips the threshold several steps early (grasps high).
+                    # Use the newest immediate prediction's gripper instead.
+                    grip_val = float(chunk[0, 3])
+                    grip_cmd = apply_waypoint(avg[:3], grip_val, step, sub=0)
+                    if step % 8 == 0:
+                        mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
+                        print(f"[STEP {step}] inf={inf_ms:.0f}ms te_n={n}  "
+                              f"avg_xyz={np.round(avg[:3], 4)}  grip={grip_val:+.2f}->{grip_cmd}  "
+                              f"chunk_move[0->{H - 1}]={mv_H:.0f}mm")
+                    step += 1
+                    sleep_t = dt - (time.time() - t0)
+                    if sleep_t > 0:
+                        time.sleep(sleep_t)
+                    continue
 
-                # 2) execute the first k waypoints at control_hz (receding horizon)
-                stop_cmd = None
+                # --- default: receding horizon, execute k waypoints per re-plan ---
+                frame, wrist_frame = read_frames()
+                t_inf = time.time()
+                chunk = policy.act(frame, wrist_frame)
+                inf_ms = (time.time() - t_inf) * 1e3
                 for i in range(k):
                     t0 = time.time()
-                    # react to E/H/Q within one waypoint (50 ms), not per re-plan
                     if args.show_camera:
                         draw_status(pygame, screen, font, "ROLLOUT",
                                     f"step {step}  E=end H=home Q=quit",
-                                    frame_rgb=live_frame(),
-                                    video_scale=args.video_scale)
+                                    frame_rgb=live_frame(), video_scale=args.video_scale)
                     cmd = poll_cmd(pygame)
                     if cmd in ("end", "home", "quit"):
                         stop_cmd = cmd
                         break
-                    pred_xyz = chunk[i, :3].astype(np.float64)
-                    grip_val = float(chunk[i, 3])
-                    grip_cmd = "open" if grip_val <= args.gripper_threshold else "close"
-
-                    # --- smoothing: EMA across waypoints, then deadband ---
-                    beta = float(args.target_ema)
-                    ema_xyz = pred_xyz if ema_xyz is None else \
-                        beta * pred_xyz + (1.0 - beta) * ema_xyz
-                    smoothed_xyz = ema_xyz
-                    if (args.target_deadband > 0.0 and last_cmd_xyz is not None
-                            and np.linalg.norm(smoothed_xyz - last_cmd_xyz)
-                            < args.target_deadband):
-                        smoothed_xyz = last_cmd_xyz  # hold: change too small to act on
-
-                    if args.execute:
-                        cur = np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)
-                        tgt_xyz = clamp_abs_target(smoothed_xyz, cur[:3],
-                                                   args.ws_min, args.ws_max, args.max_reach)
-                        target_tcp = np.concatenate([tgt_xyz, locked_rotvec])
-                        update_shared_servo_target(servo_state, target_tcp)
-                        if gripper is not None:
-                            try:
-                                gripper.command(grip_cmd)
-                            except Exception as exc:
-                                print(f"[GRIPPER] failed: {exc}")
-                    else:
-                        tgt_xyz = smoothed_xyz  # dry-run: no clamping reference available
-                    last_cmd_xyz = np.asarray(tgt_xyz, dtype=np.float64)
-
+                    grip_cmd = apply_waypoint(chunk[i, :3], float(chunk[i, 3]), step, sub=i)
                     if i == 0:
-                        # intended motion WITHIN the predicted chunk (the key
-                        # health signal: ~0 => policy predicts "stay put")
                         mv_k = np.linalg.norm(chunk[k - 1, :3] - chunk[0, :3]) * 1e3
                         mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
                         print(f"[STEP {step}] inf={inf_ms:.0f}ms  "
-                              f"pred_xyz={np.round(pred_xyz, 4)}  grip={grip_val:+.2f}->{grip_cmd}  "
+                              f"pred_xyz={np.round(chunk[i, :3], 4)}  grip={chunk[i, 3]:+.2f}->{grip_cmd}  "
                               f"chunk_move[0->{k - 1}]={mv_k:.0f}mm [0->{H - 1}]={mv_H:.0f}mm")
-                    trace["steps"].append({
-                        "step": step, "sub": i,
-                        "pred_xyz": np.asarray(pred_xyz, dtype=float).tolist(),
-                        "tgt_xyz": np.asarray(tgt_xyz, dtype=float).tolist(),
-                        "grip": grip_val, "grip_cmd": grip_cmd,
-                    })
                     step += 1
                     if step >= args.max_steps:
                         break
                     sleep_t = dt - (time.time() - t0)
                     if sleep_t > 0:
                         time.sleep(sleep_t)
-
                 if stop_cmd is not None:
-                    result = {"end": "ended", "home": "go_home", "quit": "quit"}[stop_cmd]
                     break
+
+            if stop_cmd is not None:
+                result = {"end": "ended", "home": "go_home", "quit": "quit"}[stop_cmd]
 
             trace["result"] = result
             if args.trace_dir:
@@ -604,7 +657,8 @@ def main():
                 if gripper is not None:
                     gripper.command("open")
                 move_robot_home(rtde_c, rtde_r, servo_state,
-                                args.home_movej_speed, args.home_movej_acc)
+                                args.home_movej_speed, args.home_movej_acc,
+                                home_q=args.home_q)
             if result == "quit":
                 quit_all = True
             trial += 1

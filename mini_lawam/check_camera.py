@@ -119,9 +119,14 @@ def main():
                     help="use a dataset frame as the 'live' frame (self-test, no camera)")
     ap.add_argument("--once", action="store_true", help="single check, print + save PNG, no GUI")
     ap.add_argument("--out-dir", default="results/mini_lawam/camera_check")
+    ap.add_argument("--train-frame-hw", type=int, nargs=2, default=[168, 224],
+                    metavar=("H", "W"),
+                    help="Match rollout_ur7e: recorded training resolution. Use 0 0 "
+                         "for native-256 checkpoints (multi_egg_30_moved_256).")
     args = ap.parse_args()
 
-    policy = MiniLaWAMPolicy(args.ckpt)
+    train_hw = None if args.train_frame_hw[0] <= 0 else tuple(args.train_frame_hw)
+    policy = MiniLaWAMPolicy(args.ckpt, train_frame_hw=train_hw)
     ref_names, ref_frames, home_xyz = load_refs(args.hdf5, args.n_refs)
     ref_feats = [token_feats(policy, fr) for fr in ref_frames]
 

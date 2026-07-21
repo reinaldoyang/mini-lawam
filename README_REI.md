@@ -102,26 +102,28 @@ CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_la
 ```
 
 ## Train 2 Phase: ConvPrior and Action expert
-```bash
-# GPU 0: two-phase pipeline
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg_30_moved_256.hdf5 \
-    --phase 1 --steps 10000 --out results/mini_lawam/phase1_mult_egg_256.pt
-```
-
-### Phase 2 (without wrist cam), use GPU 1
-```bash
-CUDA_VISIBLE_DEVICES=1 python -m mini_lawam.train --hdf5 dataset/multi_egg.hdf5 \
-    --phase joint --steps 20000 --out results/mini_lawam/ckpt_joint.pt \
-    --csv-log results/mini_lawam/train_log_joint.csv
-```
-
-### Phase 2 (with wrist cam)
+### Phase 1: distill the ConvPrior (run once; reused by both phase-2 variants)
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg_30_moved_256.hdf5 \
-    --phase 2 --use-wrist --prior-ckpt results/mini_lawam/phase1_mult_egg_30_moved_256.pt \
+    --phase 1 --steps 10000 --out results/mini_lawam/phase1_moved_256.pt
+```
+
+### Phase 2 (without wrist cam) — reuse the phase-1 prior above
+```bash
+CUDA_VISIBLE_DEVICES=1 python -m mini_lawam.train --hdf5 dataset/multi_egg_30_moved_256.hdf5 \
+    --phase 2 --prior-ckpt results/mini_lawam/phase1_moved_256.pt \
     --steps 10000 --batch 32 \
-    --out results/mini_lawam/ckpt_mult_egg_30_moved_256.pt \
-    --csv-log results/mini_lawam/train_log_phase2_wrist.csv
+    --out results/mini_lawam/ckpt_moved_256.pt \
+    --csv-log results/mini_lawam/train_log_moved_256.csv
+```
+
+### Phase 2 (with wrist cam) — SAME phase-1 prior
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg_30_moved_256.hdf5 \
+    --phase 2 --use-wrist --prior-ckpt results/mini_lawam/phase1_moved_256.pt \
+    --steps 10000 --batch 32 \
+    --out results/mini_lawam/ckpt_moved_256_wrist.pt \
+    --csv-log results/mini_lawam/train_log_moved_256_wrist.csv
 ```
 
 ## Evaluation 

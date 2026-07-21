@@ -91,7 +91,7 @@ CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_la
 ### use wrist cam + table cam
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_phase2.pt \
+  --ckpt results/mini_lawam/ckpt_mult_egg_30_moved_256.pt \
   --table-cam-serial 244422300964 \
   --wrist-cam-serial 252122300792 \
   --robot-ip 140.96.93.125 --execute --use-gripper-control \
@@ -99,6 +99,19 @@ CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_la
   --servol-max-pos-step 0.001 \
   --trace-dir results/mini_lawam/traces \
   --show-camera
+```
+
+### use wrist cam + table cam + 256 image size + temporal ensemble for action chunking
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
+  --ckpt results/mini_lawam/ckpt_mult_egg_30_moved_256.pt \
+  --table-cam-serial 244422300964 --wrist-cam-serial 252122300792 \
+  --robot-ip 140.96.93.125 --execute --use-gripper-control \
+  --train-frame-hw 0 0 \
+  --temporal-ensemble --te-m 0.1 \
+  --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.02 --servol-max-pos-step 0.002 \
+  --trace-dir results/mini_lawam/traces --show-camera
 ```
 
 ## Train 2 Phase: ConvPrior and Action expert
@@ -143,4 +156,30 @@ python -m mini_lawam.rollout --mode eval --ckpt results/mini_lawam/ckpt_phase2.p
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.viz_subgoal \
     --ckpt results/mini_lawam/prior_phase1.pt \
     --hdf5 dataset/multi_egg.hdf5 --demo demo_0 --t 40 80 120
+```
+
+
+## Attention head experiment
+
+Experiment 1 — attn head, isolate the un-pooling fix (your existing phase-1 prior, no proprioception, lower LR since transformers are LR-sensitive):
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
+  --hdf5 dataset/multi_egg_30_moved_256.hdf5 --phase 2 --head attn --use-wrist \
+  --prior-ckpt results/mini_lawam/phase1_moved_256.pt \
+  --steps 10000 --batch 32 --lr 1e-4 \
+  --out results/mini_lawam/ckpt_attn_256.pt --csv-log results/mini_lawam/log_attn.csv
+```
+
+Experiment 2: add proprioception
+
+
+
+Deployment: run the rollout
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
+  --ckpt results/mini_lawam/ckpt_attn_256.pt \
+  --table-cam-serial 244422300964 --wrist-cam-serial 252122300792 \
+  --robot-ip 140.96.93.125 --execute --use-gripper-control --train-frame-hw 0 0 \
+  --temporal-ensemble --te-m 0.1 --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.02 --servol-max-pos-step 0.002 --trace-dir results/mini_lawam/traces --show-camera
 ```

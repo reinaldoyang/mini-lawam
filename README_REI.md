@@ -17,7 +17,12 @@ CUDA_VISIBLE_DEVICES="" /home/iclu200/miniconda3/envs/lawam/bin/python \
 python3 scripts/view_hdf5_gui.py --input /home/iclu200/reinaldoyang/LaWAM/dataset/multi_egg_114ep.hdf5
 ```
 
-## Evaluation
+### Convert data image observation size to 256
+```bash
+CUDA_VISIBLE_DEVICES=0 /home/ovxuser02@itriovx.local/miniconda3/envs/lawam/bin/python     convert_hdf5_to_256.py     --in  dataset/new_100ep_multi_egg_exp_plate.hdf5     --out dataset/new_100ep_multi_egg_exp_plate_256.hdf5 --overwrite
+```
+
+## Evaluate pretrained LaWM
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python   scripts/eval_lam_on_dataset.py 2>&1 | grep -avE "Materializing|it/s\]|Loading weights"
@@ -51,7 +56,41 @@ cd /home/iclu200/reinaldoyang/LaWAM
   --hdf5 dataset/multi_egg.hdf5 --demo 0 --frame 0
 ```
 
-## Real robot evaluation
+## Training
+
+Train 2 Phase: ConvPrior and Action expert, to better understand the model, we divide the training into two phase
+
+For the phase 1 and phase 2 command below, it uses an MLP head
+### Phase 1: distill the ConvPrior (run once; reused by both phase-2 variants)
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
+    --phase 1 --steps 10000 --out results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt
+```
+
+### Phase 2 — reuse the phase-1 prior above, to use wrist cam, just add --use-wrist
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
+    --phase 2 --use-wrist --prior-ckpt results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt \
+    --steps 10000 --batch 32 \
+    --out results/mini_lawam/ckpt_new_100ep_multi_egg_exp_plate_256.pt \
+    --csv-log results/mini_lawam/train_log_new_100ep_multi_exp_256_wrist.csv
+```
+
+## To use attention head
+
+Experiment 1 — attn head, isolate the un-pooling fix (your existing phase-1 prior, no proprioception, lower LR since transformers are LR-sensitive):
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
+  --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 --phase 2 --head attn --use-wrist \
+  --prior-ckpt results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt \
+  --steps 10000 --batch 32 --lr 1e-4 \
+  --out results/mini_lawam/ckpt_new_100ep_multi_egg_exp_plate_attn_256.pt --csv-log results/mini_lawam/log_attn.csv
+```
+
+Experiment 2: add proprioception
+
+
+## Real Robot Rollout
 ### Check camera serial number
 ```bash
 /home/iclu200/miniconda3/envs/lawam/bin/python -c "
@@ -67,28 +106,7 @@ CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_la
   --table-cam-serial 244422300964
 ```
 
-### Run camera + robot 
-```bash
-cd /home/iclu200/reinaldoyang/LaWAM
-CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_lawam.rollout_ur7e \
-  --table-cam-serial 244422300964 \
-  --robot-ip 140.96.93.125 \
-  --execute --use-gripper-control \
-  --trace-dir results/mini_lawam/traces
-```
-
-### Run camera + robot, with interpolation for smoother movement
-```bash
-CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_phase2.pt \
-  --table-cam-serial 244422300964 \
-  --robot-ip 140.96.93.125 --execute --use-gripper-control \
-  --max-reach 0.005 --target-deadband 0.004 --target-ema 0.3 \
-  --servol-max-pos-step 0.001 \
-  --trace-dir results/mini_lawam/traces --show-camera
-```
-
-### use wrist cam + table cam
+### use wrist cam + table cam, with interpolation for smoother movement
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_lawam.rollout_ur7e \
   --ckpt results/mini_lawam/ckpt_mult_egg_30_moved_256.pt \
@@ -114,31 +132,6 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --trace-dir results/mini_lawam/traces --show-camera
 ```
 
-## Train 2 Phase: ConvPrior and Action expert
-### Phase 1: distill the ConvPrior (run once; reused by both phase-2 variants)
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg_30_moved_256.hdf5 \
-    --phase 1 --steps 10000 --out results/mini_lawam/phase1_moved_256.pt
-```
-
-### Phase 2 (without wrist cam) — reuse the phase-1 prior above
-```bash
-CUDA_VISIBLE_DEVICES=1 python -m mini_lawam.train --hdf5 dataset/multi_egg_30_moved_256.hdf5 \
-    --phase 2 --prior-ckpt results/mini_lawam/phase1_moved_256.pt \
-    --steps 10000 --batch 32 \
-    --out results/mini_lawam/ckpt_moved_256.pt \
-    --csv-log results/mini_lawam/train_log_moved_256.csv
-```
-
-### Phase 2 (with wrist cam) — SAME phase-1 prior
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg_30_moved_256.hdf5 \
-    --phase 2 --use-wrist --prior-ckpt results/mini_lawam/phase1_moved_256.pt \
-    --steps 10000 --batch 32 \
-    --out results/mini_lawam/ckpt_moved_256_wrist.pt \
-    --csv-log results/mini_lawam/train_log_moved_256_wrist.csv
-```
-
 ## Evaluation 
 ### Phase 1 evaluation
 ```bash
@@ -158,28 +151,3 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.viz_subgoal \
     --hdf5 dataset/multi_egg.hdf5 --demo demo_0 --t 40 80 120
 ```
 
-
-## Attention head experiment
-
-Experiment 1 — attn head, isolate the un-pooling fix (your existing phase-1 prior, no proprioception, lower LR since transformers are LR-sensitive):
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
-  --hdf5 dataset/multi_egg_30_moved_256.hdf5 --phase 2 --head attn --use-wrist \
-  --prior-ckpt results/mini_lawam/phase1_moved_256.pt \
-  --steps 10000 --batch 32 --lr 1e-4 \
-  --out results/mini_lawam/ckpt_attn_256.pt --csv-log results/mini_lawam/log_attn.csv
-```
-
-Experiment 2: add proprioception
-
-
-
-Deployment: run the rollout
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_attn_256.pt \
-  --table-cam-serial 244422300964 --wrist-cam-serial 252122300792 \
-  --robot-ip 140.96.93.125 --execute --use-gripper-control --train-frame-hw 0 0 \
-  --temporal-ensemble --te-m 0.1 --target-ema 1.0 --target-deadband 0.0 \
-  --max-reach 0.02 --servol-max-pos-step 0.002 --trace-dir results/mini_lawam/traces --show-camera
-```

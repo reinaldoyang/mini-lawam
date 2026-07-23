@@ -76,6 +76,18 @@ class MiniLaWAMPolicy:
         vids, _ = gpu_two_view_video_aug(frames_u8, training=False)  # normalize on GPU
         return vids                                            # [1,1,3,256,256]
 
+    def model_input_u8(self, frame_hwc_uint8: np.ndarray) -> np.ndarray:
+        """The 256x256 uint8 image the policy ACTUALLY ingests (pre-normalization).
+
+        Same resize path as preprocess() but stops before ImageNet-normalizing, so
+        you can SEE exactly what the model sees (incl. the --train-frame-hw downscale).
+        """
+        x = torch.from_numpy(np.ascontiguousarray(frame_hwc_uint8)).permute(2, 0, 1)
+        if self.pre_resize is not None and tuple(x.shape[-2:]) != self.train_frame_hw:
+            x = self.pre_resize(x).to(torch.uint8)
+        x = self.resize(x).to(torch.uint8)
+        return x.permute(1, 2, 0).numpy()                      # HWC uint8 256x256
+
     # ---- the venue-independent output ----
     @torch.no_grad()
     def act(self, frame_hwc_uint8: np.ndarray,
@@ -104,7 +116,15 @@ class MiniLaWAMPolicy:
             state = torch.from_numpy(s).view(1, 3).to(self.device)
         pred = self.model.predict(o_t, wrist=wrist, state=state)    # [1,H,4], z-scored
         pred = pred[0].cpu().numpy().astype(np.float32)
-        return pred * self.action_std + self.action_mean   # un-normalize -> [H,4]
+        chunk = pred * self.action_std + self.action_mean  # un-normalize -> [H,4]
+        if getattr(self.cfg, "target_mode", "abs") == "delta":
+            # Delta targets: compose absolute positions from the CURRENT eef pos.
+            # Each replan re-anchors at the true arm position -> servo-like loop.
+            if state_xyz is None:
+                raise ValueError("checkpoint trained with target_mode='delta' -> pass "
+                                 "state_xyz (current eef xyz) to compose absolute targets")
+            chunk[:, :3] += np.asarray(state_xyz, np.float32)
+        return chunk
 
     # >>> SEAM (venue-specific): implement per setup, do NOT bake in here.
     #   - target -> command:  real UR7e: delta = eef_pos - current_TCP -> servoL;
@@ -155,8 +175,11 @@ if __name__ == "__main__":
             g = f["data"][demo]
             frame = g["obs"]["table_cam"][args.t]
             wrist = g["obs"]["wrist_cam"][args.t] if policy.cfg.use_wrist else None
+            # current eef pos: proprioception (use_state) and/or delta anchor
+            need_xyz = (getattr(policy.cfg, "use_state", False)
+                        or getattr(policy.cfg, "target_mode", "abs") == "delta")
             st = (g["obs"]["eef_pos_base"][args.t].astype(np.float32)
-                  if getattr(policy.cfg, "use_state", False) else None)
+                  if need_xyz else None)
             gt_pos = g["obs"]["eef_pos_base"][args.t + 1].astype(np.float32)
             gt_grip = float(g["actions"][args.t + 1, 6])
         chunk = policy.act(frame, wrist, state_xyz=st)
@@ -185,8 +208,10 @@ if __name__ == "__main__":
                 g = data[demo]
                 frame = g["obs"]["table_cam"][t]                       # (H,W,3) u8
                 wrist = g["obs"]["wrist_cam"][t] if policy.cfg.use_wrist else None
+                need_xyz = (getattr(policy.cfg, "use_state", False)
+                            or getattr(policy.cfg, "target_mode", "abs") == "delta")
                 st = (g["obs"]["eef_pos_base"][t].astype(np.float32)
-                      if getattr(policy.cfg, "use_state", False) else None)
+                      if need_xyz else None)
                 gt = _read_target(g, t + 1, H, "eef_pos_base", 6)      # [H,4] physical
                 pred = policy.act(frame, wrist, state_xyz=st)          # [H,4] physical
                 pos_l2 += np.linalg.norm(pred[:, :3] - gt[:, :3], axis=1).mean()

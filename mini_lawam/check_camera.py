@@ -77,11 +77,16 @@ def resize_hw(frame: np.ndarray, w: int, h: int) -> np.ndarray:
     return cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
 
 
-def evaluate(policy, live, ref_feats, baseline_min, home_xyz):
+def evaluate(policy, live, ref_feats, baseline_min, home_xyz, wrist_live=None):
     lf = token_feats(policy, live)
     sims = [fcos(lf, rf) for rf in ref_feats]
     live_cos, best_ref = max(sims), int(np.argmax(sims))
-    chunk = policy.act(live)
+    # act() requires the wrist frame when the checkpoint uses the wrist view, and
+    # current eef xyz for use_state/delta checkpoints (robot sits at HOME here).
+    need_xyz = (getattr(policy.cfg, "use_state", False)
+                or getattr(policy.cfg, "target_mode", "abs") == "delta")
+    chunk = policy.act(live, wrist_live,
+                       state_xyz=home_xyz if need_xyz else None)
     gap_cm = float(np.linalg.norm(chunk[0, :3] - home_xyz)) * 100.0
     feat_ok = live_cos >= baseline_min
     pred_ok = gap_cm <= 5.0
@@ -123,6 +128,11 @@ def main():
                     metavar=("H", "W"),
                     help="Match rollout_ur7e: recorded training resolution. Use 0 0 "
                          "for native-256 checkpoints (multi_egg_30_moved_256).")
+    # per-camera exposure/gain (0.1 ms units), matching rollout_ur7e. None = auto.
+    ap.add_argument("--table-exposure", type=float, default=None)
+    ap.add_argument("--table-gain", type=float, default=None)
+    ap.add_argument("--wrist-exposure", type=float, default=None)
+    ap.add_argument("--wrist-gain", type=float, default=None)
     args = ap.parse_args()
 
     train_hw = None if args.train_frame_hw[0] <= 0 else tuple(args.train_frame_hw)
@@ -161,7 +171,8 @@ def main():
         print(f"[fake-live] using {demo} t={t} as the live frame")
     else:
         from mini_lawam.rollout_ur7e import RealSenseTableReader
-        reader = RealSenseTableReader(args.table_cam_serial)
+        reader = RealSenseTableReader(args.table_cam_serial, name="table_cam",
+                                      exposure=args.table_exposure, gain=args.table_gain)
         reader.start()
         get_live = reader.read_rgb
 
@@ -171,15 +182,18 @@ def main():
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        # live (camera res) and refs (dataset res) differ in size -> common canvas.
-        ref = resize_hw(ref_frames[r["best_ref"]], 640, 480)
-        live_r = resize_hw(live, 640, 480)
-        blend = (0.5 * live_r.astype(np.float32) + 0.5 * ref.astype(np.float32)).astype(np.uint8)
-        diff = np.abs(live_r.astype(np.int16) - ref.astype(np.int16)).mean(-1)
+        # Show EXACTLY what the policy ingests: the 256x256 model input (after the
+        # --train-frame-hw downscale), for both live and the dataset ref -- upscaled
+        # only for display. This is the real like-for-like the features compare.
+        mlive = resize_hw(policy.model_input_u8(live), 640, 480)
+        mref = resize_hw(policy.model_input_u8(ref_frames[r["best_ref"]]), 640, 480)
+        blend = (0.5 * mlive.astype(np.float32) + 0.5 * mref.astype(np.float32)).astype(np.uint8)
+        diff = np.abs(mlive.astype(np.int16) - mref.astype(np.int16)).mean(-1)
         fig, axes = plt.subplots(1, 4, figsize=(20, 4.6))
         for ax, im, ttl in zip(
-                axes, [live_r, ref, blend, diff],
-                ["LIVE", f"dataset ref ({ref_names[r['best_ref']]} t=0)",
+                axes, [mlive, mref, blend, diff],
+                ["LIVE model input (256)",
+                 f"dataset ref model input ({ref_names[r['best_ref']]} t=0)",
                  "50/50 blend (edges should align)", "abs diff"]):
             ax.imshow(im, cmap="magma" if im.ndim == 2 else None)
             ax.set_title(ttl, fontsize=11)
@@ -203,7 +217,9 @@ def main():
             get_wrist = lambda: fake_w  # noqa: E731
         else:
             from mini_lawam.rollout_ur7e import RealSenseTableReader
-            wrist_reader = RealSenseTableReader(args.wrist_cam_serial)
+            wrist_reader = RealSenseTableReader(args.wrist_cam_serial, name="wrist_cam",
+                                                exposure=args.wrist_exposure,
+                                                gain=args.wrist_gain)
             wrist_reader.start()
             get_wrist = wrist_reader.read_rgb
 
@@ -216,12 +232,17 @@ def main():
 
     if args.once:
         live = get_live()
-        r = evaluate(policy, live, ref_feats, baseline_min, home_xyz)
+        wrist_live = get_wrist() if get_wrist is not None else None
+        r = evaluate(policy, live, ref_feats, baseline_min, home_xyz,
+                     wrist_live=wrist_live)
         for line in report_text(r, baseline_min, baseline_mean, home_xyz, ref_names):
             print(line)
-        if get_wrist is not None:
-            wline, _ = wrist_line()
-            print(wline)
+        if wrist_live is not None:
+            cos, _ = feature_cos_vs_refs(policy, wrist_live, wrist_feats)
+            ok = cos >= wrist_baseline_min
+            print(f"WRIST feature cos(live, dataset) = {cos:.4f}   "
+                  f"(baseline wrist min={wrist_baseline_min:.4f})   "
+                  f"{'OK (>=baseline)' if ok else 'LOW (wrist also OOD)'}")
         print(f"report -> {save_report(live, r)}")
         return
 
@@ -248,7 +269,9 @@ def main():
                 elif ev.key == pygame.K_s:
                     print(f"snapshot -> {save_report(live, r, tag='_snap')}")
         live = get_live()
-        r = evaluate(policy, live, ref_feats, baseline_min, home_xyz)
+        wrist_live = get_wrist() if get_wrist is not None else None
+        r = evaluate(policy, live, ref_feats, baseline_min, home_xyz,
+                     wrist_live=wrist_live)
         # resize BOTH to the panel size first (live is 640x480, dataset refs are smaller)
         live_d = resize_hw(live, W, H)
         ref_d = resize_hw(ref_frames[ref_idx], W, H)

@@ -103,6 +103,11 @@ def main():
     ap.add_argument("--use-state", action="store_true",
                     help="Feed proprioception (current eef_pos, z-scored) to the head. "
                          "Helps 'how far to descend' but risks BC copycat -- try both.")
+    ap.add_argument("--target", choices=["abs", "delta"], default="abs",
+                    help="Action target: 'abs' = absolute eef positions (v0); 'delta' = "
+                         "pos[t+i]-pos[t] relative to the current frame. Delta composes "
+                         "as current_TCP + prediction at deploy (servo-like; immune to "
+                         "systematic absolute-position bias).")
     ap.add_argument("--phase", choices=["1", "2", "joint"], default="joint",
                     help="1: train prior only (L_distill). 2: load --prior-ckpt, train "
                          "action head (L_act + 0.1*L_distill + 0.1*L_wm). joint: original "
@@ -155,19 +160,25 @@ def main():
           f"action head {'skipped' if prior_only else 'trains'} | "
           f"lambda_distill={lambda_distill} lambda_wm={lambda_wm} | out={args.out}")
 
+    if args.use_state and args.target == "delta":
+        raise SystemExit("--use-state + --target delta unsupported: the checkpoint "
+                         "stores DELTA stats, which cannot z-score an absolute state.")
+
     # One horizon for both the LaWM future pair and the action chunk.
     state_dim = 3 if args.use_state else 0   # proprioception = current eef_pos [x,y,z]
     cfg = MiniLaWAMConfig(use_wrist=args.use_wrist, head_type=args.head,
                           use_state=args.use_state, state_dim=state_dim,
+                          target_mode=args.target,
                           future_horizon=args.horizon, action_horizon=args.horizon,
                           lambda_distill=lambda_distill, lambda_wm=lambda_wm)
-    print(f"head={args.head} | use_wrist={args.use_wrist} | use_state={args.use_state}")
+    print(f"head={args.head} | use_wrist={args.use_wrist} | use_state={args.use_state} "
+          f"| target={args.target}")
 
     # gap = future horizon (LaWM pair, o_{t+future_horizon}); horizon = action chunk.
     ds = MiniLaWAMDataset(
         args.hdf5, gap=cfg.future_horizon, horizon=cfg.action_horizon,
         sample_stride=args.sample_stride, use_wrist=args.use_wrist,
-        use_state=args.use_state,
+        use_state=args.use_state, target_mode=args.target,
     )
     print(f"horizons: future(LaWM)={cfg.future_horizon}  action_chunk={cfg.action_horizon} "
           f"(gap between o_t and o_T = {cfg.future_horizon} frames)")

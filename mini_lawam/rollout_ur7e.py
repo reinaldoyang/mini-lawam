@@ -149,8 +149,17 @@ def build_parser():
     p.add_argument("--wrist-cam-serial", default="",
                    help="RealSense serial for wrist_cam (REQUIRED if the checkpoint "
                         "was trained with use_wrist=True)")
+    # per-camera exposure/gain (0.1 ms units, matching record_real.py). None = auto.
+    p.add_argument("--table-exposure", type=float, default=None,
+                   help="table_cam manual exposure in 0.1ms units (omit = auto).")
+    p.add_argument("--table-gain", type=float, default=None,
+                   help="table_cam manual gain (only applies with --table-exposure).")
+    p.add_argument("--wrist-exposure", type=float, default=None,
+                   help="wrist_cam manual exposure in 0.1ms units (omit = auto).")
+    p.add_argument("--wrist-gain", type=float, default=None,
+                   help="wrist_cam manual gain (only applies with --wrist-exposure).")
     p.add_argument("--show-camera", action="store_true",
-                   help="live window: raw table_cam + the 256x256 model-input view")
+                   help="live window: the 256x256 model-input view(s)")
     p.add_argument("--video-scale", type=float, default=1.0, help="display window scale")
     p.add_argument("--offline-image", default=None,
                    help="HDF5 path or image file: dry-run inference without a camera. "
@@ -160,6 +169,10 @@ def build_parser():
     p.add_argument("--pygame-window-w", type=int, default=560)
     p.add_argument("--pygame-window-h", type=int, default=150)
     p.add_argument("--trace-dir", default=None, help="save per-rollout JSON traces here")
+    p.add_argument("--save-frames", type=int, default=0,
+                   help="Save the live table/wrist frames fed to the policy every N "
+                        "control steps into <trace-dir>/frames_trial_XXX/ (0 = off). "
+                        "Lets failures be analyzed offline on the exact inputs.")
     return p
 
 
@@ -167,10 +180,15 @@ def build_parser():
 # Camera: single-cam background reader (slim version of LAPA's pair reader)
 # ----------------------------------------------------------------------------
 class RealSenseTableReader:
-    def __init__(self, serial: str):
+    def __init__(self, serial: str, name: str = "table_cam",
+                 exposure=None, gain=None):
         import pyrealsense2 as rs
         self.rs = rs
         self.serial = str(serial)
+        self.name = name
+        # exposure in 0.1 ms units (same convention as record_real.py). None = auto.
+        self.exposure = exposure
+        self.gain = gain
         self.lock = threading.Lock()
         self.last_frame = None       # RGB uint8 [H,W,3]
         self.last_time = None
@@ -178,6 +196,32 @@ class RealSenseTableReader:
         self.running = False
         self.pipeline = None
         self.thread = None
+
+    def _apply_color_options(self, profile):
+        """Set manual exposure/gain (or auto) on the color sensor, like record_real.py."""
+        rs = self.rs
+        color_sensor = None
+        for sensor in profile.get_device().query_sensors():
+            nm = sensor.get_info(rs.camera_info.name)
+            if "RGB" in nm or "Color" in nm:
+                color_sensor = sensor
+                break
+        if color_sensor is None:
+            print(f"[RS] {self.name} {self.serial}: no color sensor, skip exposure setup")
+            return
+        if self.exposure is None:
+            if color_sensor.supports(rs.option.enable_auto_exposure):
+                color_sensor.set_option(rs.option.enable_auto_exposure, 1)
+            print(f"[RS] {self.name} {self.serial}: AUTO exposure")
+        else:
+            color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+            color_sensor.set_option(rs.option.exposure, float(self.exposure))
+            msg = f"[RS] {self.name} {self.serial}: MANUAL exposure={self.exposure}"
+            if self.gain is not None:
+                color_sensor.set_option(rs.option.gain, float(self.gain))
+                msg += f" gain={self.gain}"
+            print(msg)
+        time.sleep(0.2)   # let the setting take effect before warmup frames
 
     def _start_pipeline(self, hardware_reset=False):
         rs = self.rs
@@ -196,8 +240,9 @@ class RealSenseTableReader:
         config.enable_device(self.serial)
         # rgb8 to match record_real.py (the training-data source).
         config.enable_stream(rs.stream.color, CAM_WIDTH, CAM_HEIGHT, rs.format.rgb8, CAM_FPS)
-        pipeline.start(config)
+        profile = pipeline.start(config)
         self.pipeline = pipeline
+        self._apply_color_options(profile)
         for _ in range(10):  # warmup
             try:
                 fs = pipeline.wait_for_frames(timeout_ms=1000)
@@ -208,7 +253,7 @@ class RealSenseTableReader:
                         self.last_time = time.time()
             except Exception:
                 pass
-        print(f"[RS] started table_cam serial={self.serial} {CAM_WIDTH}x{CAM_HEIGHT}@{CAM_FPS}")
+        print(f"[RS] started {self.name} serial={self.serial} {CAM_WIDTH}x{CAM_HEIGHT}@{CAM_FPS}")
 
     def _loop(self):
         while self.running:
@@ -311,15 +356,16 @@ class LatchedGripper:
 # ----------------------------------------------------------------------------
 # pygame status window (S/E/H/Q), same operator flow as LAPA/record_real
 # ----------------------------------------------------------------------------
-def init_pygame(args):
+def init_pygame(args, two_rows=False):
     import pygame
     pygame.init()
     pygame.display.set_caption("mini_lawam UR7e rollout")
     if args.show_camera:
         vs = float(args.video_scale)
-        raw_w, raw_h, mv = int(480 * vs), int(360 * vs), int(256 * vs)
-        w = 16 + raw_w + 10 + mv + 16
-        h = 96 + max(raw_h, mv) + 30
+        mv = int(256 * vs)
+        n = 2 if two_rows else 1           # table panel (+ wrist panel if use_wrist)
+        w = 16 + n * (mv + 10) + 6
+        h = 96 + mv + 30
         screen = pygame.display.set_mode((max(w, args.pygame_window_w), h))
     else:
         screen = pygame.display.set_mode((args.pygame_window_w, args.pygame_window_h))
@@ -328,27 +374,30 @@ def init_pygame(args):
     return pygame, screen, font, clock
 
 
-def draw_status(pygame, screen, font, mode, extra="", frame_rgb=None, video_scale=1.0):
-    """Status text + (optionally) the live camera: raw view | 256x256 model input."""
+def draw_status(pygame, screen, font, mode, extra="", frame_rgb=None,
+                wrist_rgb=None, video_scale=1.0):
+    """Status text + the 256x256 POLICY INPUT(s) side by side: table_cam [| wrist_cam].
+
+    Each panel is exactly what the model ingests (resized to 256). wrist_cam is
+    shown only when wrist_rgb is provided (checkpoint uses the wrist view).
+    """
     screen.fill((20, 20, 20))
     for i, line in enumerate([f"Mode: {mode}", "S=start  E=end  H=home  Q=quit", extra]):
         if line:
             screen.blit(font.render(line, True, (0, 255, 0)), (16, 18 + 26 * i))
-    if frame_rgb is not None:
-        vs = float(video_scale)
-        raw_w, raw_h, mv = int(480 * vs), int(360 * vs), int(256 * vs)
-        # pygame surfaces are (W,H,3)
-        surf = pygame.surfarray.make_surface(np.transpose(frame_rgb, (1, 0, 2)))
-        raw = pygame.transform.smoothscale(surf, (raw_w, raw_h))
+    vs = float(video_scale)
+    mv = int(256 * vs)
+    small = pygame.font.SysFont(None, 22)
+    x, y0 = 16, 96
+    for rgb, name in [(frame_rgb, "table_cam"), (wrist_rgb, "wrist_cam")]:
+        if rgb is None:
+            continue
+        surf = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))  # (W,H,3)
         model = pygame.transform.smoothscale(surf, (mv, mv))  # what the policy ingests
-        y0 = 96
-        screen.blit(raw, (16, y0))
-        screen.blit(model, (16 + raw_w + 10, y0))
-        small = pygame.font.SysFont(None, 22)
-        screen.blit(small.render("table_cam raw", True, (0, 255, 0)),
-                    (16, y0 + raw_h + 6))
-        screen.blit(small.render("model input 256x256", True, (0, 255, 0)),
-                    (16 + raw_w + 10, y0 + mv + 6))
+        screen.blit(model, (x, y0))
+        screen.blit(small.render(f"{name} input 256x256", True, (0, 255, 0)),
+                    (x, y0 + mv + 6))
+        x += mv + 10
     pygame.display.flip()
 
 
@@ -433,15 +482,18 @@ def main():
     pygame = screen = font = clock = None
 
     need_wrist = bool(policy.cfg.use_wrist)
-    need_state = bool(getattr(policy.cfg, "use_state", False))
-    print(f"[INFO] checkpoint use_wrist={need_wrist} use_state={need_state}")
+    target_mode = getattr(policy.cfg, "target_mode", "abs")
+    # current eef xyz is needed as proprioception (use_state) and/or as the
+    # composition anchor for delta targets (chunk = current_TCP + delta).
+    need_state = bool(getattr(policy.cfg, "use_state", False)) or target_mode == "delta"
+    print(f"[INFO] checkpoint use_wrist={need_wrist} "
+          f"use_state={getattr(policy.cfg, 'use_state', False)} target={target_mode}")
 
     def cur_state():
-        # proprioception for the head: current eef xyz (base frame), meters
         if not need_state:
             return None
         if not args.execute:
-            return np.zeros(3, dtype=np.float64)   # dry-run: no robot to read
+            return np.zeros(3, dtype=np.float64)   # dry-run: predictions print as deltas
         return np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)[:3]
 
     try:
@@ -451,24 +503,35 @@ def main():
             if need_wrist:
                 wrist_offline_frame = load_offline_frame(args.offline_image, cam="wrist_cam")
         elif args.table_cam_serial:
-            reader = RealSenseTableReader(args.table_cam_serial)
+            reader = RealSenseTableReader(args.table_cam_serial, name="table_cam",
+                                          exposure=args.table_exposure, gain=args.table_gain)
             reader.start()
             if need_wrist:
                 if not args.wrist_cam_serial:
                     raise ValueError("checkpoint has use_wrist=True -> --wrist-cam-serial required")
-                wrist_reader = RealSenseTableReader(args.wrist_cam_serial)
+                wrist_reader = RealSenseTableReader(args.wrist_cam_serial, name="wrist_cam",
+                                                    exposure=args.wrist_exposure,
+                                                    gain=args.wrist_gain)
                 wrist_reader.start()
                 print(f"[RS] wrist_cam serial={args.wrist_cam_serial} (aux view)")
         else:
             raise ValueError("need --table-cam-serial or --offline-image")
 
         def live_frame():
-            """Newest frame for the pygame display (None if --show-camera off)."""
+            """Newest table frame for the pygame display (None if --show-camera off)."""
             if not args.show_camera:
                 return None
             if offline_frame is not None:
                 return offline_frame
             return reader.latest() if reader is not None else None
+
+        def live_wrist():
+            """Newest wrist frame for the display (None unless the policy uses wrist)."""
+            if not args.show_camera or not need_wrist:
+                return None
+            if wrist_offline_frame is not None:
+                return wrist_offline_frame
+            return wrist_reader.latest() if wrist_reader is not None else None
 
         if args.execute:
             import rtde_control
@@ -498,7 +561,7 @@ def main():
                 locked_rotvec = DEMO_LOCKED_ROTVEC.copy()
                 print(f"[ROT] locked_rotvec (fixed, from demos) = {np.round(locked_rotvec, 4)}")
 
-        pygame, screen, font, clock = init_pygame(args)
+        pygame, screen, font, clock = init_pygame(args, two_rows=need_wrist)
 
         trial, quit_all = 0, False
         while trial < args.num_rollouts and not quit_all:
@@ -506,7 +569,8 @@ def main():
             print("[IDLE] S=start  H=home  Q=quit")
             while True:
                 draw_status(pygame, screen, font, "IDLE", "waiting for S / H / Q",
-                            frame_rgb=live_frame(), video_scale=args.video_scale)
+                            frame_rgb=live_frame(), wrist_rgb=live_wrist(),
+                            video_scale=args.video_scale)
                 cmd = poll_cmd(pygame)
                 if cmd == "start":
                     break
@@ -576,13 +640,29 @@ def main():
                           else wrist_reader.read_rgb())
                 return fr, wf
 
+            frames_dir = None
+            if args.save_frames > 0 and args.trace_dir:
+                frames_dir = (Path(args.trace_dir) /
+                              f"frames_trial_{trial:03d}_{time.strftime('%Y%m%d%H%M%S')}")
+                frames_dir.mkdir(parents=True, exist_ok=True)
+                print(f"[FRAMES] saving every {args.save_frames} steps -> {frames_dir}")
+
+            def dump_frames(step, fr, wf):
+                if frames_dir is None or step % args.save_frames != 0:
+                    return
+                from PIL import Image
+                Image.fromarray(fr).save(frames_dir / f"{step:05d}_table.jpg", quality=92)
+                if wf is not None:
+                    Image.fromarray(wf).save(frames_dir / f"{step:05d}_wrist.jpg", quality=92)
+
             ensemble = {}   # temporal-ensemble buffer: abs step -> list of chunk rows (oldest..newest)
             stop_cmd = None
             while step < args.max_steps:
                 t0 = time.time()
                 draw_status(pygame, screen, font, "ROLLOUT",
                             f"step {step}  E=end H=home Q=quit",
-                            frame_rgb=live_frame(), video_scale=args.video_scale)
+                            frame_rgb=live_frame(), wrist_rgb=live_wrist(),
+                            video_scale=args.video_scale)
                 cmd = poll_cmd(pygame)
                 if cmd in ("end", "home", "quit"):
                     stop_cmd = cmd
@@ -592,6 +672,7 @@ def main():
                     # Re-plan every step; execute a weighted average over all overlapping
                     # chunks' predictions for THIS timestep (newest weighted most).
                     frame, wrist_frame = read_frames()
+                    dump_frames(step, frame, wrist_frame)
                     t_inf = time.time()
                     chunk = policy.act(frame, wrist_frame, state_xyz=cur_state())
                     inf_ms = (time.time() - t_inf) * 1e3
@@ -622,6 +703,7 @@ def main():
 
                 # --- default: receding horizon, execute k waypoints per re-plan ---
                 frame, wrist_frame = read_frames()
+                dump_frames(step, frame, wrist_frame)
                 t_inf = time.time()
                 chunk = policy.act(frame, wrist_frame, state_xyz=cur_state())
                 inf_ms = (time.time() - t_inf) * 1e3
@@ -630,7 +712,8 @@ def main():
                     if args.show_camera:
                         draw_status(pygame, screen, font, "ROLLOUT",
                                     f"step {step}  E=end H=home Q=quit",
-                                    frame_rgb=live_frame(), video_scale=args.video_scale)
+                                    frame_rgb=live_frame(), wrist_rgb=live_wrist(),
+                            video_scale=args.video_scale)
                     cmd = poll_cmd(pygame)
                     if cmd in ("end", "home", "quit"):
                         stop_cmd = cmd

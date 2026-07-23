@@ -51,15 +51,43 @@ def _read_target(g, t0: int, n: int, pos_key: str, grip_col: int) -> np.ndarray:
     return np.concatenate([pos, grip], axis=1)                    # [n,4]
 
 
-def compute_action_stats(hdf5_path: str, pos_key: str, grip_col: int
+def _read_target_delta(g, t: int, n: int, pos_key: str, grip_col: int) -> np.ndarray:
+    """Delta [(pos[t+i]-pos[t])(3), action_gripper(1)] for i=1..n.
+
+    Position targets are RELATIVE to the current frame t (per-chunk anchor), so
+    at deployment the chunk composes as current_TCP + delta -- servo-like,
+    immune to systematic bias in absolute-position regression. Gripper stays raw.
+    """
+    anchor = g["obs"][pos_key][t].astype(np.float32)               # [3]
+    pos = g["obs"][pos_key][t + 1:t + 1 + n].astype(np.float32)    # [n,3]
+    grip = g["actions"][t + 1:t + 1 + n, grip_col:grip_col + 1].astype(np.float32)
+    return np.concatenate([pos - anchor, grip], axis=1)            # [n,4]
+
+
+def compute_action_stats(hdf5_path: str, pos_key: str, grip_col: int,
+                         target_mode: str = "abs", horizon: int = 24,
                          ) -> Tuple[np.ndarray, np.ndarray]:
-    """Per-dim mean/std over all [eef_pos_base, action_gripper] targets."""
+    """Per-dim mean/std of the targets.
+
+    abs  : over all [eef_pos_base, action_gripper] frames.
+    delta: over all chunk deltas pos[t+i]-pos[t], i=1..horizon (positions), with
+           gripper stats from the raw gripper channel.
+    """
     chunks = []
     with h5py.File(hdf5_path, "r") as f:
         for demo in f["data"].keys():
             g = f["data"][demo]
             T = int(g["obs"][pos_key].shape[0])
-            chunks.append(_read_target(g, 0, T, pos_key, grip_col))
+            if target_mode == "abs":
+                chunks.append(_read_target(g, 0, T, pos_key, grip_col))
+            else:
+                pos = g["obs"][pos_key][...].astype(np.float32)
+                grip = g["actions"][:, grip_col:grip_col + 1].astype(np.float32)
+                for i in range(1, horizon + 1):
+                    if T <= i:
+                        break
+                    d = pos[i:] - pos[:-i]                       # [T-i,3]
+                    chunks.append(np.concatenate([d, grip[i:]], axis=1))
     alla = np.concatenate(chunks, axis=0)
     mean = alla.mean(axis=0)
     std = alla.std(axis=0)
@@ -82,6 +110,7 @@ class MiniLaWAMDataset(Dataset):
         use_wrist: bool = False,
         wrist_key: str = WRIST_KEY_DEFAULT,
         use_state: bool = False,
+        target_mode: str = "abs",    # "abs" = absolute eef positions; "delta" = pos[t+i]-pos[t]
     ):
         self.hdf5_path = hdf5_path
         self.gap = int(gap)
@@ -92,10 +121,14 @@ class MiniLaWAMDataset(Dataset):
         self.use_wrist = use_wrist
         self.wrist_key = wrist_key
         self.use_state = use_state   # proprioception = current eef_pos at frame t
+        assert target_mode in ("abs", "delta"), target_mode
+        self.target_mode = target_mode
         self.resize = v2.Resize(image_hw, antialias=True)
         self.index = build_index(hdf5_path, self.gap, self.horizon, sample_stride)
         if action_mean is None or action_std is None:
-            action_mean, action_std = compute_action_stats(hdf5_path, pos_key, grip_col)
+            action_mean, action_std = compute_action_stats(
+                hdf5_path, pos_key, grip_col,
+                target_mode=target_mode, horizon=self.horizon)
         self.action_mean = np.asarray(action_mean, dtype=np.float32)
         self.action_std = np.asarray(action_std, dtype=np.float32)
         self._file: Optional[h5py.File] = None  # opened lazily per worker
@@ -118,8 +151,11 @@ class MiniLaWAMDataset(Dataset):
         cam = g["obs"]["table_cam"]
         frames = torch.stack([self._frame(cam, t), self._frame(cam, t + self.gap)], 0)  # [2,3,256,256]
 
-        # Absolute EEF target trajectory over the next H steps (t+1 .. t+H).
-        raw = _read_target(g, t + 1, self.horizon, self.pos_key, self.grip_col)  # [h,4]
+        # Target trajectory over the next H steps (t+1 .. t+H): absolute or delta.
+        if self.target_mode == "delta":
+            raw = _read_target_delta(g, t, self.horizon, self.pos_key, self.grip_col)
+        else:
+            raw = _read_target(g, t + 1, self.horizon, self.pos_key, self.grip_col)  # [h,4]
         h = raw.shape[0]
         raw = (raw - self.action_mean) / self.action_std
         dim = self.action_mean.shape[0]

@@ -76,7 +76,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/new_100ep_multi
     --csv-log results/mini_lawam/train_log_new_100ep_multi_exp_256_wrist.csv
 ```
 
-## To use attention head
+### To use attention head
 
 Experiment 1 — attn head, isolate the un-pooling fix (your existing phase-1 prior, no proprioception, lower LR since transformers are LR-sensitive):
 ```bash
@@ -85,6 +85,17 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
   --prior-ckpt results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt \
   --steps 10000 --batch 32 --lr 1e-4 \
   --out results/mini_lawam/ckpt_new_100ep_multi_egg_exp_plate_attn_256.pt --csv-log results/mini_lawam/log_attn.csv
+```
+
+### To use delta position instead of absolute position
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
+  --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
+  --phase 2 --head attn --use-wrist --target delta \
+  --prior-ckpt results/mini_lawam/phase1_moved_256.pt \
+  --steps 10000 --batch 32 --lr 1e-4 \
+  --out results/mini_lawam/ckpt_100ep_attn_delta.pt \
+  --csv-log results/mini_lawam/log_100ep_attn_delta.csv
 ```
 
 Experiment 2: add proprioception
@@ -122,12 +133,25 @@ CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python -m mini_la
 ### use wrist cam + table cam + 256 image size + temporal ensemble for action chunking
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_mult_egg_30_moved_256.pt \
+  --ckpt results/mini_lawam/ckpt_new_100ep_multi_egg_exp_plate_attn_256.pt \
   --table-cam-serial 244422300964 --wrist-cam-serial 252122300792 \
   --robot-ip 140.96.93.125 --execute --use-gripper-control \
   --train-frame-hw 0 0 \
   --temporal-ensemble --te-m 0.1 \
   --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.02 --servol-max-pos-step 0.002 \
+  --trace-dir results/mini_lawam/traces --show-camera
+```
+
+### Add exposure and also use the resolution of the observation state during data collection 
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
+  --ckpt results/mini_lawam/ckpt_new_100ep_multi_egg_exp_plate_attn_256.pt \
+  --table-cam-serial 244422300964 --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 --wrist-exposure 100 --wrist-gain 16 \
+  --robot-ip 140.96.93.125 --execute --use-gripper-control \
+  --train-frame-hw 168 224 \
+  --temporal-ensemble --te-m 0.1 --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.02 --servol-max-pos-step 0.002 \
   --trace-dir results/mini_lawam/traces --show-camera
 ```

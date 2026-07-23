@@ -48,6 +48,8 @@ class MiniLaWAMConfig:
                                       # (never the prior/LaWM -- paper §C.2; wrist moves w/ arm)
     head_type: str = "mlp"           # "mlp" = pooled-features MLP (v0);
                                       # "attn" = token-level cross-attention (no pooling)
+    target_mode: str = "abs"         # "abs" = absolute eef positions;
+                                      # "delta" = pos[t+i]-pos[t] (servo-like at deploy)
     hidden: int = 512                # MLP head width
     attn_hidden: int = 384           # attn head width
     attn_layers: int = 3

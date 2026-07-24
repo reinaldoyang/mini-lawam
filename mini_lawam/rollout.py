@@ -92,7 +92,8 @@ class MiniLaWAMPolicy:
     @torch.no_grad()
     def act(self, frame_hwc_uint8: np.ndarray,
             wrist_hwc_uint8: Optional[np.ndarray] = None,
-            state_xyz: Optional[np.ndarray] = None) -> np.ndarray:
+            state_xyz: Optional[np.ndarray] = None,
+            return_subgoal_change: bool = False):
         """Frame -> physical 4D action chunk [H, 4] = [eef_pos_base(3), gripper(1)].
 
         Absolute EEF positions (meters, base frame) + raw gripper channel. This is
@@ -101,6 +102,11 @@ class MiniLaWAMPolicy:
         `wrist_hwc_uint8` (the aux wrist_cam frame at the same timestep). If trained
         with use_state=True, pass `state_xyz` = current eef_pos [x,y,z] in meters
         (base frame); it is z-scored here with the same stats as training.
+
+        With `return_subgoal_change=True`, return `(chunk, change_grid)`, where
+        `change_grid` is the per-patch DINO feature-change magnitude
+        `||u_hat_T - u_t||` for the predicted subgoal. The grid is derived from
+        the same inference pass, so visualization does not run DINO a second time.
         """
         o_t = self.preprocess(frame_hwc_uint8)
         wrist = None
@@ -114,7 +120,21 @@ class MiniLaWAMPolicy:
                 raise ValueError("checkpoint trained with use_state=True -> pass state_xyz")
             s = (np.asarray(state_xyz, np.float32) - self.action_mean[:3]) / self.action_std[:3]
             state = torch.from_numpy(s).view(1, 3).to(self.device)
-        pred = self.model.predict(o_t, wrist=wrist, state=state)    # [1,H,4], z-scored
+        model_out = self.model.predict(
+            o_t, wrist=wrist, state=state, return_subgoal=return_subgoal_change
+        )
+        subgoal_change = None
+        if return_subgoal_change:
+            pred, u_t_tokens, u_hat_tokens = model_out
+            change = (u_hat_tokens[0] - u_t_tokens[0]).norm(dim=-1)
+            grid = int(round(np.sqrt(change.numel())))
+            if grid * grid != change.numel():
+                raise RuntimeError(
+                    f"DINO patch-token count {change.numel()} is not a square grid"
+                )
+            subgoal_change = change.reshape(grid, grid).cpu().numpy().astype(np.float32)
+        else:
+            pred = model_out
         pred = pred[0].cpu().numpy().astype(np.float32)
         chunk = pred * self.action_std + self.action_mean  # un-normalize -> [H,4]
         if getattr(self.cfg, "target_mode", "abs") == "delta":
@@ -124,6 +144,8 @@ class MiniLaWAMPolicy:
                 raise ValueError("checkpoint trained with target_mode='delta' -> pass "
                                  "state_xyz (current eef xyz) to compose absolute targets")
             chunk[:, :3] += np.asarray(state_xyz, np.float32)
+        if return_subgoal_change:
+            return chunk, subgoal_change
         return chunk
 
     # >>> SEAM (venue-specific): implement per setup, do NOT bake in here.

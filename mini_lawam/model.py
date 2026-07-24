@@ -268,17 +268,23 @@ class MiniLaWAM(nn.Module):
 
     @torch.no_grad()
     def predict(self, o_t: torch.Tensor, state: Optional[torch.Tensor] = None,
-                wrist: Optional[torch.Tensor] = None) -> torch.Tensor:
+                wrist: Optional[torch.Tensor] = None,
+                return_subgoal: bool = False):
         """Inference: current frame (+ optional wrist view) -> action chunk.
 
         No future frame needed. Pass `wrist` [B,1,3,256,256] iff cfg.use_wrist.
+        With `return_subgoal=True`, also return the current and predicted-subgoal
+        DINO patch tokens as `(pred, u_t, u_hat_T)` without recomputing features.
         """
         u_t = self._feat(o_t)[:, :1]
         z_hat = self.prior(u_t[:, 0])
         u_hat_T = self.lam.decoder(u_t, z_hat)
         if isinstance(u_hat_T, tuple):
             u_hat_T = u_hat_T[0]
-        return self._action_pred(u_t[:, 0], u_hat_T[:, 0], wrist=wrist, state=state)
+        pred = self._action_pred(u_t[:, 0], u_hat_T[:, 0], wrist=wrist, state=state)
+        if return_subgoal:
+            return pred, u_t[:, 0], u_hat_T[:, 0]
+        return pred
 
 
 if __name__ == "__main__":

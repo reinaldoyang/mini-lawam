@@ -2,7 +2,7 @@
 
 A minimal, **LaWAM-inspired vision-only behavior-cloning policy** built inside the
 LaWAM repo, deployed on a real **UR7e** (egg pick-and-place). Read this to
-understand the whole system before touching code. Last updated: 2026-07-22.
+understand the whole system before touching code. Last updated: 2026-07-24.
 
 ## 1. What it is (one paragraph)
 
@@ -33,11 +33,8 @@ teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distil
 - **Horizon H = 24 frames = 1.2 s @ 20 Hz** for BOTH the LaWM pair gap and the
   action chunk (`--horizon`, default 24).
 - Target (`--target`, stored in ckpt as `target_mode`): `abs` = absolute
-  `[eef_pos_base(3), gripper]` (v0); `delta` = `pos[t+i]-pos[t]` relative to the
-  current frame — deployment composes `current_TCP + Δ` each replan (servo-like,
-  immune to systematic absolute-position bias; added 2026-07-23 to counter the
-  constant ~8-10 cm live grasp offset — mirrors lapa-barry's delta action space).
-  All z-scored (stats in ckpt). `--use-state` + delta is disallowed (stats clash).
+  `[eef_pos_base(3), gripper]` (v0); `delta` = displacement from the current
+  frame. See the exact delta contract below.
 - `use_wrist`: wrist_cam feeds the **action head only** (never prior/LaWM — §C.2).
 - `use_state` (optional, off in current ckpts): current eef xyz as extra head input.
 - Inference `predict()`: current frame(s) only → chunk. No future frame.
@@ -49,6 +46,37 @@ teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distil
 - `head_type="attn"` (~7.4M): `AttnActionHead` — per-timestep queries, 3
   cross-attn blocks (hidden 384, 6 heads) over all patch tokens. **Use this.**
 
+### Delta action contract (current deployment)
+
+The deployed `ckpt_100ep_attn_delta.pt` uses `target_mode="delta"`,
+`action_horizon=24`, `head_type="attn"`, `use_wrist=True`, and
+`use_state=False`. For an anchor frame `t`, training row `i` is:
+
+```
+chunk[i] = [pos[t+i+1] - pos[t], gripper[t+i+1]],  i = 0..23
+```
+
+- Each XYZ row is a **cumulative displacement from the same `pos[t]` anchor**,
+  in meters in the UR base frame. It is NOT an incremental
+  `pos[t+i+1]-pos[t+i]` command, and rows must never be cumulatively summed.
+- Gripper remains the raw action channel (approximately −1 open / +1 close).
+  Rotation is not predicted; rollout uses the fixed `DEMO_LOCKED_ROTVEC`.
+- Delta targets are z-scored during training. This checkpoint stores
+  `mean=[-0.01014, 0.01642, -0.01199, -0.11442]` and
+  `std=[0.03221, 0.04150, 0.03942, 0.99418]`.
+- During deployment, rollout samples the measured current TCP once and passes it
+  to `MiniLaWAMPolicy.act()`. The policy unnormalizes the chunk and converts
+  every row to an absolute target:
+  `target_xyz[i] = current_TCP_xyz + predicted_delta[i]`.
+- `use_state=False` means TCP XYZ is **not a neural-network input**. The live TCP
+  is still required outside the network as the delta-composition anchor.
+- With temporal ensembling, rollout replans at 20 Hz, re-anchors every new chunk
+  at the newly measured TCP, averages overlapping **absolute XYZ targets**, and
+  executes one ensembled waypoint. The 500 Hz servo thread then interpolates
+  toward that target.
+- `target_mode` is checkpoint-controlled; there is no deployment CLI switch.
+  Old checkpoints without the field fall back to `abs`.
+
 ## 3. Two-phase training (current workflow)
 
 Phase 1 trains ConvPrior only (distillation); phase 2 loads that prior (frozen)
@@ -57,19 +85,25 @@ once per dataset, reuse for all phase-2 variants**.
 
 ```bash
 # Phase 1 (prior only; ~3M params; best ckpt on val loss_distill)
-python -m mini_lawam.train --hdf5 <data.hdf5> --phase 1 --steps 10000 \
+python -m mini_lawam.train --hdf5 <data.hdf5> --phase 1 --target delta --steps 10000 \
     --out results/mini_lawam/phase1_<name>.pt
 
-# Phase 2 (attention head + wrist; lr 1e-4 for the transformer head)
+# Phase 2 (attention head + wrist + delta target; lr 1e-4)
 python -m mini_lawam.train --hdf5 <data.hdf5> --phase 2 --head attn --use-wrist \
+    --target delta \
     --prior-ckpt results/mini_lawam/phase1_<name>.pt \
     --steps 10000 --batch 32 --lr 1e-4 \
-    --out results/mini_lawam/ckpt_<name>_attn.pt --csv-log results/mini_lawam/log_<name>.csv
+    --out results/mini_lawam/ckpt_<name>_attn_delta.pt \
+    --csv-log results/mini_lawam/log_<name>_attn_delta.csv
 ```
 `--phase joint` = original single-phase. Phase-2 ckpt is self-contained
 (prior + head + cfg + action stats) → deployment needs only that one file.
-`head_type`/`use_wrist`/`use_state` are stored in the ckpt and auto-detected
-everywhere downstream.
+`head_type`/`use_wrist`/`use_state`/`target_mode` are stored in the ckpt and
+auto-detected everywhere downstream. Phase 1 itself is target-independent
+(distillation only), so an existing absolute-target prior can be reused for a
+delta phase 2; phase 2 must still pass `--target delta`. Do not combine
+`--use-state` with `--target delta`: training rejects it because delta action
+statistics cannot normalize an absolute TCP state.
 
 ## 4. Datasets (all robomimic HDF5, 20 Hz, UR7e)
 
@@ -94,7 +128,10 @@ everywhere downstream.
    Good: R² ≥ ~0.85, margin recovery ≥ 70%. (100ep prior: R²≈0.93, 99%.)
 2. **Offline action error**: `python -m mini_lawam.rollout --mode eval --ckpt <p2.pt> --hdf5 <data>`
    → step-0/horizon L2 (cm), per-dim MAE, gripper acc, train vs val.
-   Current best (100ep attn): **1.6 cm step-0, z-MAE 0.62 cm, 99.2% gripper** — model is NOT the bottleneck.
+   The evaluator reads `target_mode` and reconstructs absolute positions for
+   delta checkpoints using each dataset frame's current EEF position. The
+   100ep absolute-attn reference was **1.6 cm step-0, z-MAE 0.62 cm,
+   99.2% gripper**.
 3. **Subgoal viz**: `python -m mini_lawam.viz_subgoal --ckpt <any ckpt with prior> --hdf5 <data> --demo demo_0 --t 40 80`
    → PCA maps + pred-vs-true change heatmaps of the LaWM subgoal.
 4. **Pre-flight camera check** (robot at HOME, before every rollout session):
@@ -111,17 +148,19 @@ servoL stack: background 500 Hz thread interpolates toward a shared target TCP;
 policy loop at 20 Hz. Orientation locked to `DEMO_LOCKED_ROTVEC` (tool down);
 gripper close at 23 mm. Keys: S start / E end / H home / Q quit.
 
-**Current best-practice command (100ep attn checkpoint):**
+**Current best-practice command (100ep attention + delta checkpoint):**
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_new_100ep_multi_egg_exp_plate_attn_256.pt \
+  --ckpt results/mini_lawam/ckpt_100ep_attn_delta.pt \
   --table-cam-serial 244422300964 --wrist-cam-serial 252122300792 \
   --table-exposure 180 --table-gain 16 --wrist-exposure 100 --wrist-gain 16 \
   --robot-ip 140.96.93.125 --execute --use-gripper-control \
   --train-frame-hw 168 224 \
-  --temporal-ensemble --te-m 0.1 --target-ema 1.0 --target-deadband 0.0 \
+  --temporal-ensemble --te-m 0.1 --delta-scale 1.0 \
+  --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.02 --servol-max-pos-step 0.002 \
-  --trace-dir results/mini_lawam/traces --save-frames 8 --show-camera
+  --trace-dir results/mini_lawam/traces \
+  --show-camera --show-subgoal --subgoal-update-steps 8
 ```
 
 **The deployment-matching rules (each one was a debugged failure):**
@@ -138,9 +177,30 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   Gripper deliberately taken from the **newest chunk[0] only** (averaging a
   ±1 switch fires it early → grasps 4 cm high; measured + fixed).
   Old receding-horizon mode (exec 8/replan) remains the non-TE fallback.
+- Delta composition happens before temporal ensembling: each new chunk is
+  anchored at the actual TCP measured for that replan. `--max-reach` then limits
+  how far the resulting absolute target may be from the actual TCP;
+  `--servol-max-pos-step` limits the 500 Hz interpolated command step.
+- `--delta-scale` is a deployment-only XYZ gain for delta checkpoints:
+  `target_xyz = anchor_xyz + delta_scale * predicted_delta`. It is applied before
+  temporal ensembling, target smoothing, and safety clamps, and never changes
+  the gripper channel. `1.0` exactly preserves existing behavior. Increase
+  gradually (`1.25`, then `1.5`; test `2.0` only after confirming TCP tracking).
+  Non-default values are rejected for absolute-target checkpoints.
 - `--save-frames 8` dumps the exact policy-input frames per rollout → offline
   forensics (`policy.act` on saved frames, nearest-neighbor vs dataset, etc.).
+- `--trace-dir` always saves the first table frame plus a compact summary JSON
+  (`started_at`, `finished_at`, S-to-H duration, steps, and frame path).
 - GUI shows the **256×256 model inputs** (table + wrist) — what the policy sees.
+- `--show-subgoal` adds a live heatmap over the table input using the predicted
+  DINO feature change `||u_hat_T-u_t||`. Red/yellow patches indicate where the
+  LaWM subgoal predicts the largest visual-feature change. It reuses tokens from
+  the action inference pass rather than running DINO twice; `--subgoal-alpha`
+  controls overlay opacity. The GUI refreshes the heatmap every
+  `--subgoal-update-steps` policy inferences (default 8, approximately 2.5 Hz
+  with temporal ensembling) and holds the previous overlay between updates.
+  This display throttle does not freeze or otherwise change the internal
+  subgoal used by the action policy.
 
 ## 7. Debug history — what broke and what fixed it (chronological)
 
@@ -160,16 +220,13 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
 7. **MLP pooled head plateau**: 2.2–3.2 cm offline, train≈val (fit limit, not
    data limit) → replaced pooling with cross-attention head → clear improvement
    (user-confirmed on robot; offline 1.6 cm on 100ep).
-8. **OPEN ISSUE (as of 2026-07-22)**: with everything matched, the 100ep attn
-   policy approaches but **overshoots the egg by ~8–10 cm in y and hovers at
-   z≈0.24 over the BOWL (behind the plate), gripper dithering**. Intent
-   reconstruction from saved frames: model plans a full grasp at [0.07, 0.53]
-   (grip_end +1, z 0.19) — it believes the egg is where the bowl is. Camera
-   shift ruled out (0.6 px). Leading hypothesis: the bowl's yellow, egg-like
-   contents hijack egg localization. Pending experiments:
-   **(A) empty-bowl test** — remove bowl contents, rerun;
-   **(B) measure true egg TCP** (freedrive over egg,
-   `rtde_receive.getActualTCPPose()`) → exact miss vector.
+8. **Absolute-target live offset**: the 100ep absolute-attn policy overshot the
+   egg by ~8–10 cm in y despite good offline error. Delta targets were added on
+   2026-07-23 to remove dependence on regressing a globally biased absolute
+   position: each replan now predicts motion relative to the measured TCP.
+   Current deployment checkpoint: `ckpt_100ep_attn_delta.pt`. This addresses the
+   action-coordinate failure mode; it does not solve visual misidentification
+   (for example, confusing bowl contents with the egg).
 
 ## 8. Environment
 
@@ -194,9 +251,15 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   `.detach().clone()`d in `_teacher()`.
 - Phase-1 ckpts have NO action head/stats → `rollout.py` can't load them
   (`eval_prior`/`viz_subgoal` can).
+- Delta rows are all relative to one chunk anchor; do not integrate them across
+  the horizon. Deployment must provide current TCP XYZ to `policy.act()` even
+  though the checkpoint has `use_state=False`.
+- `--use-state --target delta` is intentionally unsupported. Also never deploy a
+  delta-trained head as `abs`: use the checkpoint's `target_mode`.
 - `check_camera`/`rollout_ur7e` share `RealSenseTableReader` (name, exposure,
   gain per camera). Quit one before starting the other (camera is exclusive).
-- Trace JSONs store `pred_xyz`/`tgt_xyz`/`grip` per control step — the analysis
-  scripts in the debug history all read these.
+- Rollout summary JSONs are compact and no longer contain per-step
+  `pred_xyz`/`tgt_xyz`/`grip`; use `--save-frames N` when frame-level forensics
+  are needed.
 - h5py truncated-file EOF error after copying a dataset = incomplete transfer;
   check file size.

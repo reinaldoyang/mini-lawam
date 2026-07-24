@@ -140,18 +140,20 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --temporal-ensemble --te-m 0.1 \
   --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.02 --servol-max-pos-step 0.002 \
-  --trace-dir results/mini_lawam/traces --show-camera
+  --trace-dir results/mini_lawam/traces \
+  --show-camera --show-subgoal --subgoal-update-steps 8
 ```
 
 ### Add exposure and also use the resolution of the observation state during data collection 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_new_100ep_multi_egg_exp_plate_attn_256.pt \
+  --ckpt results/mini_lawam/ckpt_100ep_attn_delta.pt \
   --table-cam-serial 244422300964 --wrist-cam-serial 252122300792 \
   --table-exposure 180 --table-gain 16 --wrist-exposure 100 --wrist-gain 16 \
   --robot-ip 140.96.93.125 --execute --use-gripper-control \
   --train-frame-hw 168 224 \
-  --temporal-ensemble --te-m 0.1 --target-ema 1.0 --target-deadband 0.0 \
+  --temporal-ensemble --te-m 0.1 --delta-scale 1.25 \
+  --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.02 --servol-max-pos-step 0.002 \
   --trace-dir results/mini_lawam/traces --show-camera
 ```
@@ -174,4 +176,3 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.viz_subgoal \
     --ckpt results/mini_lawam/prior_phase1.pt \
     --hdf5 dataset/multi_egg.hdf5 --demo demo_0 --t 40 80 120
 ```
-

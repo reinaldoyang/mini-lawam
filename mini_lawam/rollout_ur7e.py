@@ -83,6 +83,12 @@ def build_parser():
                    help="Temporal-ensemble weight decay: newest prediction weight 1, a "
                         "prediction made 'age' steps ago gets exp(-te_m*age). Larger = more "
                         "responsive/less smooth; smaller = smoother/laggier. ACT uses ~0.01.")
+    p.add_argument("--delta-scale", type=float, default=1.0,
+                   help="Deployment gain for XYZ deltas from a delta-target checkpoint. "
+                        "1.0 preserves the learned motion; values >1 command larger "
+                        "translations. Applied before temporal ensembling and safety clamps. "
+                        "Does not affect the gripper; non-default values require a "
+                        "delta-target checkpoint.")
     p.add_argument("--max-steps", type=int, default=2000, help="max control steps per rollout")
     p.add_argument("--num-rollouts", type=int, default=10)
     p.add_argument("--startup-wait-sec", type=float, default=1.0)
@@ -160,6 +166,16 @@ def build_parser():
                    help="wrist_cam manual gain (only applies with --wrist-exposure).")
     p.add_argument("--show-camera", action="store_true",
                    help="live window: the 256x256 model-input view(s)")
+    p.add_argument("--show-subgoal", action="store_true",
+                   help="add a live table-camera overlay of predicted DINO feature change "
+                        "||u_hat_T-u_t|| (requires --show-camera). Red/yellow patches are "
+                        "where the predicted subgoal differs most from the observation.")
+    p.add_argument("--subgoal-alpha", type=float, default=0.55,
+                   help="opacity of the live subgoal heatmap in [0,1] (default: 0.55)")
+    p.add_argument("--subgoal-update-steps", type=int, default=8,
+                   help="refresh the displayed subgoal heatmap every N policy inferences "
+                        "and hold it between updates (default: 8, about 2.5 Hz when the "
+                        "policy runs at 20 Hz). Does not change policy inference/control.")
     p.add_argument("--video-scale", type=float, default=1.0, help="display window scale")
     p.add_argument("--offline-image", default=None,
                    help="HDF5 path or image file: dry-run inference without a camera. "
@@ -168,7 +184,8 @@ def build_parser():
     # UI / debug
     p.add_argument("--pygame-window-w", type=int, default=560)
     p.add_argument("--pygame-window-h", type=int, default=150)
-    p.add_argument("--trace-dir", default=None, help="save per-rollout JSON traces here")
+    p.add_argument("--trace-dir", default=None,
+                   help="save per-rollout summary JSON and the first table-camera frame here")
     p.add_argument("--save-frames", type=int, default=0,
                    help="Save the live table/wrist frames fed to the policy every N "
                         "control steps into <trace-dir>/frames_trial_XXX/ (0 = off). "
@@ -363,7 +380,7 @@ def init_pygame(args, two_rows=False):
     if args.show_camera:
         vs = float(args.video_scale)
         mv = int(256 * vs)
-        n = 2 if two_rows else 1           # table panel (+ wrist panel if use_wrist)
+        n = 1 + int(bool(two_rows)) + int(bool(args.show_subgoal))
         w = 16 + n * (mv + 10) + 6
         h = 96 + mv + 30
         screen = pygame.display.set_mode((max(w, args.pygame_window_w), h))
@@ -375,11 +392,11 @@ def init_pygame(args, two_rows=False):
 
 
 def draw_status(pygame, screen, font, mode, extra="", frame_rgb=None,
-                wrist_rgb=None, video_scale=1.0):
-    """Status text + the 256x256 POLICY INPUT(s) side by side: table_cam [| wrist_cam].
+                wrist_rgb=None, subgoal_rgb=None, video_scale=1.0):
+    """Status text + policy inputs and optional predicted-subgoal overlay.
 
-    Each panel is exactly what the model ingests (resized to 256). wrist_cam is
-    shown only when wrist_rgb is provided (checkpoint uses the wrist view).
+    `subgoal_rgb` is the table input overlaid with per-patch
+    `||u_hat_T-u_t||`; it is already 256x256 RGB.
     """
     screen.fill((20, 20, 20))
     for i, line in enumerate([f"Mode: {mode}", "S=start  E=end  H=home  Q=quit", extra]):
@@ -389,13 +406,18 @@ def draw_status(pygame, screen, font, mode, extra="", frame_rgb=None,
     mv = int(256 * vs)
     small = pygame.font.SysFont(None, 22)
     x, y0 = 16, 96
-    for rgb, name in [(frame_rgb, "table_cam"), (wrist_rgb, "wrist_cam")]:
+    panels = [
+        (frame_rgb, "table_cam input"),
+        (wrist_rgb, "wrist_cam input"),
+        (subgoal_rgb, "pred subgoal change (red=high)"),
+    ]
+    for rgb, name in panels:
         if rgb is None:
             continue
         surf = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))  # (W,H,3)
         model = pygame.transform.smoothscale(surf, (mv, mv))  # what the policy ingests
         screen.blit(model, (x, y0))
-        screen.blit(small.render(f"{name} input 256x256", True, (0, 255, 0)),
+        screen.blit(small.render(name, True, (0, 255, 0)),
                     (x, y0 + mv + 6))
         x += mv + 10
     pygame.display.flip()
@@ -426,6 +448,51 @@ def clamp_abs_target(pred_xyz, current_xyz, ws_min, ws_max, max_reach):
     return tgt
 
 
+def scale_delta_chunk(chunk, anchor_xyz, delta_scale):
+    """Scale a composed absolute chunk's XYZ displacement around its TCP anchor."""
+    scaled = np.asarray(chunk).copy()
+    anchor = np.asarray(anchor_xyz, dtype=scaled.dtype)
+    scaled[:, :3] = anchor + float(delta_scale) * (scaled[:, :3] - anchor)
+    return scaled
+
+
+def make_subgoal_overlay(model_input_rgb, change_grid, alpha=0.55):
+    """Colorize a DINO patch-change grid and blend it over the 256px model input."""
+    import cv2
+
+    base = np.asarray(model_input_rgb, dtype=np.uint8)
+    heat = np.nan_to_num(np.asarray(change_grid, dtype=np.float32),
+                         nan=0.0, posinf=0.0, neginf=0.0)
+    if heat.ndim != 2:
+        raise ValueError(f"subgoal change map must be 2D, got {heat.shape}")
+    lo, hi = np.percentile(heat, [5.0, 95.0])
+    if hi <= lo + 1e-8:
+        normalized = np.zeros_like(heat)
+    else:
+        normalized = np.clip((heat - lo) / (hi - lo), 0.0, 1.0)
+    resized = cv2.resize(normalized, (base.shape[1], base.shape[0]),
+                         interpolation=cv2.INTER_CUBIC)
+    heat_bgr = cv2.applyColorMap(
+        np.clip(resized * 255.0, 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO
+    )
+    heat_rgb = heat_bgr[:, :, ::-1].copy()
+    return cv2.addWeighted(base, 1.0 - float(alpha), heat_rgb, float(alpha), 0.0)
+
+
+def should_update_subgoal(enabled, inference_index, update_steps):
+    """Whether this inference should refresh the held GUI subgoal overlay."""
+    return bool(enabled) and int(inference_index) % int(update_steps) == 0
+
+
+def format_duration_hms(duration_sec: float) -> str:
+    """Format seconds as HH:MM:SS.mmm, matching the rollout summary schema."""
+    total_ms = int(round(float(duration_sec) * 1000.0))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
+
 def load_offline_frame(path: str, cam: str = "table_cam") -> np.ndarray:
     p = Path(path)
     if p.suffix in (".hdf5", ".h5"):
@@ -442,6 +509,14 @@ def load_offline_frame(path: str, cam: str = "table_cam") -> np.ndarray:
 # ----------------------------------------------------------------------------
 def main():
     args = build_parser().parse_args()
+    if not np.isfinite(args.delta_scale) or args.delta_scale < 0.0:
+        raise ValueError("--delta-scale must be a finite value >= 0")
+    if args.show_subgoal and not args.show_camera:
+        raise ValueError("--show-subgoal requires --show-camera")
+    if not np.isfinite(args.subgoal_alpha) or not 0.0 <= args.subgoal_alpha <= 1.0:
+        raise ValueError("--subgoal-alpha must be a finite value in [0,1]")
+    if args.subgoal_update_steps < 1:
+        raise ValueError("--subgoal-update-steps must be >= 1")
     if args.execute and args.offline_image:
         raise ValueError("--execute cannot be combined with --offline-image")
     if args.execute and not args.table_cam_serial:
@@ -486,8 +561,18 @@ def main():
     # current eef xyz is needed as proprioception (use_state) and/or as the
     # composition anchor for delta targets (chunk = current_TCP + delta).
     need_state = bool(getattr(policy.cfg, "use_state", False)) or target_mode == "delta"
+    if target_mode != "delta" and args.delta_scale != 1.0:
+        raise ValueError("--delta-scale only applies to a checkpoint with target_mode='delta'")
     print(f"[INFO] checkpoint use_wrist={need_wrist} "
-          f"use_state={getattr(policy.cfg, 'use_state', False)} target={target_mode}")
+          f"use_state={getattr(policy.cfg, 'use_state', False)} target={target_mode} "
+          f"delta_scale={args.delta_scale:g}")
+    if args.show_subgoal:
+        print("[VIZ] live predicted-subgoal feature-change overlay enabled "
+              f"(alpha={args.subgoal_alpha:g}, refresh every "
+              f"{args.subgoal_update_steps} policy inference(s))")
+
+    latest_subgoal_overlay = None
+    subgoal_inference_index = 0
 
     def cur_state():
         if not need_state:
@@ -495,6 +580,30 @@ def main():
         if not args.execute:
             return np.zeros(3, dtype=np.float64)   # dry-run: predictions print as deltas
         return np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)[:3]
+
+    def predict_chunk(frame, wrist_frame):
+        """Run one inference and apply the deployment-only delta gain."""
+        nonlocal latest_subgoal_overlay, subgoal_inference_index
+        anchor_xyz = cur_state()
+        update_subgoal = should_update_subgoal(
+            args.show_subgoal, subgoal_inference_index, args.subgoal_update_steps
+        )
+        subgoal_inference_index += 1
+        policy_out = policy.act(
+            frame, wrist_frame, state_xyz=anchor_xyz,
+            return_subgoal_change=update_subgoal,
+        )
+        if update_subgoal:
+            chunk, change_grid = policy_out
+            model_input = policy.model_input_u8(frame)
+            latest_subgoal_overlay = make_subgoal_overlay(
+                model_input, change_grid, alpha=args.subgoal_alpha
+            )
+        else:
+            chunk = policy_out
+        if target_mode == "delta" and args.delta_scale != 1.0:
+            chunk = scale_delta_chunk(chunk, anchor_xyz, args.delta_scale)
+        return chunk
 
     try:
         if args.offline_image:
@@ -565,14 +674,19 @@ def main():
 
         trial, quit_all = 0, False
         while trial < args.num_rollouts and not quit_all:
+            latest_subgoal_overlay = None
+            subgoal_inference_index = 0
             # ---- idle: wait for S / H / Q ----
             print("[IDLE] S=start  H=home  Q=quit")
             while True:
                 draw_status(pygame, screen, font, "IDLE", "waiting for S / H / Q",
                             frame_rgb=live_frame(), wrist_rgb=live_wrist(),
+                            subgoal_rgb=latest_subgoal_overlay,
                             video_scale=args.video_scale)
                 cmd = poll_cmd(pygame)
                 if cmd == "start":
+                    rollout_started_wall = time.time()
+                    rollout_started_perf = time.perf_counter()
                     break
                 if cmd == "home" and args.execute:
                     if gripper is not None:
@@ -592,6 +706,10 @@ def main():
                   + (f"  locked_rotvec={np.round(locked_rotvec, 4)}" if args.execute else ""))
             time.sleep(max(0.0, args.startup_wait_sec))
 
+            rollout_stamp = time.strftime("%Y%m%dT%H%M%S",
+                                           time.localtime(rollout_started_wall))
+            rollout_stem = f"trial_{trial:03d}_async_{rollout_stamp}"
+            first_table_frame = None
             trace = {"ckpt": str(Path(args.ckpt).resolve()), "execute": args.execute,
                      "exec_steps": k, "control_hz": args.control_hz, "steps": []}
             result = "completed"
@@ -633,11 +751,14 @@ def main():
                 return grip_cmd
 
             def read_frames():
+                nonlocal first_table_frame
                 fr = offline_frame if offline_frame is not None else reader.read_rgb()
                 wf = None
                 if need_wrist:
                     wf = (wrist_offline_frame if wrist_offline_frame is not None
                           else wrist_reader.read_rgb())
+                if first_table_frame is None:
+                    first_table_frame = fr.copy()
                 return fr, wf
 
             frames_dir = None
@@ -662,6 +783,7 @@ def main():
                 draw_status(pygame, screen, font, "ROLLOUT",
                             f"step {step}  E=end H=home Q=quit",
                             frame_rgb=live_frame(), wrist_rgb=live_wrist(),
+                            subgoal_rgb=latest_subgoal_overlay,
                             video_scale=args.video_scale)
                 cmd = poll_cmd(pygame)
                 if cmd in ("end", "home", "quit"):
@@ -674,7 +796,7 @@ def main():
                     frame, wrist_frame = read_frames()
                     dump_frames(step, frame, wrist_frame)
                     t_inf = time.time()
-                    chunk = policy.act(frame, wrist_frame, state_xyz=cur_state())
+                    chunk = predict_chunk(frame, wrist_frame)
                     inf_ms = (time.time() - t_inf) * 1e3
                     for j in range(H):
                         ensemble.setdefault(step + j, []).append(chunk[j])
@@ -705,7 +827,7 @@ def main():
                 frame, wrist_frame = read_frames()
                 dump_frames(step, frame, wrist_frame)
                 t_inf = time.time()
-                chunk = policy.act(frame, wrist_frame, state_xyz=cur_state())
+                chunk = predict_chunk(frame, wrist_frame)
                 inf_ms = (time.time() - t_inf) * 1e3
                 for i in range(k):
                     t0 = time.time()
@@ -713,7 +835,8 @@ def main():
                         draw_status(pygame, screen, font, "ROLLOUT",
                                     f"step {step}  E=end H=home Q=quit",
                                     frame_rgb=live_frame(), wrist_rgb=live_wrist(),
-                            video_scale=args.video_scale)
+                                    subgoal_rgb=latest_subgoal_overlay,
+                                    video_scale=args.video_scale)
                     cmd = poll_cmd(pygame)
                     if cmd in ("end", "home", "quit"):
                         stop_cmd = cmd
@@ -738,12 +861,33 @@ def main():
                 result = {"end": "ended", "home": "go_home", "quit": "quit"}[stop_cmd]
 
             trace["result"] = result
+            rollout_finished_wall = time.time()
+            duration_sec = round(time.perf_counter() - rollout_started_perf, 3)
+            print(f"[ROLLOUT] result={result} duration={duration_sec:.3f}s")
             if args.trace_dir:
                 out = Path(args.trace_dir)
                 out.mkdir(parents=True, exist_ok=True)
-                fp = out / f"trial_{trial:03d}_{time.strftime('%Y%m%d%H%M%S')}.json"
-                fp.write_text(json.dumps(trace, indent=2))
-                print(f"[TRACE] {fp}")
+                first_frame_path = None
+                if first_table_frame is not None:
+                    from PIL import Image
+                    first_frame_fp = out / f"{rollout_stem}_table_cam_first.png"
+                    Image.fromarray(first_table_frame).save(first_frame_fp)
+                    first_frame_path = first_frame_fp.as_posix()
+                    print(f"[FIRST FRAME] {first_frame_fp}")
+                summary = {
+                    "trial": trial,
+                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                                time.localtime(rollout_started_wall)),
+                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                                 time.localtime(rollout_finished_wall)),
+                    "duration_sec": duration_sec,
+                    "duration_hms": format_duration_hms(duration_sec),
+                    "steps_executed": len(trace["steps"]),
+                    "first_table_frame": first_frame_path,
+                }
+                fp = out / f"{rollout_stem}_summary.json"
+                fp.write_text(json.dumps(summary, indent=2) + "\n")
+                print(f"[SUMMARY] {fp}")
 
             if result == "go_home" and args.execute:
                 if gripper is not None:

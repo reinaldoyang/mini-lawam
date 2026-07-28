@@ -192,22 +192,24 @@ CUDA_VISIBLE_DEVICES=1 python -m mini_lawam.rollout_ur7e \
   --temporal-ensemble --te-m 0.1 --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.02 --servol-max-pos-step 0.002 \
   --trace-dir results/mini_lawam/traces --show-camera --show-subgoal --subgoal-alpha 0.55 \
-  --subgoal-update-steps 8
+  --subgoal-update-steps 8 --video-scale 2.0
 ```
 
-### Rollout of joystick target
+### Rollout of joystick target (gripper state on the bowl is stuck)
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --ckpt results/mini_lawam/ckpt_100ep_attn_joystick.pt \
   --table-cam-serial 244422300964 \
   --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 --wrist-exposure 100 --wrist-gain 16 \
   --robot-ip 140.96.93.7 --execute --use-gripper-control \
   --train-frame-hw 168 224 \
   --temporal-ensemble --te-m 0.3 \
-  --action-scale 0.3 \
+  --action-scale 0.305 \
   --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.02 --servol-max-pos-step 0.002 \
-  --show-camera
+  --show-camera --show-subgoal --subgoal-alpha 0.55 \
+  --subgoal-update-steps 8 --video-scale 2.0
 ```
 
 ## Evaluation 

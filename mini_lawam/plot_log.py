@@ -3,7 +3,7 @@
     python -m mini_lawam.plot_log                      # reads default CSV, saves PNG
     python -m mini_lawam.plot_log --csv path.csv --out curves.png
 
-Draws train vs. val for each loss (total / act / distill / wm) on shared axes.
+Draws train vs. val for each loss, including split XYZ/gripper losses when present.
 """
 
 import argparse
@@ -14,7 +14,10 @@ import matplotlib
 matplotlib.use("Agg")  # headless: save to file, no display needed
 import matplotlib.pyplot as plt  # noqa: E402
 
-LOSSES = ["loss_total", "loss_act", "loss_distill", "loss_wm"]
+LOSSES = [
+    "loss_total", "loss_act", "loss_xyz",
+    "loss_gripper", "loss_distill", "loss_wm",
+]
 
 
 def load(csv_path):
@@ -37,7 +40,7 @@ def main():
     args = ap.parse_args()
 
     data = load(args.csv)
-    fig, axes = plt.subplots(2, 2, figsize=(11, 7))
+    fig, axes = plt.subplots(2, 3, figsize=(14, 7))
     for ax, m in zip(axes.flat, LOSSES):
         for split, style in (("train", "-"), ("val", "o-")):
             steps, vals = data.get(split, {}).get(m, ([], []))

@@ -7,7 +7,7 @@ Structure (your diagram):
                           [pool(u_t), pool(u_hat_T), (state)] --MLP--> action chunk
 
 Losses:
-    loss_act     = MSE(pred_actions, actions)                 # behavior cloning
+    loss_act     = XYZ MSE + gripper BCE (binary-head mode), or legacy action MSE
     loss_distill = MSE(z_hat, z_teacher)                      # teacher = frozen LAM IDM(u_t,u_T)
     loss_wm      = MSE(u_hat_T, u_T)                          # subgoal supervision (light)
 
@@ -48,6 +48,8 @@ class MiniLaWAMConfig:
                                       # (never the prior/LaWM -- paper §C.2; wrist moves w/ arm)
     head_type: str = "mlp"           # "mlp" = pooled-features MLP (v0);
                                       # "attn" = token-level cross-attention (no pooling)
+    gripper_head: str = "regression" # "regression" = legacy joint 4D MSE output;
+                                      # "binary" = separate XYZ regression + grip logit
     target_mode: str = "abs"         # "abs" = absolute eef positions;
                                       # "delta" = pos[t+i]-pos[t];
                                       # "joystick" = raw action XYZ + gripper
@@ -55,6 +57,7 @@ class MiniLaWAMConfig:
     attn_hidden: int = 384           # attn head width
     attn_layers: int = 3
     attn_heads: int = 6
+    lambda_gripper: float = 1.0       # binary-head BCE weight relative to XYZ MSE
     lambda_distill: float = 1.0
     lambda_wm: float = 0.1            # subgoal supervision weight (0 to disable)
 
@@ -84,21 +87,45 @@ class ConvPrior(nn.Module):
 
 
 class MLPActionHead(nn.Module):
-    """[pooled conditioning] -> flat action chunk [B, H, action_dim] (v0: MSE)."""
+    """Pooled conditioning -> action chunk, with optional split binary grip head."""
 
-    def __init__(self, in_dim: int, action_dim: int, horizon: int, hidden: int = 512):
+    def __init__(self, in_dim: int, action_dim: int, horizon: int, hidden: int = 512,
+                 gripper_head: str = "regression"):
         super().__init__()
         self.horizon = horizon
         self.action_dim = action_dim
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.GELU(),
-            nn.Linear(hidden, hidden), nn.GELU(),
-            nn.Linear(hidden, horizon * action_dim),
-        )
+        self.gripper_head = gripper_head
+        if gripper_head == "regression":
+            # Keep the exact legacy module layout/state-dict keys so all existing
+            # checkpoints remain loadable.
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, hidden), nn.GELU(),
+                nn.Linear(hidden, hidden), nn.GELU(),
+                nn.Linear(hidden, horizon * action_dim),
+            )
+        elif gripper_head == "binary":
+            if action_dim != 4:
+                raise ValueError("binary gripper head requires action_dim=4 (XYZ + grip)")
+            self.trunk = nn.Sequential(
+                nn.Linear(in_dim, hidden), nn.GELU(),
+                nn.Linear(hidden, hidden), nn.GELU(),
+            )
+            self.xyz_out = nn.Linear(hidden, horizon * 3)
+            self.gripper_out = nn.Linear(hidden, horizon)
+        else:
+            raise ValueError(
+                f"unknown gripper_head {gripper_head!r} "
+                "(use 'regression' or 'binary')"
+            )
 
     def forward(self, cond: torch.Tensor) -> torch.Tensor:
         b = cond.shape[0]
-        return self.net(cond).view(b, self.horizon, self.action_dim)
+        if self.gripper_head == "regression":
+            return self.net(cond).view(b, self.horizon, self.action_dim)
+        feat = self.trunk(cond)
+        xyz = self.xyz_out(feat).view(b, self.horizon, 3)
+        grip_logits = self.gripper_out(feat).view(b, self.horizon, 1)
+        return torch.cat([xyz, grip_logits], dim=-1)
 
 
 class _CrossAttnBlock(nn.Module):
@@ -129,15 +156,19 @@ class AttnActionHead(nn.Module):
     One learned query per output timestep cross-attends to the DINO patch tokens
     of every view (u_t, u_hat_T, [wrist]) -- so the head reads *where* things are
     (arm/egg patches) instead of a single averaged vector. Optional proprioception
-    (current eef_pos) enters as an extra context token. Deterministic; MSE loss.
+    (current eef_pos) enters as an extra context token. The legacy mode regresses
+    all four outputs. Binary mode splits the final projection into normalized XYZ
+    regression and a single open/close logit per timestep.
     """
 
     def __init__(self, token_dim: int, action_dim: int, horizon: int,
                  n_views: int, hidden: int = 384, n_layers: int = 3,
-                 n_heads: int = 6, state_dim: int = 0):
+                 n_heads: int = 6, state_dim: int = 0,
+                 gripper_head: str = "regression"):
         super().__init__()
         self.horizon = horizon
         self.action_dim = action_dim
+        self.gripper_head = gripper_head
         self.in_proj = nn.Linear(token_dim, hidden)        # DINO token 768 -> hidden
         self.view_emb = nn.Parameter(torch.zeros(n_views, hidden))   # per-view tag
         self.queries = nn.Parameter(torch.zeros(horizon, hidden))    # per-step query
@@ -146,7 +177,19 @@ class AttnActionHead(nn.Module):
             [_CrossAttnBlock(hidden, n_heads) for _ in range(n_layers)]
         )
         self.norm = nn.LayerNorm(hidden)
-        self.out = nn.Linear(hidden, action_dim)
+        if gripper_head == "regression":
+            # Preserve the legacy key names (`out.weight`, `out.bias`) for old ckpts.
+            self.out = nn.Linear(hidden, action_dim)
+        elif gripper_head == "binary":
+            if action_dim != 4:
+                raise ValueError("binary gripper head requires action_dim=4 (XYZ + grip)")
+            self.xyz_out = nn.Linear(hidden, 3)
+            self.gripper_out = nn.Linear(hidden, 1)
+        else:
+            raise ValueError(
+                f"unknown gripper_head {gripper_head!r} "
+                "(use 'regression' or 'binary')"
+            )
         nn.init.normal_(self.queries, std=0.02)
         nn.init.normal_(self.view_emb, std=0.02)
 
@@ -160,7 +203,73 @@ class AttnActionHead(nn.Module):
         q = self.queries.unsqueeze(0).expand(b, -1, -1)    # [B, horizon, hidden]
         for layer in self.layers:
             q = layer(q, ctx)
-        return self.out(self.norm(q))                      # [B, horizon, action_dim]
+        feat = self.norm(q)
+        if self.gripper_head == "regression":
+            return self.out(feat)                          # [B, horizon, 4]
+        xyz = self.xyz_out(feat)                           # normalized XYZ
+        grip_logits = self.gripper_out(feat)               # unbounded close logits
+        return torch.cat([xyz, grip_logits], dim=-1)       # [B, horizon, 4]
+
+
+def compute_action_losses(
+    pred: torch.Tensor,
+    actions: torch.Tensor,
+    actions_mask: Optional[torch.Tensor],
+    gripper_targets: Optional[torch.Tensor],
+    gripper_head: str,
+    lambda_gripper: float,
+):
+    """Compute action losses without mixing continuous XYZ and binary grip targets.
+
+    `pred[..., :3]` and `actions[..., :3]` are normalized XYZ in both modes.
+    In binary mode `pred[..., 3]` is a close logit and `gripper_targets` is raw
+    class supervision (0=open, 1=close). Regression mode exactly preserves the
+    previous four-dimensional masked-MSE objective.
+    """
+
+    def masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]):
+        if mask is None:
+            return values.mean()
+        m = mask.to(values.dtype)
+        return (values * m).sum() / m.sum().clamp_min(1.0)
+
+    xyz_mask = None if actions_mask is None else actions_mask[..., :3]
+    loss_xyz = masked_mean((pred[..., :3] - actions[..., :3]) ** 2, xyz_mask)
+
+    if gripper_head == "regression":
+        grip_mask = None if actions_mask is None else actions_mask[..., 3]
+        loss_gripper = masked_mean(
+            (pred[..., 3] - actions[..., 3]) ** 2, grip_mask
+        )
+        loss_act = masked_mean(
+            (pred - actions) ** 2, actions_mask
+        )
+        return loss_act, loss_xyz, loss_gripper, None
+
+    if gripper_head != "binary":
+        raise ValueError(
+            f"unknown gripper_head {gripper_head!r} "
+            "(use 'regression' or 'binary')"
+        )
+    if gripper_targets is None:
+        raise ValueError("binary gripper head requires raw gripper_targets")
+
+    target = gripper_targets.to(pred.dtype)
+    if target.ndim == pred.ndim:
+        target = target.squeeze(-1)
+    if target.shape != pred[..., 3].shape:
+        raise ValueError(
+            f"gripper_targets shape {tuple(target.shape)} does not match logits "
+            f"{tuple(pred[..., 3].shape)}"
+        )
+    grip_mask = None if actions_mask is None else actions_mask[..., 3]
+    bce = F.binary_cross_entropy_with_logits(pred[..., 3], target, reduction="none")
+    loss_gripper = masked_mean(bce, grip_mask)
+    loss_act = loss_xyz + float(lambda_gripper) * loss_gripper
+
+    correct = ((pred[..., 3] >= 0) == (target >= 0.5)).to(pred.dtype)
+    gripper_accuracy = masked_mean(correct, grip_mask)
+    return loss_act, loss_xyz, loss_gripper, gripper_accuracy
 
 
 class MiniLaWAM(nn.Module):
@@ -178,12 +287,14 @@ class MiniLaWAM(nn.Module):
                 token_dim=vdim, action_dim=cfg.action_dim, horizon=cfg.action_horizon,
                 n_views=n_views, hidden=cfg.attn_hidden, n_layers=cfg.attn_layers,
                 n_heads=cfg.attn_heads, state_dim=state_dim,
+                gripper_head=cfg.gripper_head,
             )
         elif cfg.head_type == "mlp":
             # cond = [pool(u_t), pool(u_hat_T), (pool(wrist)), (state)]
             cond_dim = n_views * vdim + state_dim
             self.action_head = MLPActionHead(cond_dim, cfg.action_dim,
-                                             cfg.action_horizon, cfg.hidden)
+                                             cfg.action_horizon, cfg.hidden,
+                                             gripper_head=cfg.gripper_head)
         else:
             raise ValueError(f"unknown head_type {cfg.head_type!r} (use 'mlp' or 'attn')")
 
@@ -200,10 +311,11 @@ class MiniLaWAM(nn.Module):
         return out["quantized"].detach().clone(), out["tgt"].detach().clone()
 
     def _action_pred(self, u_t_tok, u_hat_tok, wrist=None, state=None):
-        """(u_t, u_hat_T) patch tokens [B,K,D] -> action chunk [B,H,action_dim].
+        """(u_t, u_hat_T) patch tokens [B,K,D] -> raw head output [B,H,4].
 
         Branches on cfg.head_type: 'attn' consumes tokens directly (no pooling);
-        'mlp' mean-pools each view first. Wrist/state added if configured.
+        'mlp' mean-pools each view first. Wrist/state added if configured. In
+        binary-gripper mode the final channel is a logit, not a normalized action.
         """
         wrist_tok = None
         if self.cfg.use_wrist:
@@ -228,6 +340,7 @@ class MiniLaWAM(nn.Module):
         o_T: torch.Tensor,          # [B, 1, 3, 256, 256]
         actions: Optional[torch.Tensor] = None,       # [B, H, action_dim] (unused if prior_only)
         actions_mask: Optional[torch.Tensor] = None,  # [B, H, action_dim] or None
+        gripper_targets: Optional[torch.Tensor] = None,  # [B,H,1], raw 0=open/1=close
         state: Optional[torch.Tensor] = None,         # [B, state_dim] or None
         wrist: Optional[torch.Tensor] = None,         # [B, 1, 3, 256, 256] or None (aux view)
         prior_only: bool = False,   # Phase 1: only L_distill; skip decoder + action head
@@ -242,6 +355,7 @@ class MiniLaWAM(nn.Module):
         if prior_only:
             zero = z_hat.new_zeros(())
             return {"loss_total": loss_distill, "loss_act": zero,
+                    "loss_xyz": zero, "loss_gripper": zero,
                     "loss_distill": loss_distill, "loss_wm": zero, "pred": None}
 
         assert actions is not None, "actions required unless prior_only=True"
@@ -252,20 +366,24 @@ class MiniLaWAM(nn.Module):
 
         pred = self._action_pred(u_t[:, 0], u_hat_T[:, 0], wrist=wrist, state=state)
 
-        if actions_mask is None:
-            loss_act = F.mse_loss(pred, actions)
-        else:
-            m = actions_mask.to(pred.dtype)
-            loss_act = ((pred - actions) ** 2 * m).sum() / m.sum().clamp_min(1.0)
+        loss_act, loss_xyz, loss_gripper, gripper_accuracy = compute_action_losses(
+            pred, actions, actions_mask, gripper_targets,
+            self.cfg.gripper_head, self.cfg.lambda_gripper,
+        )
 
         total = loss_act + self.cfg.lambda_distill * loss_distill + self.cfg.lambda_wm * loss_wm
-        return {
+        out = {
             "loss_total": total,
             "loss_act": loss_act,
+            "loss_xyz": loss_xyz,
+            "loss_gripper": loss_gripper,
             "loss_distill": loss_distill,
             "loss_wm": loss_wm,
             "pred": pred,
         }
+        if gripper_accuracy is not None:
+            out["gripper_accuracy"] = gripper_accuracy
+        return out
 
     @torch.no_grad()
     def predict(self, o_t: torch.Tensor, state: Optional[torch.Tensor] = None,

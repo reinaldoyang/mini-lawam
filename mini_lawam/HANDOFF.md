@@ -24,11 +24,16 @@ o_t(table) ─DINO(frozen)─► u_t ─ConvPrior─► ẑ ─LaWM decoder(froz
                             ▼                                            ▼
         action head:  MLP:  [pool(u_t) ‖ pool(û_T) ‖ pool(wrist)] ──► chunk [H,4]
                       ATTN: 24 learned queries cross-attend the RAW tokens of
-                            {u_t, û_T, wrist} (+optional state token) ──► chunk
+                            {u_t, û_T, wrist} (+optional state token)
+                              ├─ XYZ regression projection ─► [H,3]
+                              └─ optional binary grip projection ─► [H,1] logits
 teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distill ẑ ← z
 ```
 
-- Losses: `loss_act` (masked MSE on chunk) + `λ_d·loss_distill` + `λ_wm·loss_wm`.
+- Legacy `--gripper-head regression`: `loss_act` is masked MSE on all four
+  outputs. New `--gripper-head binary`: `loss_act = loss_xyz + λ_g·loss_gripper`,
+  where XYZ uses masked MSE and gripper uses binary cross-entropy on the raw
+  class (`0=open`, `1=close`). Binary inference emits exact `−1/+1`.
 - Frozen: DINOv3, LAM IDM teacher, LaWM decoder. Trainable: ConvPrior + head.
 - **Horizon H = 24 frames = 1.2 s @ 20 Hz** for BOTH the LaWM pair gap and the
   action chunk (`--horizon`, default 24).
@@ -46,6 +51,9 @@ teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distil
   grasp commits.
 - `head_type="attn"` (~7.4M): `AttnActionHead` — per-timestep queries, 3
   cross-attn blocks (hidden 384, 6 heads) over all patch tokens. **Use this.**
+- `gripper_head="regression"` preserves old checkpoint state dictionaries.
+  `gripper_head="binary"` shares the attention trunk but splits the final XYZ
+  and gripper projections; use it for new training.
 
 ### Delta action contract (current deployment)
 
@@ -118,7 +126,7 @@ python -m mini_lawam.train --hdf5 <data.hdf5> --phase 2 --head attn --use-wrist 
 
 # Alternative phase 2: same attention head/prior, raw joystick target
 python -m mini_lawam.train --hdf5 <data.hdf5> --phase 2 --head attn --use-wrist \
-    --target joystick \
+    --target joystick --gripper-head binary --lambda-gripper 1.0 \
     --prior-ckpt results/mini_lawam/phase1_<name>.pt \
     --steps 10000 --batch 32 --lr 1e-4 \
     --out results/mini_lawam/ckpt_<name>_attn_joystick.pt \
@@ -126,8 +134,9 @@ python -m mini_lawam.train --hdf5 <data.hdf5> --phase 2 --head attn --use-wrist 
 ```
 `--phase joint` = original single-phase. Phase-2 ckpt is self-contained
 (prior + head + cfg + action stats) → deployment needs only that one file.
-`head_type`/`use_wrist`/`use_state`/`target_mode` are stored in the ckpt and
-auto-detected everywhere downstream. Phase 1 itself is target-independent
+`head_type`/`gripper_head`/`use_wrist`/`use_state`/`target_mode` are stored in
+the ckpt and auto-detected everywhere downstream. Old checkpoints without
+`gripper_head` default to legacy regression. Phase 1 itself is target-independent
 (distillation only), so the same prior can be reused for delta and joystick
 phase 2 runs; phase 2 must pass the intended `--target`. Do not combine
 `--use-state` with `--target delta` or `--target joystick`: their target

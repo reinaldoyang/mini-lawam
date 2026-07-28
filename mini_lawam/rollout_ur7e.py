@@ -600,6 +600,7 @@ def main():
         raise ValueError(f"unsupported checkpoint target_mode={target_mode!r}")
     print(f"[INFO] checkpoint use_wrist={need_wrist} "
           f"use_state={getattr(policy.cfg, 'use_state', False)} target={target_mode} "
+          f"gripper_head={getattr(policy.cfg, 'gripper_head', 'regression')} "
           f"delta_scale={args.delta_scale:g}"
           + (f" action_scale={args.action_scale:g}" if target_mode == "joystick" else ""))
     if args.show_subgoal:

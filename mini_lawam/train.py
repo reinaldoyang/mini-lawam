@@ -19,7 +19,7 @@ Example:
     CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg.hdf5 \
         --phase 2 --prior-ckpt results/mini_lawam/prior_phase1.pt --steps 20000 --batch 32
     CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg.hdf5 \
-        --phase 2 --head attn --target joystick \
+        --phase 2 --head attn --gripper-head binary --target joystick \
         --prior-ckpt results/mini_lawam/prior_phase1.pt --steps 20000 --batch 32
 """
 
@@ -55,12 +55,13 @@ def to_inputs(batch, device):
     o_t, o_T = split_o_t_o_T(vids)
     actions = batch["actions"].to(device, non_blocking=True)
     mask = batch["actions_mask"].to(device, non_blocking=True)
+    gripper_targets = batch["gripper_targets"].to(device, non_blocking=True)
     wrist = None
     if "wrist_u8" in batch:
         w_u8 = batch["wrist_u8"].to(device, non_blocking=True).unsqueeze(1)  # [B,1,3,256,256]
         wrist, _ = gpu_two_view_video_aug(w_u8, training=False)              # same ImageNet norm
     state = batch["state"].to(device, non_blocking=True) if "state" in batch else None
-    return o_t, o_T, actions, mask, wrist, state
+    return o_t, o_T, actions, mask, gripper_targets, wrist, state
 
 
 @torch.no_grad()
@@ -70,9 +71,14 @@ def evaluate(model, loader, device, max_batches=20, prior_only=False, set_train_
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        o_t, o_T, actions, mask, wrist, state = to_inputs(batch, device)
-        out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist, state=state,
-                    prior_only=prior_only)
+        o_t, o_T, actions, mask, gripper_targets, wrist, state = to_inputs(
+            batch, device
+        )
+        out = model(
+            o_t, o_T, actions, actions_mask=mask,
+            gripper_targets=gripper_targets, wrist=wrist, state=state,
+            prior_only=prior_only,
+        )
         for k, v in out.items():
             if k != "pred":
                 tot[k] = tot.get(k, 0.0) + float(v)
@@ -103,6 +109,12 @@ def main():
     ap.add_argument("--head", choices=["mlp", "attn"], default="mlp",
                     help="Action head: 'mlp' = pooled-features MLP (v0); 'attn' = "
                          "token-level cross-attention (no mean-pooling, fixes precision).")
+    ap.add_argument(
+        "--gripper-head", choices=["regression", "binary"], default="regression",
+        help="'regression' preserves the legacy joint 4D MSE head/checkpoints; "
+             "'binary' uses separate XYZ regression and open/close-logit projections "
+             "with BCE loss. Use binary for new gripper-focused training.",
+    )
     ap.add_argument("--use-state", action="store_true",
                     help="Feed proprioception (current eef_pos, z-scored) to the head. "
                          "Helps 'how far to descend' but risks BC copycat -- try both.")
@@ -125,6 +137,10 @@ def main():
                     help="Override distill weight (default: 1.0 joint, 0.1 phase 2).")
     ap.add_argument("--lambda-wm", type=float, default=None,
                     help="Override wm/subgoal weight (default: 0.1).")
+    ap.add_argument(
+        "--lambda-gripper", type=float, default=1.0,
+        help="Binary gripper BCE weight relative to normalized XYZ MSE (default: 1.0).",
+    )
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--out", default=None,
@@ -163,7 +179,8 @@ def main():
     lambda_wm = args.lambda_wm if args.lambda_wm is not None else 0.1
     print(f"phase={args.phase} | prior {'trains' if train_prior else 'FROZEN'} | "
           f"action head {'skipped' if prior_only else 'trains'} | "
-          f"lambda_distill={lambda_distill} lambda_wm={lambda_wm} | out={args.out}")
+          f"lambda_distill={lambda_distill} lambda_wm={lambda_wm} "
+          f"lambda_gripper={args.lambda_gripper} | out={args.out}")
 
     if args.use_state and args.target != "abs":
         raise SystemExit(f"--use-state + --target {args.target} unsupported: the checkpoint "
@@ -173,12 +190,14 @@ def main():
     # One horizon for both the LaWM future pair and the action chunk.
     state_dim = 3 if args.use_state else 0   # proprioception = current eef_pos [x,y,z]
     cfg = MiniLaWAMConfig(use_wrist=args.use_wrist, head_type=args.head,
+                          gripper_head=args.gripper_head,
                           use_state=args.use_state, state_dim=state_dim,
                           target_mode=args.target,
                           future_horizon=args.horizon, action_horizon=args.horizon,
+                          lambda_gripper=args.lambda_gripper,
                           lambda_distill=lambda_distill, lambda_wm=lambda_wm)
     print(f"head={args.head} | use_wrist={args.use_wrist} | use_state={args.use_state} "
-          f"| target={args.target}")
+          f"| gripper_head={args.gripper_head} | target={args.target}")
 
     # gap = future horizon (LaWM pair, o_{t+future_horizon}); horizon = action chunk.
     ds = MiniLaWAMDataset(
@@ -220,14 +239,20 @@ def main():
     os.makedirs(os.path.dirname(args.csv_log) or ".", exist_ok=True)
     csv_file = open(args.csv_log, "w", newline="")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["step", "split", "loss_total", "loss_act",
-                         "loss_distill", "loss_wm", "lr"])
+    csv_writer.writerow([
+        "step", "split", "loss_total", "loss_act", "loss_xyz", "loss_gripper",
+        "gripper_accuracy", "loss_distill", "loss_wm", "lr",
+    ])
     csv_file.flush()
 
     def log_row(step, split, metrics, lr=""):
-        csv_writer.writerow([step, split,
-                             metrics.get("loss_total", ""), metrics.get("loss_act", ""),
-                             metrics.get("loss_distill", ""), metrics.get("loss_wm", ""), lr])
+        csv_writer.writerow([
+            step, split,
+            metrics.get("loss_total", ""), metrics.get("loss_act", ""),
+            metrics.get("loss_xyz", ""), metrics.get("loss_gripper", ""),
+            metrics.get("gripper_accuracy", ""),
+            metrics.get("loss_distill", ""), metrics.get("loss_wm", ""), lr,
+        ])
         csv_file.flush()
 
     run = None
@@ -247,9 +272,14 @@ def main():
     step, best_val = 0, float("inf")
     while step < args.steps:
         for batch in train_loader:
-            o_t, o_T, actions, mask, wrist, state = to_inputs(batch, device)
-            out = model(o_t, o_T, actions, actions_mask=mask, wrist=wrist, state=state,
-                        prior_only=prior_only)
+            o_t, o_T, actions, mask, gripper_targets, wrist, state = to_inputs(
+                batch, device
+            )
+            out = model(
+                o_t, o_T, actions, actions_mask=mask,
+                gripper_targets=gripper_targets, wrist=wrist, state=state,
+                prior_only=prior_only,
+            )
             opt.zero_grad(set_to_none=True)
             out["loss_total"].backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -261,7 +291,14 @@ def main():
                 train_m = {k: float(v) for k, v in out.items() if k != "pred"}
                 print(f"step {step:>6} | total {train_m['loss_total']:.4f} "
                       f"act {train_m['loss_act']:.4f} distill {train_m['loss_distill']:.4f} "
-                      f"wm {train_m['loss_wm']:.4f} | lr {lr:.2e}")
+                      f"wm {train_m['loss_wm']:.4f}"
+                      + (
+                          f" xyz {train_m['loss_xyz']:.4f} "
+                          f"grip {train_m['loss_gripper']:.4f} "
+                          f"grip_acc {train_m['gripper_accuracy'] * 100:.1f}%"
+                          if "gripper_accuracy" in train_m else ""
+                      )
+                      + f" | lr {lr:.2e}")
                 log_row(step, "train", train_m, lr)
                 if run is not None:
                     run.log({**{f"train/{k}": v for k, v in train_m.items()},

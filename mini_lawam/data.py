@@ -4,6 +4,7 @@ Yields, per sample:
     frames_u8   : uint8 [2, 3, 256, 256]  = (o_t, o_{t+gap}) from table_cam, resized
     actions     : float [H, target_dim]   = normalized target chunk
     actions_mask: float [H, target_dim]    = 1 for valid steps, 0 for right-padding
+    gripper_targets: float [H, 1]          = raw binary class (0=open, 1=close)
 
 The target is selected by ``target_mode``:
     abs      : [eef_pos[t+i+1] (3), raw_gripper[t+i+1] (1)]
@@ -198,17 +199,24 @@ class MiniLaWAMDataset(Dataset):
         else:
             raw = _read_target(g, t + 1, self.horizon, self.pos_key, self.grip_col)  # [h,4]
         h = raw.shape[0]
-        raw = (raw - self.action_mean) / self.action_std
+        # Preserve the raw discrete class before z-scoring the legacy 4D action
+        # target. Binary-head training consumes this field directly; regression
+        # checkpoints continue to use normalized actions[..., 3] unchanged.
+        raw_gripper = raw[:, 3].copy()
+        normalized = (raw - self.action_mean) / self.action_std
         dim = self.action_mean.shape[0]
         actions = np.zeros((self.horizon, dim), dtype=np.float32)
         mask = np.zeros((self.horizon, dim), dtype=np.float32)
-        actions[:h] = raw
+        gripper_targets = np.zeros((self.horizon, 1), dtype=np.float32)
+        actions[:h] = normalized
         mask[:h] = 1.0
+        gripper_targets[:h, 0] = (raw_gripper > 0.0).astype(np.float32)
 
         out = {
             "frames_u8": frames,
             "actions": torch.from_numpy(actions),
             "actions_mask": torch.from_numpy(mask),
+            "gripper_targets": torch.from_numpy(gripper_targets),
         }
         if self.use_wrist:
             # Aux view: wrist_cam at the CURRENT frame t only (not the pair).

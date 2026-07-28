@@ -5,7 +5,8 @@ This is the venue-INDEPENDENT core of deployment. It goes:
     raw camera frame (H,W,3 uint8)
         -> preprocess (resize 256, ImageNet-normalize)   [matches training exactly]
         -> model.predict()                                [z-scored action chunk]
-        -> un-normalize (pred * action_std + action_mean) [physical units]
+        -> un-normalize XYZ; legacy grip regresses physical value, binary grip
+           thresholds its logit to an exact -1/+1 command
         -> 4D chunk in checkpoint target units:
              abs/delta -> [absolute eef_pos_base(3), gripper(1)]
              joystick  -> [raw joystick XYZ command(3), gripper(1)]
@@ -29,6 +30,36 @@ from torchvision.transforms import v2
 
 from latent_action_model.data_loader.video_aug import gpu_two_view_video_aug
 from mini_lawam.model import MiniLaWAM, MiniLaWAMConfig
+
+
+def decode_action_prediction(pred, action_mean, action_std,
+                             gripper_head: str = "regression") -> np.ndarray:
+    """Convert raw head output [H,4] to physical XYZ plus exact/legacy grip.
+
+    Regression mode preserves the original four-dimensional denormalization.
+    Binary mode treats the fourth channel as a close logit and maps it to the
+    dataset convention exactly: logit < 0 -> -1 open, logit >= 0 -> +1 close.
+    """
+    pred = np.asarray(pred, dtype=np.float32)
+    mean = np.asarray(action_mean, dtype=np.float32)
+    std = np.asarray(action_std, dtype=np.float32)
+    if pred.ndim != 2 or pred.shape[1] != 4:
+        raise ValueError(f"expected raw action prediction [H,4], got {pred.shape}")
+    if mean.shape != (4,) or std.shape != (4,):
+        raise ValueError(
+            f"expected action mean/std shape (4,), got {mean.shape}/{std.shape}"
+        )
+    if gripper_head == "regression":
+        return pred * std + mean
+    if gripper_head != "binary":
+        raise ValueError(
+            f"unknown gripper_head {gripper_head!r} "
+            "(use 'regression' or 'binary')"
+        )
+    chunk = np.empty_like(pred)
+    chunk[:, :3] = pred[:, :3] * std[:3] + mean[:3]
+    chunk[:, 3] = np.where(pred[:, 3] >= 0.0, 1.0, -1.0)
+    return chunk
 
 
 class MiniLaWAMPolicy:
@@ -143,7 +174,10 @@ class MiniLaWAMPolicy:
         else:
             pred = model_out
         pred = pred[0].cpu().numpy().astype(np.float32)
-        chunk = pred * self.action_std + self.action_mean  # un-normalize -> [H,4]
+        chunk = decode_action_prediction(
+            pred, self.action_mean, self.action_std,
+            gripper_head=getattr(self.cfg, "gripper_head", "regression"),
+        )
         if getattr(self.cfg, "target_mode", "abs") == "delta":
             # Delta targets: compose absolute positions from the CURRENT eef pos.
             # Each replan re-anchors at the true arm position -> servo-like loop.
@@ -201,7 +235,8 @@ if __name__ == "__main__":
     H = policy.cfg.action_horizon
     target_mode = getattr(policy.cfg, "target_mode", "abs")
     print(f"loaded ckpt (step {step}) | action_dim={policy.cfg.action_dim} horizon={H} "
-          f"use_wrist={policy.cfg.use_wrist} target={target_mode}")
+          f"use_wrist={policy.cfg.use_wrist} target={target_mode} "
+          f"gripper_head={getattr(policy.cfg, 'gripper_head', 'regression')}")
     print(f"action_mean={np.round(policy.action_mean,4)} action_std={np.round(policy.action_std,4)}")
 
     def read_gt(g, t):

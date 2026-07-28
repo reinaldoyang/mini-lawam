@@ -18,6 +18,9 @@ Example:
         --phase 1 --steps 10000 --batch 32
     CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg.hdf5 \
         --phase 2 --prior-ckpt results/mini_lawam/prior_phase1.pt --steps 20000 --batch 32
+    CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/multi_egg.hdf5 \
+        --phase 2 --head attn --target joystick \
+        --prior-ckpt results/mini_lawam/prior_phase1.pt --steps 20000 --batch 32
 """
 
 import argparse
@@ -103,11 +106,13 @@ def main():
     ap.add_argument("--use-state", action="store_true",
                     help="Feed proprioception (current eef_pos, z-scored) to the head. "
                          "Helps 'how far to descend' but risks BC copycat -- try both.")
-    ap.add_argument("--target", choices=["abs", "delta"], default="abs",
+    ap.add_argument("--target", choices=["abs", "delta", "joystick"], default="abs",
                     help="Action target: 'abs' = absolute eef positions (v0); 'delta' = "
                          "pos[t+i]-pos[t] relative to the current frame. Delta composes "
                          "as current_TCP + prediction at deploy (servo-like; immune to "
-                         "systematic absolute-position bias).")
+                         "systematic absolute-position bias); 'joystick' = raw HDF5 "
+                         "actions[t+i,0:3] plus actions[t+i,6] gripper. Joystick XYZ is "
+                         "scaled and composed with the live TCP only at deployment.")
     ap.add_argument("--phase", choices=["1", "2", "joint"], default="joint",
                     help="1: train prior only (L_distill). 2: load --prior-ckpt, train "
                          "action head (L_act + 0.1*L_distill + 0.1*L_wm). joint: original "
@@ -160,9 +165,10 @@ def main():
           f"action head {'skipped' if prior_only else 'trains'} | "
           f"lambda_distill={lambda_distill} lambda_wm={lambda_wm} | out={args.out}")
 
-    if args.use_state and args.target == "delta":
-        raise SystemExit("--use-state + --target delta unsupported: the checkpoint "
-                         "stores DELTA stats, which cannot z-score an absolute state.")
+    if args.use_state and args.target != "abs":
+        raise SystemExit(f"--use-state + --target {args.target} unsupported: the checkpoint "
+                         "does not store absolute-position stats, so it cannot z-score "
+                         "an absolute TCP state.")
 
     # One horizon for both the LaWM future pair and the action chunk.
     state_dim = 3 if args.use_state else 0   # proprioception = current eef_pos [x,y,z]

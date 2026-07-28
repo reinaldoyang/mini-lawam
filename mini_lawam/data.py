@@ -5,12 +5,18 @@ Yields, per sample:
     actions     : float [H, target_dim]   = normalized target chunk
     actions_mask: float [H, target_dim]    = 1 for valid steps, 0 for right-padding
 
-Target = ABSOLUTE end-effector trajectory over the next H steps:
-    [eef_pos (3), gripper_pos (1)]  from obs, at frames t+1 .. t+H.
-This is cleaner/less quantized than the raw delta `actions` field. Targets are
-z-scored per dim using dataset statistics; keep the stats to un-normalize at
-deployment. At rollout you convert predicted absolute positions to whatever the
-IsaacLab controller consumes (e.g. delta = pred - current).
+The target is selected by ``target_mode``:
+    abs      : [eef_pos[t+i+1] (3), raw_gripper[t+i+1] (1)]
+    delta    : [eef_pos[t+i+1] - eef_pos[t] (3), raw_gripper[t+i+1] (1)]
+    joystick : [raw_actions[t+i, 0:3], raw_actions[t+i, 6]]
+
+The joystick mode deliberately uses the command at the same index as the input
+observation, matching the recorder/LAPA convention: image ``t`` predicts
+``actions[t]``. Rotation columns 3:6 are omitted because Mini-LaWAM locks TCP
+orientation and predicts a four-dimensional [XYZ, gripper] chunk.
+
+Targets are z-scored per dimension using dataset statistics; the checkpoint
+keeps those statistics so deployment can restore the original physical scale.
 
 Preprocessing contract: this Dataset only resizes to 256 and returns uint8. The
 train loop applies ImageNet normalization on GPU via
@@ -32,7 +38,7 @@ WRIST_KEY_DEFAULT = "wrist_cam"   # arm-mounted aux view (action head only, curr
 
 def build_index(hdf5_path: str, gap: int, horizon: int, sample_stride: int = 1
                 ) -> List[Tuple[str, int]]:
-    """List (demo_key, t) where o_{t+gap} and targets t+1..t+H are all valid."""
+    """List (demo_key, t) with a valid future frame and full target horizon."""
     idx: List[Tuple[str, int]] = []
     with h5py.File(hdf5_path, "r") as f:
         for demo in f["data"].keys():
@@ -64,23 +70,44 @@ def _read_target_delta(g, t: int, n: int, pos_key: str, grip_col: int) -> np.nda
     return np.concatenate([pos - anchor, grip], axis=1)            # [n,4]
 
 
+def _read_target_joystick(g, t: int, n: int, grip_col: int) -> np.ndarray:
+    """Raw joystick [XYZ(3), gripper(1)] commands for indices [t, t+n).
+
+    The source HDF5 action layout is [XYZ(3), rotation(3), gripper(1)]. Mini-LaWAM
+    keeps its existing four-dimensional head and ignores rotation because the
+    real rollout uses a fixed TCP orientation.
+    """
+    raw = g["actions"][t:t + n].astype(np.float32)
+    if raw.ndim != 2 or raw.shape[1] <= max(2, grip_col):
+        raise ValueError(
+            f"expected HDF5 actions with XYZ columns 0:3 and gripper column "
+            f"{grip_col}, got shape {raw.shape}"
+        )
+    return np.concatenate([raw[:, :3], raw[:, grip_col:grip_col + 1]], axis=1)
+
+
 def compute_action_stats(hdf5_path: str, pos_key: str, grip_col: int,
                          target_mode: str = "abs", horizon: int = 24,
                          ) -> Tuple[np.ndarray, np.ndarray]:
     """Per-dim mean/std of the targets.
 
-    abs  : over all [eef_pos_base, action_gripper] frames.
-    delta: over all chunk deltas pos[t+i]-pos[t], i=1..horizon (positions), with
-           gripper stats from the raw gripper channel.
+    abs     : over all [eef_pos_base, action_gripper] frames.
+    delta   : over all chunk deltas pos[t+i]-pos[t], i=1..horizon (positions),
+              with gripper stats from the raw gripper channel.
+    joystick: over raw [action_xyz, action_gripper] rows; rotation is omitted.
     """
     chunks = []
     with h5py.File(hdf5_path, "r") as f:
         for demo in f["data"].keys():
             g = f["data"][demo]
-            T = int(g["obs"][pos_key].shape[0])
+            T = int(
+                g["actions"].shape[0]
+                if target_mode == "joystick"
+                else g["obs"][pos_key].shape[0]
+            )
             if target_mode == "abs":
                 chunks.append(_read_target(g, 0, T, pos_key, grip_col))
-            else:
+            elif target_mode == "delta":
                 pos = g["obs"][pos_key][...].astype(np.float32)
                 grip = g["actions"][:, grip_col:grip_col + 1].astype(np.float32)
                 for i in range(1, horizon + 1):
@@ -88,6 +115,13 @@ def compute_action_stats(hdf5_path: str, pos_key: str, grip_col: int,
                         break
                     d = pos[i:] - pos[:-i]                       # [T-i,3]
                     chunks.append(np.concatenate([d, grip[i:]], axis=1))
+            elif target_mode == "joystick":
+                chunks.append(_read_target_joystick(g, 0, T, grip_col))
+            else:
+                raise ValueError(
+                    f"unknown target_mode {target_mode!r}; "
+                    "expected 'abs', 'delta', or 'joystick'"
+                )
     alla = np.concatenate(chunks, axis=0)
     mean = alla.mean(axis=0)
     std = alla.std(axis=0)
@@ -110,7 +144,7 @@ class MiniLaWAMDataset(Dataset):
         use_wrist: bool = False,
         wrist_key: str = WRIST_KEY_DEFAULT,
         use_state: bool = False,
-        target_mode: str = "abs",    # "abs" = absolute eef positions; "delta" = pos[t+i]-pos[t]
+        target_mode: str = "abs",    # "abs", cumulative EEF "delta", or raw "joystick"
     ):
         self.hdf5_path = hdf5_path
         self.gap = int(gap)
@@ -121,7 +155,11 @@ class MiniLaWAMDataset(Dataset):
         self.use_wrist = use_wrist
         self.wrist_key = wrist_key
         self.use_state = use_state   # proprioception = current eef_pos at frame t
-        assert target_mode in ("abs", "delta"), target_mode
+        if target_mode not in ("abs", "delta", "joystick"):
+            raise ValueError(
+                f"unknown target_mode {target_mode!r}; "
+                "expected 'abs', 'delta', or 'joystick'"
+            )
         self.target_mode = target_mode
         self.resize = v2.Resize(image_hw, antialias=True)
         self.index = build_index(hdf5_path, self.gap, self.horizon, sample_stride)
@@ -151,9 +189,12 @@ class MiniLaWAMDataset(Dataset):
         cam = g["obs"]["table_cam"]
         frames = torch.stack([self._frame(cam, t), self._frame(cam, t + self.gap)], 0)  # [2,3,256,256]
 
-        # Target trajectory over the next H steps (t+1 .. t+H): absolute or delta.
+        # EEF modes use future rows t+1..t+H; joystick uses commands t..t+H-1.
         if self.target_mode == "delta":
             raw = _read_target_delta(g, t, self.horizon, self.pos_key, self.grip_col)
+        elif self.target_mode == "joystick":
+            # Same-index alignment: observation[t] -> raw joystick action[t].
+            raw = _read_target_joystick(g, t, self.horizon, self.grip_col)
         else:
             raw = _read_target(g, t + 1, self.horizon, self.pos_key, self.grip_col)  # [h,4]
         h = raw.shape[0]

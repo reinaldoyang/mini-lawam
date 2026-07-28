@@ -49,7 +49,8 @@ class MiniLaWAMConfig:
     head_type: str = "mlp"           # "mlp" = pooled-features MLP (v0);
                                       # "attn" = token-level cross-attention (no pooling)
     target_mode: str = "abs"         # "abs" = absolute eef positions;
-                                      # "delta" = pos[t+i]-pos[t] (servo-like at deploy)
+                                      # "delta" = pos[t+i]-pos[t];
+                                      # "joystick" = raw action XYZ + gripper
     hidden: int = 512                # MLP head width
     attn_hidden: int = 384           # attn head width
     attn_layers: int = 3

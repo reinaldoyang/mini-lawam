@@ -77,7 +77,8 @@ def resize_hw(frame: np.ndarray, w: int, h: int) -> np.ndarray:
     return cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
 
 
-def evaluate(policy, live, ref_feats, baseline_min, home_xyz, wrist_live=None):
+def evaluate(policy, live, ref_feats, baseline_min, home_xyz, wrist_live=None,
+             action_scale=0.3):
     lf = token_feats(policy, live)
     sims = [fcos(lf, rf) for rf in ref_feats]
     live_cos, best_ref = max(sims), int(np.argmax(sims))
@@ -87,12 +88,18 @@ def evaluate(policy, live, ref_feats, baseline_min, home_xyz, wrist_live=None):
                 or getattr(policy.cfg, "target_mode", "abs") == "delta")
     chunk = policy.act(live, wrist_live,
                        state_xyz=home_xyz if need_xyz else None)
-    gap_cm = float(np.linalg.norm(chunk[0, :3] - home_xyz)) * 100.0
+    if getattr(policy.cfg, "target_mode", "abs") == "joystick":
+        # policy.act() returns the unscaled raw joystick command. Show/check the
+        # absolute step-0 target that rollout would execute from the home pose.
+        pred0 = home_xyz + float(action_scale) * chunk[0, :3]
+    else:
+        pred0 = chunk[0, :3]
+    gap_cm = float(np.linalg.norm(pred0 - home_xyz)) * 100.0
     feat_ok = live_cos >= baseline_min
     pred_ok = gap_cm <= 5.0
     return {
         "live_cos": live_cos, "best_ref": best_ref, "sims": sims,
-        "pred0": chunk[0, :3], "grip0": float(chunk[0, 3]), "gap_cm": gap_cm,
+        "pred0": pred0, "grip0": float(chunk[0, 3]), "gap_cm": gap_cm,
         "feat_ok": feat_ok, "pred_ok": pred_ok, "ok": feat_ok and pred_ok,
     }
 
@@ -123,6 +130,9 @@ def main():
     ap.add_argument("--fake-live", default=None, metavar="DEMO:T",
                     help="use a dataset frame as the 'live' frame (self-test, no camera)")
     ap.add_argument("--once", action="store_true", help="single check, print + save PNG, no GUI")
+    ap.add_argument("--action-scale", type=float, default=0.3,
+                    help="Joystick checkpoint only: scale used to convert the raw "
+                         "step-0 command into the rollout target (default: 0.3).")
     ap.add_argument("--out-dir", default="results/mini_lawam/camera_check")
     ap.add_argument("--train-frame-hw", type=int, nargs=2, default=[168, 224],
                     metavar=("H", "W"),
@@ -134,6 +144,8 @@ def main():
     ap.add_argument("--wrist-exposure", type=float, default=None)
     ap.add_argument("--wrist-gain", type=float, default=None)
     args = ap.parse_args()
+    if not np.isfinite(args.action_scale) or args.action_scale < 0.0:
+        raise ValueError("--action-scale must be a finite value >= 0")
 
     train_hw = None if args.train_frame_hw[0] <= 0 else tuple(args.train_frame_hw)
     policy = MiniLaWAMPolicy(args.ckpt, train_frame_hw=train_hw)
@@ -234,7 +246,7 @@ def main():
         live = get_live()
         wrist_live = get_wrist() if get_wrist is not None else None
         r = evaluate(policy, live, ref_feats, baseline_min, home_xyz,
-                     wrist_live=wrist_live)
+                     wrist_live=wrist_live, action_scale=args.action_scale)
         for line in report_text(r, baseline_min, baseline_mean, home_xyz, ref_names):
             print(line)
         if wrist_live is not None:
@@ -271,7 +283,7 @@ def main():
         live = get_live()
         wrist_live = get_wrist() if get_wrist is not None else None
         r = evaluate(policy, live, ref_feats, baseline_min, home_xyz,
-                     wrist_live=wrist_live)
+                     wrist_live=wrist_live, action_scale=args.action_scale)
         # resize BOTH to the panel size first (live is 640x480, dataset refs are smaller)
         live_d = resize_hw(live, W, H)
         ref_d = resize_hw(ref_frames[ref_idx], W, H)

@@ -6,7 +6,9 @@ This is the venue-INDEPENDENT core of deployment. It goes:
         -> preprocess (resize 256, ImageNet-normalize)   [matches training exactly]
         -> model.predict()                                [z-scored action chunk]
         -> un-normalize (pred * action_std + action_mean) [physical units]
-        -> 4D action chunk in PHYSICAL units: [eef_pos_base(3), gripper(1)]
+        -> 4D chunk in checkpoint target units:
+             abs/delta -> [absolute eef_pos_base(3), gripper(1)]
+             joystick  -> [raw joystick XYZ command(3), gripper(1)]
 
 It STOPS there. Turning a 4D action into an actual robot/sim command
 (pose->servoL delta on real UR7e, or controller target in sim), choosing how many
@@ -45,7 +47,8 @@ class MiniLaWAMPolicy:
         self.model.action_head.load_state_dict(ckpt["action_head"])
         self.model.eval()
 
-        # De-normalization stats (per-dim), saved at train time. [eef_pos(3), grip(1)]
+        # Per-dimension target statistics saved at train time. The first three
+        # dimensions are EEF positions/deltas or joystick XYZ depending on target_mode.
         self.action_mean = np.asarray(ckpt["action_mean"], dtype=np.float32)  # [4]
         self.action_std = np.asarray(ckpt["action_std"], dtype=np.float32)    # [4]
 
@@ -94,13 +97,17 @@ class MiniLaWAMPolicy:
             wrist_hwc_uint8: Optional[np.ndarray] = None,
             state_xyz: Optional[np.ndarray] = None,
             return_subgoal_change: bool = False):
-        """Frame -> physical 4D action chunk [H, 4] = [eef_pos_base(3), gripper(1)].
+        """Frame -> physical 4D action chunk [H, 4].
 
-        Absolute EEF positions (meters, base frame) + raw gripper channel. This is
-        the clean hand-off point. Downstream (venue-specific) code decides what to
-        do with it. If the checkpoint was trained with use_wrist=True, you MUST pass
-        `wrist_hwc_uint8` (the aux wrist_cam frame at the same timestep). If trained
-        with use_state=True, pass `state_xyz` = current eef_pos [x,y,z] in meters
+        Output semantics are checkpoint-controlled:
+          abs      -> absolute [eef_pos_base XYZ, raw gripper]
+          delta    -> absolute [current XYZ + predicted EEF delta, raw gripper]
+          joystick -> raw [joystick XYZ command, raw gripper]
+
+        Joystick scaling/composition is venue-specific and intentionally happens
+        in rollout_ur7e, not here. If the checkpoint was trained with use_wrist=True,
+        you MUST pass `wrist_hwc_uint8` at the same timestep. If trained with
+        use_state=True, pass `state_xyz` = current eef_pos [x,y,z] in meters
         (base frame); it is z-scored here with the same stats as training.
 
         With `return_subgoal_change=True`, return `(chunk, change_grid)`, where
@@ -167,7 +174,12 @@ if __name__ == "__main__":
     import argparse
     import h5py
 
-    from mini_lawam.data import MiniLaWAMDataset, _read_target
+    from mini_lawam.data import (
+        MiniLaWAMDataset,
+        _read_target,
+        _read_target_delta,
+        _read_target_joystick,
+    )
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="results/mini_lawam/ckpt.pt")
@@ -187,9 +199,20 @@ if __name__ == "__main__":
     policy = MiniLaWAMPolicy(args.ckpt)
     step = torch.load(args.ckpt, map_location="cpu", weights_only=False).get("step")
     H = policy.cfg.action_horizon
+    target_mode = getattr(policy.cfg, "target_mode", "abs")
     print(f"loaded ckpt (step {step}) | action_dim={policy.cfg.action_dim} horizon={H} "
-          f"use_wrist={policy.cfg.use_wrist}")
+          f"use_wrist={policy.cfg.use_wrist} target={target_mode}")
     print(f"action_mean={np.round(policy.action_mean,4)} action_std={np.round(policy.action_std,4)}")
+
+    def read_gt(g, t):
+        """Ground truth in the same output convention as policy.act()."""
+        if target_mode == "joystick":
+            return _read_target_joystick(g, t, H, 6)
+        if target_mode == "delta":
+            gt = _read_target_delta(g, t, H, "eef_pos_base", 6)
+            gt[:, :3] += g["obs"]["eef_pos_base"][t].astype(np.float32)
+            return gt
+        return _read_target(g, t + 1, H, "eef_pos_base", 6)
 
     if args.mode == "single":
         with h5py.File(args.hdf5, "r") as f:
@@ -202,17 +225,23 @@ if __name__ == "__main__":
                         or getattr(policy.cfg, "target_mode", "abs") == "delta")
             st = (g["obs"]["eef_pos_base"][args.t].astype(np.float32)
                   if need_xyz else None)
-            gt_pos = g["obs"]["eef_pos_base"][args.t + 1].astype(np.float32)
-            gt_grip = float(g["actions"][args.t + 1, 6])
+            gt = read_gt(g, args.t)
         chunk = policy.act(frame, wrist, state_xyz=st)
         print(f"\ndemo={demo} t={args.t}  chunk shape={chunk.shape}")
-        print(f"pred step0 : eef_pos={np.round(chunk[0,:3],4)}  gripper={chunk[0,3]:+.3f}")
-        print(f"gt   step0 : eef_pos={np.round(gt_pos,4)}  gripper={gt_grip:+.3f}")
-        print(f"pos L2 err : {np.linalg.norm(chunk[0,:3]-gt_pos):.4f} m")
+        xyz_name = "joystick_xyz" if target_mode == "joystick" else "eef_pos"
+        print(f"pred step0 : {xyz_name}={np.round(chunk[0,:3],4)}  "
+              f"gripper={chunk[0,3]:+.3f}")
+        print(f"gt   step0 : {xyz_name}={np.round(gt[0,:3],4)}  "
+              f"gripper={gt[0,3]:+.3f}")
+        print(f"XYZ L2 err : {np.linalg.norm(chunk[0,:3]-gt[0,:3]):.4f} "
+              f"{'action units' if target_mode == 'joystick' else 'm'}")
         raise SystemExit(0)
 
     # ---- eval mode: reproduce train.py's split, then measure error per split ----
-    ds = MiniLaWAMDataset(args.hdf5, gap=H, horizon=H, sample_stride=args.sample_stride)
+    ds = MiniLaWAMDataset(
+        args.hdf5, gap=H, horizon=H, sample_stride=args.sample_stride,
+        target_mode=target_mode,
+    )
     n = len(ds)
     perm = np.random.default_rng(args.split_seed).permutation(n)
     n_val = max(1, int(n * args.val_frac))
@@ -234,15 +263,20 @@ if __name__ == "__main__":
                             or getattr(policy.cfg, "target_mode", "abs") == "delta")
                 st = (g["obs"]["eef_pos_base"][t].astype(np.float32)
                       if need_xyz else None)
-                gt = _read_target(g, t + 1, H, "eef_pos_base", 6)      # [H,4] physical
-                pred = policy.act(frame, wrist, state_xyz=st)          # [H,4] physical
+                gt = read_gt(g, t)                                    # [H,4] target units
+                pred = policy.act(frame, wrist, state_xyz=st)          # [H,4] target units
                 pos_l2 += np.linalg.norm(pred[:, :3] - gt[:, :3], axis=1).mean()
                 step0_l2 += np.linalg.norm(pred[0, :3] - gt[0, :3])
                 mae += np.abs(pred - gt).mean(axis=0)
                 grip_ok += float((np.sign(pred[:, 3]) == np.sign(gt[:, 3])).mean())
                 cnt += 1
             print(f"\n[{split}]  n={cnt}  (of {len(idxs)} in split)")
-            print(f"  pos L2 err  (mean over horizon): {pos_l2/cnt*100:.2f} cm")
-            print(f"  pos L2 err  (step 0 only)      : {step0_l2/cnt*100:.2f} cm")
-            print(f"  per-dim MAE [x y z](m) grip    : {np.round(mae/cnt,4)}")
+            if target_mode == "joystick":
+                print(f"  XYZ action L2 (mean horizon)   : {pos_l2/cnt:.4f}")
+                print(f"  XYZ action L2 (step 0 only)    : {step0_l2/cnt:.4f}")
+                print(f"  per-dim MAE [x y z] grip       : {np.round(mae/cnt,4)}")
+            else:
+                print(f"  pos L2 err  (mean over horizon): {pos_l2/cnt*100:.2f} cm")
+                print(f"  pos L2 err  (step 0 only)      : {step0_l2/cnt*100:.2f} cm")
+                print(f"  per-dim MAE [x y z](m) grip    : {np.round(mae/cnt,4)}")
             print(f"  gripper sign accuracy          : {grip_ok/cnt*100:.1f}%")

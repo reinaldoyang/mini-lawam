@@ -67,7 +67,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/new_100ep_multi
     --phase 1 --steps 10000 --out results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt
 ```
 
-### Phase 2 — reuse the phase-1 prior above, to use wrist cam, just add --use-wrist
+### Phase 2 — reuse the phase-1 prior above, to use wrist cam, just add --use-wrist, MLP head version
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
     --phase 2 --use-wrist --prior-ckpt results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt \
@@ -87,7 +87,18 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
   --out results/mini_lawam/ckpt_new_100ep_multi_egg_exp_plate_attn_256.pt --csv-log results/mini_lawam/log_attn.csv
 ```
 
-### To use delta position instead of absolute position
+### Train attention head joystick
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
+  --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
+  --phase 2 --head attn --use-wrist --target joystick \
+  --prior-ckpt results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt \
+  --steps 10000 --batch 32 --lr 1e-4 \
+  --out results/mini_lawam/ckpt_100ep_attn_joystick.pt \
+  --csv-log results/mini_lawam/log_100ep_attn_joystick.csv
+```
+
+### To use delta eef position instead of absolute position
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
   --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
@@ -156,7 +167,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --trace-dir results/mini_lawam/traces --show-camera
 ```
 
-use delta scale
+### use delta scale
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --ckpt results/mini_lawam/ckpt_100ep_attn_delta.pt \
@@ -170,7 +181,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --trace-dir results/mini_lawam/traces --show-camera
 ```
 
-show subgoal at gui
+### show subgoal at gui
 ```bash
 CUDA_VISIBLE_DEVICES=1 python -m mini_lawam.rollout_ur7e \
   --ckpt results/mini_lawam/ckpt_100ep_attn_delta.pt \
@@ -184,6 +195,20 @@ CUDA_VISIBLE_DEVICES=1 python -m mini_lawam.rollout_ur7e \
   --subgoal-update-steps 8
 ```
 
+### Rollout of joystick target
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
+  --ckpt results/mini_lawam/ckpt_100ep_attn_joystick.pt \
+  --table-cam-serial 244422300964 \
+  --wrist-cam-serial 252122300792 \
+  --robot-ip 140.96.93.7 --execute --use-gripper-control \
+  --train-frame-hw 168 224 \
+  --temporal-ensemble --te-m 0.3 \
+  --action-scale 0.3 \
+  --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.02 --servol-max-pos-step 0.002 \
+  --show-camera
+```
 
 ## Evaluation 
 ### Phase 1 evaluation

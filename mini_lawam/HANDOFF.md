@@ -2,7 +2,7 @@
 
 A minimal, **LaWAM-inspired vision-only behavior-cloning policy** built inside the
 LaWAM repo, deployed on a real **UR7e** (egg pick-and-place). Read this to
-understand the whole system before touching code. Last updated: 2026-07-24.
+understand the whole system before touching code. Last updated: 2026-07-28.
 
 ## 1. What it is (one paragraph)
 
@@ -33,8 +33,9 @@ teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distil
 - **Horizon H = 24 frames = 1.2 s @ 20 Hz** for BOTH the LaWM pair gap and the
   action chunk (`--horizon`, default 24).
 - Target (`--target`, stored in ckpt as `target_mode`): `abs` = absolute
-  `[eef_pos_base(3), gripper]` (v0); `delta` = displacement from the current
-  frame. See the exact delta contract below.
+  `[eef_pos_base(3), gripper]` (v0); `delta` = cumulative EEF displacement from
+  the current frame; `joystick` = recorded `[actions[0:3], actions[6]]`. See the
+  exact contracts below.
 - `use_wrist`: wrist_cam feeds the **action head only** (never prior/LaWM — §C.2).
 - `use_state` (optional, off in current ckpts): current eef xyz as extra head input.
 - Inference `predict()`: current frame(s) only → chunk. No future frame.
@@ -77,6 +78,25 @@ chunk[i] = [pos[t+i+1] - pos[t], gripper[t+i+1]],  i = 0..23
 - `target_mode` is checkpoint-controlled; there is no deployment CLI switch.
   Old checkpoints without the field fall back to `abs`.
 
+### Joystick action contract
+
+For `--target joystick`, input observation `t` is aligned to the recorded
+command at the same index:
+
+```
+chunk[i] = [actions[t+i, 0:3], actions[t+i, 6]],  i = 0..23
+```
+
+- Rotation columns `3:6` are omitted; the rollout keeps its locked orientation.
+- Training uses the original joystick values and target-specific mean/std. It
+  does not apply the deployment gain.
+- `MiniLaWAMPolicy.act()` denormalizes back to the original joystick scale.
+- `rollout_ur7e --action-scale 0.3` multiplies only XYZ. Each scaled command is
+  added to the live TCP when that row is executed. Gripper is never scaled and
+  is thresholded at zero.
+- Switch back without code changes by selecting a checkpoint trained with
+  `--target delta`.
+
 ## 3. Two-phase training (current workflow)
 
 Phase 1 trains ConvPrior only (distillation); phase 2 loads that prior (frozen)
@@ -95,14 +115,22 @@ python -m mini_lawam.train --hdf5 <data.hdf5> --phase 2 --head attn --use-wrist 
     --steps 10000 --batch 32 --lr 1e-4 \
     --out results/mini_lawam/ckpt_<name>_attn_delta.pt \
     --csv-log results/mini_lawam/log_<name>_attn_delta.csv
+
+# Alternative phase 2: same attention head/prior, raw joystick target
+python -m mini_lawam.train --hdf5 <data.hdf5> --phase 2 --head attn --use-wrist \
+    --target joystick \
+    --prior-ckpt results/mini_lawam/phase1_<name>.pt \
+    --steps 10000 --batch 32 --lr 1e-4 \
+    --out results/mini_lawam/ckpt_<name>_attn_joystick.pt \
+    --csv-log results/mini_lawam/log_<name>_attn_joystick.csv
 ```
 `--phase joint` = original single-phase. Phase-2 ckpt is self-contained
 (prior + head + cfg + action stats) → deployment needs only that one file.
 `head_type`/`use_wrist`/`use_state`/`target_mode` are stored in the ckpt and
 auto-detected everywhere downstream. Phase 1 itself is target-independent
-(distillation only), so an existing absolute-target prior can be reused for a
-delta phase 2; phase 2 must still pass `--target delta`. Do not combine
-`--use-state` with `--target delta`: training rejects it because delta action
+(distillation only), so the same prior can be reused for delta and joystick
+phase 2 runs; phase 2 must pass the intended `--target`. Do not combine
+`--use-state` with `--target delta` or `--target joystick`: their target
 statistics cannot normalize an absolute TCP state.
 
 ## 4. Datasets (all robomimic HDF5, 20 Hz, UR7e)
@@ -127,9 +155,10 @@ statistics cannot normalize an absolute TCP state.
    → R² vs mean/shuffle baselines + subgoal floor(copy)/ceiling(oracle) bracket.
    Good: R² ≥ ~0.85, margin recovery ≥ 70%. (100ep prior: R²≈0.93, 99%.)
 2. **Offline action error**: `python -m mini_lawam.rollout --mode eval --ckpt <p2.pt> --hdf5 <data>`
-   → step-0/horizon L2 (cm), per-dim MAE, gripper acc, train vs val.
+   → step-0/horizon L2, per-dim MAE, gripper acc, train vs val.
    The evaluator reads `target_mode` and reconstructs absolute positions for
-   delta checkpoints using each dataset frame's current EEF position. The
+   delta checkpoints using each dataset frame's current EEF position; joystick
+   checkpoints are compared directly against the raw command rows. The
    100ep absolute-attn reference was **1.6 cm step-0, z-MAE 0.62 cm,
    99.2% gripper**.
 3. **Subgoal viz**: `python -m mini_lawam.viz_subgoal --ckpt <any ckpt with prior> --hdf5 <data> --demo demo_0 --t 40 80`
@@ -187,6 +216,10 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   the gripper channel. `1.0` exactly preserves existing behavior. Increase
   gradually (`1.25`, then `1.5`; test `2.0` only after confirming TCP tracking).
   Non-default values are rejected for absolute-target checkpoints.
+- `--action-scale` is the corresponding deployment-only gain for joystick
+  checkpoints (default `0.3`). It scales only the denormalized XYZ command;
+  gripper is unchanged. The scaled command is composed from the live TCP at each
+  execution tick, before target smoothing and safety clamps.
 - `--save-frames 8` dumps the exact policy-input frames per rollout → offline
   forensics (`policy.act` on saved frames, nearest-neighbor vs dataset, etc.).
 - `--trace-dir` always saves the first table frame plus a compact summary JSON
@@ -254,8 +287,9 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
 - Delta rows are all relative to one chunk anchor; do not integrate them across
   the horizon. Deployment must provide current TCP XYZ to `policy.act()` even
   though the checkpoint has `use_state=False`.
-- `--use-state --target delta` is intentionally unsupported. Also never deploy a
-  delta-trained head as `abs`: use the checkpoint's `target_mode`.
+- `--use-state` with `--target delta` or `--target joystick` is intentionally
+  unsupported. Never reinterpret a trained head as another target mode: rollout
+  must use the checkpoint's stored `target_mode`.
 - `check_camera`/`rollout_ur7e` share `RealSenseTableReader` (name, exposure,
   gain per camera). Quit one before starting the other (camera is exclusive).
 - Rollout summary JSONs are compact and no longer contain per-step

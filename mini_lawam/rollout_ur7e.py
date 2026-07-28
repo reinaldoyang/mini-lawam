@@ -9,9 +9,11 @@ Pattern follows ur7e_ramen_il/scripts/real_world/lapa_latent_real_servoL.py:
   - DRY-RUN by default; add --execute to actually send servoL/gripper.
 
 mini_lawam-specific differences vs the LAPA baseline:
-  - policy output is an ABSOLUTE [H=32, 4] chunk: [eef_pos_base(3), gripper(1)]
-    (same base frame as rtde getActualTCPPose position). No delta composition:
-        target_tcp = [pred_xyz, locked_rotvec]
+  - policy output is an [H, 4] chunk whose checkpoint-stored target mode is:
+      abs/delta -> absolute [eef_pos_base(3), gripper(1)] targets
+      joystick  -> raw recorded [joystick_xyz(3), gripper(1)] commands
+    Joystick commands are multiplied by --action-scale and added to the measured
+    TCP at each execution tick. Rotation is always locked.
   - receding horizon: execute the first --exec-steps (default 8) waypoints of
     each chunk at --control-hz (default 20, matching training), then re-plan
     from a fresh frame.
@@ -89,6 +91,11 @@ def build_parser():
                         "translations. Applied before temporal ensembling and safety clamps. "
                         "Does not affect the gripper; non-default values require a "
                         "delta-target checkpoint.")
+    p.add_argument("--action-scale", type=float, default=0.3,
+                   help="Deployment gain for raw XYZ commands from a joystick-target "
+                        "checkpoint (default: 0.3). Applied after de-normalization and "
+                        "before temporal ensembling/TCP composition. Does not affect "
+                        "the gripper and is ignored by abs/delta checkpoints.")
     p.add_argument("--max-steps", type=int, default=2000, help="max control steps per rollout")
     p.add_argument("--num-rollouts", type=int, default=10)
     p.add_argument("--startup-wait-sec", type=float, default=1.0)
@@ -456,6 +463,29 @@ def scale_delta_chunk(chunk, anchor_xyz, delta_scale):
     return scaled
 
 
+def scale_joystick_chunk(chunk, action_scale):
+    """Scale only raw joystick XYZ commands; preserve the gripper exactly."""
+    scaled = np.asarray(chunk).copy()
+    if scaled.ndim != 2 or scaled.shape[1] != 4:
+        raise ValueError(f"joystick chunk must have shape [H,4], got {scaled.shape}")
+    scaled[:, :3] *= float(action_scale)
+    return scaled
+
+
+def compose_target_xyz(pred_xyz, current_xyz, target_mode):
+    """Convert a policy XYZ row into an absolute TCP target.
+
+    Joystick rows are incremental commands (already deployment-scaled);
+    abs/delta policy rows are already absolute by this boundary.
+    """
+    pred = np.asarray(pred_xyz, dtype=np.float64)
+    if target_mode == "joystick":
+        return np.asarray(current_xyz, dtype=np.float64) + pred
+    if target_mode in ("abs", "delta"):
+        return pred
+    raise ValueError(f"unsupported target_mode={target_mode!r}")
+
+
 def make_subgoal_overlay(model_input_rgb, change_grid, alpha=0.55):
     """Colorize a DINO patch-change grid and blend it over the 256px model input."""
     import cv2
@@ -511,6 +541,8 @@ def main():
     args = build_parser().parse_args()
     if not np.isfinite(args.delta_scale) or args.delta_scale < 0.0:
         raise ValueError("--delta-scale must be a finite value >= 0")
+    if not np.isfinite(args.action_scale) or args.action_scale < 0.0:
+        raise ValueError("--action-scale must be a finite value >= 0")
     if args.show_subgoal and not args.show_camera:
         raise ValueError("--show-subgoal requires --show-camera")
     if not np.isfinite(args.subgoal_alpha) or not 0.0 <= args.subgoal_alpha <= 1.0:
@@ -559,13 +591,17 @@ def main():
     need_wrist = bool(policy.cfg.use_wrist)
     target_mode = getattr(policy.cfg, "target_mode", "abs")
     # current eef xyz is needed as proprioception (use_state) and/or as the
-    # composition anchor for delta targets (chunk = current_TCP + delta).
+    # composition anchor for cumulative EEF-delta targets. Joystick commands are
+    # composed with the live TCP later, at each execution tick.
     need_state = bool(getattr(policy.cfg, "use_state", False)) or target_mode == "delta"
     if target_mode != "delta" and args.delta_scale != 1.0:
         raise ValueError("--delta-scale only applies to a checkpoint with target_mode='delta'")
+    if target_mode not in ("abs", "delta", "joystick"):
+        raise ValueError(f"unsupported checkpoint target_mode={target_mode!r}")
     print(f"[INFO] checkpoint use_wrist={need_wrist} "
           f"use_state={getattr(policy.cfg, 'use_state', False)} target={target_mode} "
-          f"delta_scale={args.delta_scale:g}")
+          f"delta_scale={args.delta_scale:g}"
+          + (f" action_scale={args.action_scale:g}" if target_mode == "joystick" else ""))
     if args.show_subgoal:
         print("[VIZ] live predicted-subgoal feature-change overlay enabled "
               f"(alpha={args.subgoal_alpha:g}, refresh every "
@@ -582,7 +618,7 @@ def main():
         return np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)[:3]
 
     def predict_chunk(frame, wrist_frame):
-        """Run one inference and apply the deployment-only delta gain."""
+        """Run inference and apply the target-mode-specific deployment gain."""
         nonlocal latest_subgoal_overlay, subgoal_inference_index
         anchor_xyz = cur_state()
         update_subgoal = should_update_subgoal(
@@ -603,6 +639,8 @@ def main():
             chunk = policy_out
         if target_mode == "delta" and args.delta_scale != 1.0:
             chunk = scale_delta_chunk(chunk, anchor_xyz, args.delta_scale)
+        elif target_mode == "joystick":
+            chunk = scale_joystick_chunk(chunk, args.action_scale)
         return chunk
 
     try:
@@ -711,6 +749,9 @@ def main():
             rollout_stem = f"trial_{trial:03d}_async_{rollout_stamp}"
             first_table_frame = None
             trace = {"ckpt": str(Path(args.ckpt).resolve()), "execute": args.execute,
+                     "target_mode": target_mode,
+                     "delta_scale": args.delta_scale,
+                     "action_scale": args.action_scale if target_mode == "joystick" else None,
                      "exec_steps": k, "control_hz": args.control_hz, "steps": []}
             result = "completed"
             step = 0
@@ -720,9 +761,20 @@ def main():
                 """One control tick: smooth -> clamp -> servo target + gripper + trace."""
                 pred_xyz = np.asarray(pred_xyz, dtype=np.float64)
                 grip_cmd = "open" if grip_val <= args.gripper_threshold else "close"
+                # For joystick checkpoints pred_xyz is now a scaled incremental
+                # command. Compose it from the live TCP at the moment this row is
+                # executed. abs/delta policy outputs are already absolute targets.
+                if target_mode == "joystick":
+                    current_xyz = (
+                        np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)[:3]
+                        if args.execute else np.zeros(3, dtype=np.float64)
+                    )
+                    command_xyz = compose_target_xyz(pred_xyz, current_xyz, target_mode)
+                else:
+                    command_xyz = compose_target_xyz(pred_xyz, None, target_mode)
                 beta = float(args.target_ema)
-                smooth["ema_xyz"] = pred_xyz if smooth["ema_xyz"] is None else \
-                    beta * pred_xyz + (1.0 - beta) * smooth["ema_xyz"]
+                smooth["ema_xyz"] = command_xyz if smooth["ema_xyz"] is None else \
+                    beta * command_xyz + (1.0 - beta) * smooth["ema_xyz"]
                 smoothed_xyz = smooth["ema_xyz"]
                 if (args.target_deadband > 0.0 and smooth["last_cmd_xyz"] is not None
                         and np.linalg.norm(smoothed_xyz - smooth["last_cmd_xyz"])
@@ -745,6 +797,10 @@ def main():
                 trace["steps"].append({
                     "step": step, "sub": sub,
                     "pred_xyz": pred_xyz.tolist(),
+                    "pred_xyz_kind": (
+                        "scaled_joystick_delta" if target_mode == "joystick"
+                        else "absolute_target"
+                    ),
                     "tgt_xyz": np.asarray(tgt_xyz, dtype=float).tolist(),
                     "grip": float(grip_val), "grip_cmd": grip_cmd,
                 })
@@ -806,7 +862,7 @@ def main():
                     w = np.exp(-float(args.te_m) * age)
                     w /= w.sum()
                     avg = (preds * w[:, None]).sum(0)                     # [4]
-                    # Ensemble-average the XYZ (smooth), but NOT the gripper: it is a
+                    # Ensemble-average XYZ targets/commands, but NOT the gripper:
                     # near-discrete -1/+1 switch, and averaging in far-horizon "+1 close"
                     # predictions trips the threshold several steps early (grasps high).
                     # Use the newest immediate prediction's gripper instead.
@@ -814,9 +870,11 @@ def main():
                     grip_cmd = apply_waypoint(avg[:3], grip_val, step, sub=0)
                     if step % 8 == 0:
                         mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
+                        xyz_label = "avg_joy_delta" if target_mode == "joystick" else "avg_xyz"
                         print(f"[STEP {step}] inf={inf_ms:.0f}ms te_n={n}  "
-                              f"avg_xyz={np.round(avg[:3], 4)}  grip={grip_val:+.2f}->{grip_cmd}  "
-                              f"chunk_move[0->{H - 1}]={mv_H:.0f}mm")
+                              f"{xyz_label}={np.round(avg[:3], 4)}  "
+                              f"grip={grip_val:+.2f}->{grip_cmd}  "
+                              f"chunk_span[0->{H - 1}]={mv_H:.0f}mm")
                     step += 1
                     sleep_t = dt - (time.time() - t0)
                     if sleep_t > 0:
@@ -845,9 +903,12 @@ def main():
                     if i == 0:
                         mv_k = np.linalg.norm(chunk[k - 1, :3] - chunk[0, :3]) * 1e3
                         mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
+                        xyz_label = "joy_delta" if target_mode == "joystick" else "pred_xyz"
                         print(f"[STEP {step}] inf={inf_ms:.0f}ms  "
-                              f"pred_xyz={np.round(chunk[i, :3], 4)}  grip={chunk[i, 3]:+.2f}->{grip_cmd}  "
-                              f"chunk_move[0->{k - 1}]={mv_k:.0f}mm [0->{H - 1}]={mv_H:.0f}mm")
+                              f"{xyz_label}={np.round(chunk[i, :3], 4)}  "
+                              f"grip={chunk[i, 3]:+.2f}->{grip_cmd}  "
+                              f"chunk_span[0->{k - 1}]={mv_k:.0f}mm "
+                              f"[0->{H - 1}]={mv_H:.0f}mm")
                     step += 1
                     if step >= args.max_steps:
                         break
@@ -876,6 +937,12 @@ def main():
                     print(f"[FIRST FRAME] {first_frame_fp}")
                 summary = {
                     "trial": trial,
+                    "ckpt": trace["ckpt"],
+                    "target_mode": target_mode,
+                    "delta_scale": args.delta_scale,
+                    "action_scale": (
+                        args.action_scale if target_mode == "joystick" else None
+                    ),
                     "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z",
                                                 time.localtime(rollout_started_wall)),
                     "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z",

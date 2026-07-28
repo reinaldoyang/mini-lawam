@@ -140,8 +140,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --temporal-ensemble --te-m 0.1 \
   --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.02 --servol-max-pos-step 0.002 \
-  --trace-dir results/mini_lawam/traces \
-  --show-camera --show-subgoal --subgoal-update-steps 8
+  --trace-dir results/mini_lawam/traces --show-camera
 ```
 
 ### Add exposure and also use the resolution of the observation state during data collection 
@@ -152,11 +151,39 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --table-exposure 180 --table-gain 16 --wrist-exposure 100 --wrist-gain 16 \
   --robot-ip 140.96.93.125 --execute --use-gripper-control \
   --train-frame-hw 168 224 \
-  --temporal-ensemble --te-m 0.1 --delta-scale 1.25 \
+  --temporal-ensemble --te-m 0.3 --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.02 --servol-max-pos-step 0.002 \
+  --trace-dir results/mini_lawam/traces --show-camera
+```
+
+use delta scale
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
+  --ckpt results/mini_lawam/ckpt_100ep_attn_delta.pt \
+  --table-cam-serial 244422300964 --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 --wrist-exposure 100 --wrist-gain 16 \
+  --robot-ip 140.96.93.7 --execute --use-gripper-control \
+  --train-frame-hw 168 224 \
+  --temporal-ensemble --te-m 0.3 --delta-scale 1.0 \
   --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.02 --servol-max-pos-step 0.002 \
   --trace-dir results/mini_lawam/traces --show-camera
 ```
+
+show subgoal at gui
+```bash
+CUDA_VISIBLE_DEVICES=1 python -m mini_lawam.rollout_ur7e \
+  --ckpt results/mini_lawam/ckpt_100ep_attn_delta.pt \
+  --table-cam-serial 244422300964 --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 --wrist-exposure 100 --wrist-gain 16 \
+  --robot-ip 140.96.93.7 --execute --use-gripper-control \
+  --train-frame-hw 168 224 \
+  --temporal-ensemble --te-m 0.1 --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.02 --servol-max-pos-step 0.002 \
+  --trace-dir results/mini_lawam/traces --show-camera --show-subgoal --subgoal-alpha 0.55 \
+  --subgoal-update-steps 8
+```
+
 
 ## Evaluation 
 ### Phase 1 evaluation
@@ -176,3 +203,4 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.viz_subgoal \
     --ckpt results/mini_lawam/prior_phase1.pt \
     --hdf5 dataset/multi_egg.hdf5 --demo demo_0 --t 40 80 120
 ```
+

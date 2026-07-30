@@ -210,6 +210,7 @@ if __name__ == "__main__":
 
     from mini_lawam.data import (
         MiniLaWAMDataset,
+        _read_gripper_target,
         _read_target,
         _read_target_delta,
         _read_target_joystick,
@@ -234,20 +235,33 @@ if __name__ == "__main__":
     step = torch.load(args.ckpt, map_location="cpu", weights_only=False).get("step")
     H = policy.cfg.action_horizon
     target_mode = getattr(policy.cfg, "target_mode", "abs")
+    gripper_target_offset = int(
+        getattr(policy.cfg, "gripper_target_offset", -1)
+    )
+    if gripper_target_offset < 0:
+        gripper_target_offset = 0 if target_mode == "joystick" else 1
     print(f"loaded ckpt (step {step}) | action_dim={policy.cfg.action_dim} horizon={H} "
           f"use_wrist={policy.cfg.use_wrist} target={target_mode} "
-          f"gripper_head={getattr(policy.cfg, 'gripper_head', 'regression')}")
+          f"gripper_head={getattr(policy.cfg, 'gripper_head', 'regression')} "
+          f"gripper_target_offset={gripper_target_offset}")
     print(f"action_mean={np.round(policy.action_mean,4)} action_std={np.round(policy.action_std,4)}")
 
     def read_gt(g, t):
         """Ground truth in the same output convention as policy.act()."""
         if target_mode == "joystick":
-            return _read_target_joystick(g, t, H, 6)
-        if target_mode == "delta":
+            gt = _read_target_joystick(g, t, H, 6)
+        elif target_mode == "delta":
             gt = _read_target_delta(g, t, H, "eef_pos_base", 6)
             gt[:, :3] += g["obs"]["eef_pos_base"][t].astype(np.float32)
-            return gt
-        return _read_target(g, t + 1, H, "eef_pos_base", 6)
+        else:
+            gt = _read_target(g, t + 1, H, "eef_pos_base", 6)
+        grip_available = int(g["actions"].shape[0]) - (t + gripper_target_offset)
+        h = min(int(gt.shape[0]), max(0, grip_available))
+        gt = gt[:h]
+        gt[:, 3:4] = _read_gripper_target(
+            g, t, h, 6, gripper_target_offset
+        )
+        return gt
 
     if args.mode == "single":
         with h5py.File(args.hdf5, "r") as f:
@@ -276,6 +290,10 @@ if __name__ == "__main__":
     ds = MiniLaWAMDataset(
         args.hdf5, gap=H, horizon=H, sample_stride=args.sample_stride,
         target_mode=target_mode,
+        gripper_target_offset=gripper_target_offset,
+        include_tail_actions=bool(
+            getattr(policy.cfg, "include_tail_actions", False)
+        ),
     )
     n = len(ds)
     perm = np.random.default_rng(args.split_seed).permutation(n)
@@ -300,6 +318,7 @@ if __name__ == "__main__":
                       if need_xyz else None)
                 gt = read_gt(g, t)                                    # [H,4] target units
                 pred = policy.act(frame, wrist, state_xyz=st)          # [H,4] target units
+                pred = pred[:len(gt)]
                 pos_l2 += np.linalg.norm(pred[:, :3] - gt[:, :3], axis=1).mean()
                 step0_l2 += np.linalg.norm(pred[0, :3] - gt[0, :3])
                 mae += np.abs(pred - gt).mean(axis=0)

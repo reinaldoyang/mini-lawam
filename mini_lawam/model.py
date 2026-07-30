@@ -53,6 +53,9 @@ class MiniLaWAMConfig:
     target_mode: str = "abs"         # "abs" = absolute eef positions;
                                       # "delta" = pos[t+i]-pos[t];
                                       # "joystick" = raw action XYZ + gripper
+    gripper_target_offset: int = -1   # 0=same row, 1=one row ahead;
+                                      # -1 preserves legacy target-mode behavior
+    include_tail_actions: bool = False  # train terminal anchors with masked padding
     hidden: int = 512                # MLP head width
     attn_hidden: int = 384           # attn head width
     attn_layers: int = 3

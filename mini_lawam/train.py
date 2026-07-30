@@ -141,6 +141,19 @@ def main():
         "--lambda-gripper", type=float, default=1.0,
         help="Binary gripper BCE weight relative to normalized XYZ MSE (default: 1.0).",
     )
+    ap.add_argument(
+        "--gripper-target-offset", type=int, choices=[0, 1], default=None,
+        help="Gripper label row relative to observation t, independent of XYZ: "
+             "0=same row, 1=one row ahead. Default preserves the historical "
+             "contract (joystick=0, abs/delta=1). Use 1 for the recommended "
+             "joystick-binary release timing.",
+    )
+    ap.add_argument(
+        "--include-tail-actions", action="store_true",
+        help="Include anchors in the final action horizon of each demo. Short action "
+             "chunks are right-padded/masked and the LaWM future image is clamped to "
+             "the terminal frame. Recommended for phase-2 place/release training.",
+    )
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--out", default=None,
@@ -177,10 +190,17 @@ def main():
     lambda_distill = args.lambda_distill if args.lambda_distill is not None else (
         0.1 if args.phase == "2" else 1.0)
     lambda_wm = args.lambda_wm if args.lambda_wm is not None else 0.1
+    gripper_target_offset = (
+        int(args.gripper_target_offset)
+        if args.gripper_target_offset is not None
+        else (0 if args.target == "joystick" else 1)
+    )
     print(f"phase={args.phase} | prior {'trains' if train_prior else 'FROZEN'} | "
           f"action head {'skipped' if prior_only else 'trains'} | "
           f"lambda_distill={lambda_distill} lambda_wm={lambda_wm} "
-          f"lambda_gripper={args.lambda_gripper} | out={args.out}")
+          f"lambda_gripper={args.lambda_gripper} "
+          f"gripper_target_offset={gripper_target_offset} "
+          f"include_tail_actions={args.include_tail_actions} | out={args.out}")
 
     if args.use_state and args.target != "abs":
         raise SystemExit(f"--use-state + --target {args.target} unsupported: the checkpoint "
@@ -193,6 +213,8 @@ def main():
                           gripper_head=args.gripper_head,
                           use_state=args.use_state, state_dim=state_dim,
                           target_mode=args.target,
+                          gripper_target_offset=gripper_target_offset,
+                          include_tail_actions=args.include_tail_actions,
                           future_horizon=args.horizon, action_horizon=args.horizon,
                           lambda_gripper=args.lambda_gripper,
                           lambda_distill=lambda_distill, lambda_wm=lambda_wm)
@@ -204,6 +226,8 @@ def main():
         args.hdf5, gap=cfg.future_horizon, horizon=cfg.action_horizon,
         sample_stride=args.sample_stride, use_wrist=args.use_wrist,
         use_state=args.use_state, target_mode=args.target,
+        gripper_target_offset=cfg.gripper_target_offset,
+        include_tail_actions=cfg.include_tail_actions,
     )
     print(f"horizons: future(LaWM)={cfg.future_horizon}  action_chunk={cfg.action_horizon} "
           f"(gap between o_t and o_T = {cfg.future_horizon} frames)")

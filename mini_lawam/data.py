@@ -11,10 +11,11 @@ The target is selected by ``target_mode``:
     delta    : [eef_pos[t+i+1] - eef_pos[t] (3), raw_gripper[t+i+1] (1)]
     joystick : [raw_actions[t+i, 0:3], raw_actions[t+i, 6]]
 
-The joystick mode deliberately uses the command at the same index as the input
-observation, matching the recorder/LAPA convention: image ``t`` predicts
-``actions[t]``. Rotation columns 3:6 are omitted because Mini-LaWAM locks TCP
-orientation and predicts a four-dimensional [XYZ, gripper] chunk.
+``gripper_target_offset`` can override the gripper clock independently of XYZ.
+For example, joystick XYZ can stay at ``actions[t+i, 0:3]`` while a value of 1
+trains the separate binary gripper output on ``actions[t+i+1, 6]``. Rotation
+columns 3:6 are omitted because Mini-LaWAM locks TCP orientation and predicts a
+four-dimensional [XYZ, gripper] chunk.
 
 Targets are z-scored per dimension using dataset statistics; the checkpoint
 keeps those statistics so deployment can restore the original physical scale.
@@ -37,14 +38,21 @@ GRIP_ACTION_COL = 6               # gripper command column in raw `actions` (no 
 WRIST_KEY_DEFAULT = "wrist_cam"   # arm-mounted aux view (action head only, current frame t)
 
 
-def build_index(hdf5_path: str, gap: int, horizon: int, sample_stride: int = 1
+def build_index(hdf5_path: str, gap: int, horizon: int, sample_stride: int = 1,
+                include_tail_actions: bool = False,
                 ) -> List[Tuple[str, int]]:
-    """List (demo_key, t) with a valid future frame and full target horizon."""
+    """List training anchors.
+
+    Legacy mode requires a full future frame and action horizon. Tail mode keeps
+    anchors through T-2, clamps the LaWM future image to the terminal frame, and
+    lets the existing action mask right-pad short chunks. This is important for
+    terminal discrete events such as place-and-release.
+    """
     idx: List[Tuple[str, int]] = []
     with h5py.File(hdf5_path, "r") as f:
         for demo in f["data"].keys():
             T = int(f["data"][demo]["obs"]["table_cam"].shape[0])
-            last = T - max(gap, horizon) - 1
+            last = T - 2 if include_tail_actions else T - max(gap, horizon) - 1
             if last < 0:
                 continue
             idx.extend((demo, t) for t in range(0, last + 1, sample_stride))
@@ -85,6 +93,19 @@ def _read_target_joystick(g, t: int, n: int, grip_col: int) -> np.ndarray:
             f"{grip_col}, got shape {raw.shape}"
         )
     return np.concatenate([raw[:, :3], raw[:, grip_col:grip_col + 1]], axis=1)
+
+
+def _read_gripper_target(g, t: int, n: int, grip_col: int,
+                         offset: int) -> np.ndarray:
+    """Raw gripper command rows [t+offset, t+offset+n), shape [n,1]."""
+    start = int(t) + int(offset)
+    grip = g["actions"][start:start + int(n), grip_col:grip_col + 1].astype(np.float32)
+    if grip.shape != (int(n), 1):
+        raise IndexError(
+            f"gripper target offset {offset} from t={t} requires {n} rows, "
+            f"got shape {grip.shape}"
+        )
+    return grip
 
 
 def compute_action_stats(hdf5_path: str, pos_key: str, grip_col: int,
@@ -146,6 +167,8 @@ class MiniLaWAMDataset(Dataset):
         wrist_key: str = WRIST_KEY_DEFAULT,
         use_state: bool = False,
         target_mode: str = "abs",    # "abs", cumulative EEF "delta", or raw "joystick"
+        gripper_target_offset: Optional[int] = None,
+        include_tail_actions: bool = False,
     ):
         self.hdf5_path = hdf5_path
         self.gap = int(gap)
@@ -162,8 +185,21 @@ class MiniLaWAMDataset(Dataset):
                 "expected 'abs', 'delta', or 'joystick'"
             )
         self.target_mode = target_mode
+        if gripper_target_offset is None:
+            # Preserve the historical contracts unless training explicitly
+            # decouples gripper timing from the XYZ target representation.
+            gripper_target_offset = 0 if target_mode == "joystick" else 1
+        if int(gripper_target_offset) not in (0, 1):
+            raise ValueError(
+                "gripper_target_offset must be 0 (same row) or 1 (one row ahead)"
+            )
+        self.gripper_target_offset = int(gripper_target_offset)
+        self.include_tail_actions = bool(include_tail_actions)
         self.resize = v2.Resize(image_hw, antialias=True)
-        self.index = build_index(hdf5_path, self.gap, self.horizon, sample_stride)
+        self.index = build_index(
+            hdf5_path, self.gap, self.horizon, sample_stride,
+            include_tail_actions=self.include_tail_actions,
+        )
         if action_mean is None or action_std is None:
             action_mean, action_std = compute_action_stats(
                 hdf5_path, pos_key, grip_col,
@@ -188,7 +224,8 @@ class MiniLaWAMDataset(Dataset):
         demo, t = self.index[i]
         g = self._f()["data"][demo]
         cam = g["obs"]["table_cam"]
-        frames = torch.stack([self._frame(cam, t), self._frame(cam, t + self.gap)], 0)  # [2,3,256,256]
+        future_t = min(t + self.gap, int(cam.shape[0]) - 1)
+        frames = torch.stack([self._frame(cam, t), self._frame(cam, future_t)], 0)  # [2,3,256,256]
 
         # EEF modes use future rows t+1..t+H; joystick uses commands t..t+H-1.
         if self.target_mode == "delta":
@@ -198,7 +235,16 @@ class MiniLaWAMDataset(Dataset):
             raw = _read_target_joystick(g, t, self.horizon, self.grip_col)
         else:
             raw = _read_target(g, t + 1, self.horizon, self.pos_key, self.grip_col)  # [h,4]
-        h = raw.shape[0]
+        # The chosen gripper offset can have fewer valid tail rows than XYZ.
+        grip_available = int(g["actions"].shape[0]) - (t + self.gripper_target_offset)
+        h = min(int(raw.shape[0]), max(0, grip_available))
+        raw = raw[:h]
+        # Gripper timing is an explicit, target-mode-independent contract.
+        # In the recommended joystick-binary run, XYZ stays at action[t+i] while
+        # gripper uses action[t+i+1], teaching chunk[0] to predict the next command.
+        raw[:, 3:4] = _read_gripper_target(
+            g, t, h, self.grip_col, self.gripper_target_offset
+        )
         # Preserve the raw discrete class before z-scoring the legacy 4D action
         # target. Binary-head training consumes this field directly; regression
         # checkpoints continue to use normalized actions[..., 3] unchanged.

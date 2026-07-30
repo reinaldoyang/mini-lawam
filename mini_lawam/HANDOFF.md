@@ -2,7 +2,7 @@
 
 A minimal, **LaWAM-inspired vision-only behavior-cloning policy** built inside the
 LaWAM repo, deployed on a real **UR7e** (egg pick-and-place). Read this to
-understand the whole system before touching code. Last updated: 2026-07-28.
+understand the whole system before touching code. Last updated: 2026-07-30.
 
 ## 1. What it is (one paragraph)
 
@@ -41,6 +41,12 @@ teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distil
   `[eef_pos_base(3), gripper]` (v0); `delta` = cumulative EEF displacement from
   the current frame; `joystick` = recorded `[actions[0:3], actions[6]]`. See the
   exact contracts below.
+- Gripper timing is independently checkpointed as `gripper_target_offset`.
+  `--gripper-target-offset 1` means action-head row `i` uses the gripper command
+  from `t+i+1` even when joystick XYZ remains at `t+i`.
+- `--include-tail-actions` keeps the final placement/release frames as phase-2
+  action-head anchors. Short terminal chunks use the existing right-padding
+  mask, and the LaWM future image is clamped to the terminal frame.
 - `use_wrist`: wrist_cam feeds the **action head only** (never prior/LaWM — §C.2).
 - `use_state` (optional, off in current ckpts): current eef xyz as extra head input.
 - Inference `predict()`: current frame(s) only → chunk. No future frame.
@@ -88,13 +94,18 @@ chunk[i] = [pos[t+i+1] - pos[t], gripper[t+i+1]],  i = 0..23
 
 ### Joystick action contract
 
-For `--target joystick`, input observation `t` is aligned to the recorded
-command at the same index:
+For `--target joystick`, XYZ for input observation `t` is aligned to the
+recorded command at the same index:
 
 ```
 chunk[i] = [actions[t+i, 0:3], actions[t+i, 6]],  i = 0..23
 ```
 
+- The formula above is the legacy same-index checkpoint contract
+  (`gripper_target_offset=0`). The recommended binary-gripper run uses
+  `gripper_target_offset=1`, changing only the fourth channel to
+  `actions[t+i+1, 6]`. This teaches `chunk[0]` the next-row release command
+  without shifting joystick XYZ.
 - Rotation columns `3:6` are omitted; the rollout keeps its locked orientation.
 - Training uses the original joystick values and target-specific mean/std. It
   does not apply the deployment gain.
@@ -126,11 +137,12 @@ python -m mini_lawam.train --hdf5 <data.hdf5> --phase 2 --head attn --use-wrist 
 
 # Alternative phase 2: same attention head/prior, raw joystick target
 python -m mini_lawam.train --hdf5 <data.hdf5> --phase 2 --head attn --use-wrist \
-    --target joystick --gripper-head binary --lambda-gripper 1.0 \
+    --target joystick --gripper-head binary --gripper-target-offset 1 \
+    --include-tail-actions --lambda-gripper 1.0 \
     --prior-ckpt results/mini_lawam/phase1_<name>.pt \
     --steps 10000 --batch 32 --lr 1e-4 \
-    --out results/mini_lawam/ckpt_<name>_attn_joystick.pt \
-    --csv-log results/mini_lawam/log_<name>_attn_joystick.csv
+    --out results/mini_lawam/ckpt_<name>_attn_joystick_binary_grip_t1.pt \
+    --csv-log results/mini_lawam/log_<name>_attn_joystick_binary_grip_t1.csv
 ```
 `--phase joint` = original single-phase. Phase-2 ckpt is self-contained
 (prior + head + cfg + action stats) → deployment needs only that one file.
@@ -276,6 +288,59 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
    Current deployment checkpoint: `ckpt_100ep_attn_delta.pt`. This addresses the
    action-coordinate failure mode; it does not solve visual misidentification
    (for example, confusing bowl contents with the egg).
+9. **Release procrastination with receding-horizon gripper prediction**: the
+   joystick binary-head policy picked up the egg correctly and reached the bowl,
+   but hovered while holding the egg. Trial 59 showed that the model did predict
+   release, with the first open row counting down from chunk index 23 → 15 → 8
+   → 2 → 1. Once it reached `[close now, open next step, ...]`, rollout kept
+   executing only the newest `chunk[0]`. Because the gripper remained closed,
+   the camera observation barely changed; every replan repeated the same
+   `[close now, open next step]` forecast. The release stayed perpetually one
+   step away until visual drift finally changed `chunk[0]` roughly 9.2 seconds
+   later. This is a discrete-action receding-horizon deadlock, not a missing
+   release class or a slow 20 Hz policy loop.
+
+   Fix: `--gripper-open-lead-steps 1` (default) lets only the release event use
+   the newest chunk's next row once the commanded gripper is already closed.
+   Closing/grasping still uses the immediate row. When release triggers, it is
+   latched open for the rest of that single-pick rollout so the next unchanged
+   pre-release image cannot command close again. Set the option to `0` to
+   disable lookahead. A trigger prints:
+   `[GRIPPER] release triggered from chunk[1] (open lookahead=1 step)`.
+
+   Why this is needed: action chunks are forecasts, not commitments. Continuous
+   XYZ commands make partial progress and change the next observation; a
+   discrete `+1=close` command makes no progress toward `-1=open`. The
+   memoryless head cannot remember that its previous chunk promised to open on
+   the next frame. Legacy joystick checkpoints use gripper row `t`, whereas
+   delta checkpoints use `t+1`; new training should set the now-explicit
+   `--gripper-target-offset 1` so the gripper clock does not depend on XYZ mode.
+   In addition, legacy `build_index` required a full 24-row future horizon and
+   therefore excluded the final 24 anchor frames of every demo. In `demo_0`,
+   the frame immediately before release was not an action-head training anchor:
+   release appeared only in later query rows of earlier chunks. Use
+   `--include-tail-actions` in phase 2 so query 0 is directly supervised on the
+   terminal placement and release states.
+
+   Prevention:
+   - Define and test camera/action/state timestamps and label offsets explicitly;
+     gripper alignment must not change implicitly with the XYZ target mode.
+   - Evaluate closed-loop `predict → execute row 0 → observe → replan`, not only
+     open-loop chunk accuracy. Inspect the first predicted open index across
+     replans; a countdown that stalls at index 1 reveals procrastination.
+   - Score grasp/release transition error in frames. Overall gripper accuracy is
+     dominated by long constant-state intervals and can hide a late release.
+   - Treat discrete events separately from continuous temporal ensembling:
+     use event latching, hysteresis/confirmation, or explicit scheduling rather
+     than averaging binary commands.
+   - Record actual gripper position/status in future datasets. The current HDF5
+     stores the requested latched command only, so actuator latency and command
+     completion cannot be learned or measured.
+   - For the next clean training ablation, use the explicit
+     `--gripper-target-offset 1 --include-tail-actions` and compare joystick-binary with
+     `delta + binary gripper`. Training step 0 against `gripper[t+1]` should
+     reduce inference-time lookahead, while a configurable deployment lead can
+     remain for physical actuator latency.
 
 ## 8. Environment
 

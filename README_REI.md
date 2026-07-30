@@ -122,6 +122,21 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
   --csv-log results/mini_lawam/log_100ep_attn_delta.csv
 ```
 
+### To train attention head, with binary gripper head, and changed gripper timing
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
+  --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
+  --phase 2 --head attn --gripper-head binary \
+  --use-wrist --target joystick \
+  --gripper-target-offset 1 \
+  --include-tail-actions \
+  --prior-ckpt results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt \
+  --lambda-gripper 1.0 \
+  --steps 10000 --batch 32 --lr 1e-4 \
+  --out results/mini_lawam/ckpt_100ep_attn_joystick_binary_grip_t1.pt \
+  --csv-log results/mini_lawam/log_100ep_attn_joystick_binary_grip_t1.csv
+```
+
 Experiment 2: add proprioception
 
 
@@ -245,6 +260,8 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --trace-dir results/mini_lawam/traces \
   --show-camera --show-subgoal \
   --subgoal-update-steps 8
+  --gripper-threshold 0.0 \
+  --gripper-open-lead-steps 1 \
 ```
 
 

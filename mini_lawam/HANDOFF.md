@@ -212,8 +212,11 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   home; old-scene ckpts need the old π/2 home). 23° mismatch ⇒ start-frame OOD.
 - `--temporal-ensemble` (ACT-style): replans every step (15 ms ≪ 50 ms budget),
   executes an exp-weighted average of all overlapping chunks → smooth motion.
-  Gripper deliberately taken from the **newest chunk[0] only** (averaging a
-  ±1 switch fires it early → grasps 4 cm high; measured + fixed).
+  Gripper is never ensemble-averaged. Closing uses the newest immediate row;
+  once already closed, `--gripper-open-lead-steps 1` may use the newest
+  chunk's next row to trigger release 50 ms early, then latches open for the
+  remainder of the rollout. This avoids both the old early-grasp failure and
+  the observed “close now, open next step” release deadlock.
   Old receding-horizon mode (exec 8/replan) remains the non-TE fallback.
 - Delta composition happens before temporal ensembling: each new chunk is
   anchored at the actual TCP measured for that replan. `--max-reach` then limits
@@ -233,6 +236,10 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   forensics (`policy.act` on saved frames, nearest-neighbor vs dataset, etc.).
 - `--trace-dir` always saves the first table frame plus a compact summary JSON
   (`started_at`, `finished_at`, S-to-H duration, steps, and frame path).
+  It scans existing `trial_<N>_...` files and resumes at `max(N)+1` across
+  sessions. Basenames use `trial_10_20260724T133010_{table_cam_first.png,summary.json}`
+  with no zero padding or `_async_` marker. Both files share one trial number;
+  duplicate files are never counted as separate trials.
 - GUI shows the **256×256 model inputs** (table + wrist) — what the policy sees.
 - `--show-subgoal` adds a live heatmap over the table input using the predicted
   DINO feature change `||u_hat_T-u_t||`. Red/yellow patches indicate where the

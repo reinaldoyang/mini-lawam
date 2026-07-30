@@ -194,7 +194,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --trace-dir results/mini_lawam/traces --show-camera
 ```
 
-### show subgoal at gui
+### show subgoal at gui (most stable version but slower)
 ```bash
 CUDA_VISIBLE_DEVICES=1 python -m mini_lawam.rollout_ur7e \
   --ckpt results/mini_lawam/ckpt_100ep_attn_delta.pt \
@@ -202,7 +202,7 @@ CUDA_VISIBLE_DEVICES=1 python -m mini_lawam.rollout_ur7e \
   --table-exposure 180 --table-gain 16 --wrist-exposure 100 --wrist-gain 16 \
   --robot-ip 140.96.93.7 --execute --use-gripper-control \
   --train-frame-hw 168 224 \
-  --temporal-ensemble --te-m 0.1 --target-ema 1.0 --target-deadband 0.0 \
+  --temporal-ensemble --te-m 0.3 --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.02 --servol-max-pos-step 0.002 \
   --trace-dir results/mini_lawam/traces --show-camera --show-subgoal --subgoal-alpha 0.55 \
   --subgoal-update-steps 8 --video-scale 2.0
@@ -225,6 +225,27 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --subgoal-update-steps 8 --video-scale 2.0
 ```
 
+### Rollout of joystick target with binary gripper head
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
+  --ckpt results/mini_lawam/ckpt_100ep_attn_joystick_binary.pt \
+  --table-cam-serial 244422300964 \
+  --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 \
+  --wrist-exposure 100 --wrist-gain 16 \
+  --robot-ip 140.96.93.7 \
+  --execute --use-gripper-control \
+  --train-frame-hw 168 224 \
+  --temporal-ensemble --te-m 0.1 \
+  --action-scale 0.28 \
+  --gripper-threshold 0.0 \
+  --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.02 \
+  --servol-max-pos-step 0.002 \
+  --trace-dir results/mini_lawam/traces \
+  --show-camera --show-subgoal \
+  --subgoal-update-steps 8
+```
 
 
 ## Evaluation 

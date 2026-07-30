@@ -5,6 +5,7 @@ from mini_lawam.rollout_ur7e import (
     compose_target_xyz,
     scale_delta_chunk,
     scale_joystick_chunk,
+    select_gripper_with_open_lookahead,
 )
 
 
@@ -97,8 +98,48 @@ def test_existing_delta_target_and_scale_semantics_are_preserved():
     )
 
 
+def test_open_lookahead_preserves_grasp_then_latches_release():
+    chunk = np.asarray(
+        [
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, -1.0],
+            [0.0, 0.0, 0.0, -1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    # While currently open, closing remains an immediate chunk[0] decision.
+    grip, latched, source = select_gripper_with_open_lookahead(
+        chunk, step_index=0, last_cmd="open", release_latched=False,
+        open_lead_steps=1,
+    )
+    assert grip == 1.0
+    assert not latched
+    assert source == 0
+
+    # Once closed, the next-step open forecast triggers release now.
+    grip, latched, source = select_gripper_with_open_lookahead(
+        chunk, step_index=0, last_cmd="close", release_latched=False,
+        open_lead_steps=1,
+    )
+    assert grip == -1.0
+    assert latched
+    assert source == 1
+
+    # The latch prevents an unchanged image from commanding close again.
+    all_close = np.ones((3, 4), dtype=np.float32)
+    grip, latched, source = select_gripper_with_open_lookahead(
+        all_close, step_index=0, last_cmd="open", release_latched=True,
+        open_lead_steps=1,
+    )
+    assert grip == -1.0
+    assert latched
+    assert source == -1
+
+
 if __name__ == "__main__":
     test_joystick_target_uses_same_index_xyz_and_gripper_only()
     test_joystick_scale_changes_xyz_but_not_gripper()
     test_existing_delta_target_and_scale_semantics_are_preserved()
-    print("3 focused target-mode tests passed")
+    test_open_lookahead_preserves_grasp_then_latches_release()
+    print("4 focused target-mode tests passed")

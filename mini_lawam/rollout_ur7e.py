@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import threading
 import time
@@ -60,6 +61,7 @@ HOME_Q = [0.4076, -1.4255, -1.7052, -1.5821, 1.5703, 1.9768]
 # dataset's eef_quat_base across ALL demo frames (constant within 0.24 deg).
 # = 180 deg about base Y, i.e. tool pointing straight down.
 DEMO_LOCKED_ROTVEC = np.array([0.0036, 3.14094, -0.00024], dtype=np.float64)
+TRACE_TRIAL_RE = re.compile(r"^trial_(\d+)(?:_|$)")
 
 
 def build_parser():
@@ -151,6 +153,11 @@ def build_parser():
     p.add_argument("--gripper-force", type=int, default=50)
     p.add_argument("--gripper-threshold", type=float, default=0.0,
                    help="chunk[:,3] <= thr => open, > thr => close (open=-1, close=+1)")
+    p.add_argument("--gripper-open-lead-steps", type=int, default=1,
+                   help="When the commanded gripper is already closed, allow an open "
+                        "prediction this many chunk steps ahead to trigger release now. "
+                        "The release is latched open for the rest of the rollout. "
+                        "Default 1 = 50 ms lookahead at 20 Hz; 0 disables lookahead.")
 
     # camera
     p.add_argument("--train-frame-hw", type=int, nargs=2, default=[168, 224],
@@ -192,12 +199,42 @@ def build_parser():
     p.add_argument("--pygame-window-w", type=int, default=560)
     p.add_argument("--pygame-window-h", type=int, default=150)
     p.add_argument("--trace-dir", default=None,
-                   help="save per-rollout summary JSON and the first table-camera frame here")
+                   help="save per-rollout summary JSON and first table-camera frame here. "
+                        "Trial numbering resumes from the highest trial_<N> already present.")
     p.add_argument("--save-frames", type=int, default=0,
                    help="Save the live table/wrist frames fed to the policy every N "
-                        "control steps into <trace-dir>/frames_trial_XXX/ (0 = off). "
+                        "control steps into <trace-dir>/frames_trial_<N>_<timestamp>/ "
+                        "(0 = off). "
                         "Lets failures be analyzed offline on the exact inputs.")
     return p
+
+
+def next_trace_trial_number(trace_dir) -> int:
+    """Return max existing ``trial_<N>_...`` number + 1.
+
+    A rollout normally writes both a PNG and JSON, so counting files would skip
+    numbers. Parsing and deduplicating trial IDs also avoids overwriting a
+    partial trace left by an interrupted run. With an empty/missing trace
+    directory, persisted numbering starts at 1. Without tracing, retain the
+    historical in-session zero-based number.
+    """
+    if not trace_dir:
+        return 0
+    root = Path(trace_dir)
+    if not root.exists():
+        return 1
+    numbers = []
+    for child in root.iterdir():
+        match = TRACE_TRIAL_RE.match(child.name)
+        if match is not None:
+            numbers.append(int(match.group(1)))
+    return max(numbers, default=0) + 1
+
+
+def format_rollout_stem(trial: int, started_wall: float) -> str:
+    """Requested trace basename: trial_10_20260724T133010."""
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.localtime(started_wall))
+    return f"trial_{int(trial)}_{stamp}"
 
 
 # ----------------------------------------------------------------------------
@@ -486,6 +523,50 @@ def compose_target_xyz(pred_xyz, current_xyz, target_mode):
     raise ValueError(f"unsupported target_mode={target_mode!r}")
 
 
+def select_gripper_with_open_lookahead(
+    chunk,
+    step_index,
+    last_cmd,
+    release_latched,
+    threshold=0.0,
+    open_lead_steps=1,
+):
+    """Select a gripper row while allowing only the release event to look ahead.
+
+    Closing always uses the immediate row. Once the commanded gripper is closed,
+    an open prediction in [step_index, step_index + open_lead_steps] triggers
+    release. Release then stays latched open for this single-pick rollout so an
+    unchanged pre-release image cannot command close again on the next frame.
+
+    Returns ``(grip_value, release_latched, source_index)``. ``source_index`` is
+    -1 when an existing release latch supplied the open command.
+    """
+    rows = np.asarray(chunk)
+    if rows.ndim != 2 or rows.shape[1] < 4:
+        raise ValueError(f"action chunk must have shape [H,>=4], got {rows.shape}")
+    idx = int(step_index)
+    if idx < 0 or idx >= rows.shape[0]:
+        raise IndexError(f"gripper step_index {idx} outside chunk horizon {rows.shape[0]}")
+    lead = int(open_lead_steps)
+    if lead < 0:
+        raise ValueError(f"open_lead_steps must be >= 0, got {lead}")
+
+    if release_latched:
+        return -1.0, True, -1
+
+    immediate = float(rows[idx, 3])
+    if last_cmd != "close":
+        return immediate, False, idx
+
+    end = min(rows.shape[0] - 1, idx + lead)
+    window = rows[idx:end + 1, 3]
+    open_offsets = np.flatnonzero(window <= float(threshold))
+    if open_offsets.size:
+        source_index = idx + int(open_offsets[0])
+        return float(rows[source_index, 3]), True, source_index
+    return immediate, False, idx
+
+
 def make_subgoal_overlay(model_input_rgb, change_grid, alpha=0.55):
     """Colorize a DINO patch-change grid and blend it over the 256px model input."""
     import cv2
@@ -543,6 +624,8 @@ def main():
         raise ValueError("--delta-scale must be a finite value >= 0")
     if not np.isfinite(args.action_scale) or args.action_scale < 0.0:
         raise ValueError("--action-scale must be a finite value >= 0")
+    if args.gripper_open_lead_steps < 0:
+        raise ValueError("--gripper-open-lead-steps must be >= 0")
     if args.show_subgoal and not args.show_camera:
         raise ValueError("--show-subgoal requires --show-camera")
     if not np.isfinite(args.subgoal_alpha) or not 0.0 <= args.subgoal_alpha <= 1.0:
@@ -603,6 +686,8 @@ def main():
           f"gripper_head={getattr(policy.cfg, 'gripper_head', 'regression')} "
           f"delta_scale={args.delta_scale:g}"
           + (f" action_scale={args.action_scale:g}" if target_mode == "joystick" else ""))
+    print(f"[INFO] gripper open lookahead={args.gripper_open_lead_steps} step(s) "
+          "(release latches open for the rest of each rollout)")
     if args.show_subgoal:
         print("[VIZ] live predicted-subgoal feature-change overlay enabled "
               f"(alpha={args.subgoal_alpha:g}, refresh every "
@@ -711,8 +796,13 @@ def main():
 
         pygame, screen, font, clock = init_pygame(args, two_rows=need_wrist)
 
-        trial, quit_all = 0, False
-        while trial < args.num_rollouts and not quit_all:
+        trial = next_trace_trial_number(args.trace_dir)
+        session_rollouts = 0
+        quit_all = False
+        if args.trace_dir:
+            print(f"[TRACE] next persistent trial number={trial} "
+                  f"(scanned {Path(args.trace_dir)})")
+        while session_rollouts < args.num_rollouts and not quit_all:
             latest_subgoal_overlay = None
             subgoal_inference_index = 0
             # ---- idle: wait for S / H / Q ----
@@ -745,18 +835,37 @@ def main():
                   + (f"  locked_rotvec={np.round(locked_rotvec, 4)}" if args.execute else ""))
             time.sleep(max(0.0, args.startup_wait_sec))
 
-            rollout_stamp = time.strftime("%Y%m%dT%H%M%S",
-                                           time.localtime(rollout_started_wall))
-            rollout_stem = f"trial_{trial:03d}_async_{rollout_stamp}"
+            rollout_stem = format_rollout_stem(trial, rollout_started_wall)
             first_table_frame = None
             trace = {"ckpt": str(Path(args.ckpt).resolve()), "execute": args.execute,
                      "target_mode": target_mode,
                      "delta_scale": args.delta_scale,
                      "action_scale": args.action_scale if target_mode == "joystick" else None,
+                     "gripper_open_lead_steps": args.gripper_open_lead_steps,
                      "exec_steps": k, "control_hz": args.control_hz, "steps": []}
             result = "completed"
             step = 0
             smooth = {"ema_xyz": None, "last_cmd_xyz": None}  # per-rollout smoothing state
+            grip_runtime = {"last_cmd": None, "release_latched": False}
+
+            def select_grip_value(chunk, step_index):
+                """Apply open-only lookahead and report the release transition once."""
+                was_latched = grip_runtime["release_latched"]
+                grip_val, release_latched, source_index = \
+                    select_gripper_with_open_lookahead(
+                        chunk=chunk,
+                        step_index=step_index,
+                        last_cmd=grip_runtime["last_cmd"],
+                        release_latched=was_latched,
+                        threshold=args.gripper_threshold,
+                        open_lead_steps=args.gripper_open_lead_steps,
+                    )
+                grip_runtime["release_latched"] = release_latched
+                if release_latched and not was_latched:
+                    lead = source_index - int(step_index)
+                    print(f"[GRIPPER] release triggered from chunk[{source_index}] "
+                          f"(open lookahead={lead} step{'s' if lead != 1 else ''})")
+                return grip_val
 
             def apply_waypoint(pred_xyz, grip_val, step, sub):
                 """One control tick: smooth -> clamp -> servo target + gripper + trace."""
@@ -795,6 +904,7 @@ def main():
                 else:
                     tgt_xyz = smoothed_xyz
                 smooth["last_cmd_xyz"] = np.asarray(tgt_xyz, dtype=np.float64)
+                grip_runtime["last_cmd"] = grip_cmd
                 trace["steps"].append({
                     "step": step, "sub": sub,
                     "pred_xyz": pred_xyz.tolist(),
@@ -820,8 +930,7 @@ def main():
 
             frames_dir = None
             if args.save_frames > 0 and args.trace_dir:
-                frames_dir = (Path(args.trace_dir) /
-                              f"frames_trial_{trial:03d}_{time.strftime('%Y%m%d%H%M%S')}")
+                frames_dir = Path(args.trace_dir) / f"frames_{rollout_stem}"
                 frames_dir.mkdir(parents=True, exist_ok=True)
                 print(f"[FRAMES] saving every {args.save_frames} steps -> {frames_dir}")
 
@@ -863,13 +972,12 @@ def main():
                     w = np.exp(-float(args.te_m) * age)
                     w /= w.sum()
                     avg = (preds * w[:, None]).sum(0)                     # [4]
-                    # Ensemble-average XYZ targets/commands, but NOT the gripper:
-                    # near-discrete -1/+1 switch, and averaging in far-horizon "+1 close"
-                    # predictions trips the threshold several steps early (grasps high).
-                    # Use the newest immediate prediction's gripper instead.
-                    grip_val = float(chunk[0, 3])
+                    # Ensemble-average XYZ targets/commands, but use the newest
+                    # chunk for gripper timing. Only release may look ahead.
+                    grip_val = select_grip_value(chunk, step_index=0)
                     grip_cmd = apply_waypoint(avg[:3], grip_val, step, sub=0)
                     if step % 8 == 0:
+                        print("gripper chunk:", chunk[:, 3])
                         mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
                         xyz_label = "avg_joy_delta" if target_mode == "joystick" else "avg_xyz"
                         print(f"[STEP {step}] inf={inf_ms:.0f}ms te_n={n}  "
@@ -900,14 +1008,16 @@ def main():
                     if cmd in ("end", "home", "quit"):
                         stop_cmd = cmd
                         break
-                    grip_cmd = apply_waypoint(chunk[i, :3], float(chunk[i, 3]), step, sub=i)
+                    grip_val = select_grip_value(chunk, step_index=i)
+                    grip_cmd = apply_waypoint(chunk[i, :3], grip_val, step, sub=i)
                     if i == 0:
+                        print("gripper chunk:", chunk[:, 3])
                         mv_k = np.linalg.norm(chunk[k - 1, :3] - chunk[0, :3]) * 1e3
                         mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
                         xyz_label = "joy_delta" if target_mode == "joystick" else "pred_xyz"
                         print(f"[STEP {step}] inf={inf_ms:.0f}ms  "
                               f"{xyz_label}={np.round(chunk[i, :3], 4)}  "
-                              f"grip={chunk[i, 3]:+.2f}->{grip_cmd}  "
+                              f"grip={grip_val:+.2f}->{grip_cmd}  "
                               f"chunk_span[0->{k - 1}]={mv_k:.0f}mm "
                               f"[0->{H - 1}]={mv_H:.0f}mm")
                     step += 1
@@ -944,6 +1054,7 @@ def main():
                     "action_scale": (
                         args.action_scale if target_mode == "joystick" else None
                     ),
+                    "gripper_open_lead_steps": args.gripper_open_lead_steps,
                     "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z",
                                                 time.localtime(rollout_started_wall)),
                     "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z",
@@ -966,6 +1077,7 @@ def main():
             if result == "quit":
                 quit_all = True
             trial += 1
+            session_rollouts += 1
 
     finally:
         stop_servo_pipeline(servo_state, servo_thread)

@@ -241,6 +241,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
 ```
 
 ### Rollout of joystick target with binary gripper head
+the gripper open lead step will make the gripper open command to be sent 1 step earlier
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --ckpt results/mini_lawam/ckpt_100ep_attn_joystick_binary.pt \
@@ -264,6 +265,49 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --gripper-open-lead-steps 1 \
 ```
 
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
+  --ckpt results/mini_lawam/ckpt_100ep_attn_joystick_binary_grip_t1.pt \
+  --table-cam-serial 244422300964 \
+  --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 \
+  --wrist-exposure 100 --wrist-gain 16 \
+  --robot-ip 140.96.93.7 \
+  --execute --use-gripper-control \
+  --train-frame-hw 168 224 \
+  --temporal-ensemble --te-m 0.1 \
+  --action-scale 0.28 \
+  --gripper-threshold 0.0 \
+  --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.02 \
+  --servol-max-pos-step 0.002 \
+  --trace-dir results/mini_lawam/traces \
+  --show-camera --show-subgoal \
+  --subgoal-update-steps 8 \
+  --gripper-threshold 0.0 \
+  --gripper-open-lead-steps 0
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
+  --ckpt results/mini_lawam/ckpt_100ep_attn_joystick_binary_grip_t1.pt \
+  --table-cam-serial 244422300964 \
+  --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 \
+  --wrist-exposure 100 --wrist-gain 16 \
+  --robot-ip 140.96.93.7 \
+  --execute --use-gripper-control \
+  --train-frame-hw 168 224 \
+  --exec-steps 1 \
+  --gripper-threshold 0.0 \
+  --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.02 \
+  --servol-max-pos-step 0.002 \
+  --trace-dir results/mini_lawam/traces \
+  --save-frames 1 \
+  --show-camera --show-subgoal \
+  --subgoal-update-steps 8
+```
 
 ## Evaluation 
 ### Phase 1 evaluation

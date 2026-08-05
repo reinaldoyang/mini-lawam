@@ -7,7 +7,7 @@ Structure (your diagram):
                           [pool(u_t), pool(u_hat_T), (state)] --MLP--> action chunk
 
 Losses:
-    loss_act     = XYZ MSE + gripper BCE (binary-head mode), or legacy action MSE
+    loss_act     = motion MSE + gripper BCE (binary-head mode), or action MSE
     loss_distill = MSE(z_hat, z_teacher)                      # teacher = frozen LAM IDM(u_t,u_T)
     loss_wm      = MSE(u_hat_T, u_T)                          # subgoal supervision (light)
 
@@ -36,7 +36,7 @@ from latent_action_model.core.lam_model import load_latent_action_model
 class MiniLaWAMConfig:
     lam_ckpt: str = "latent_action_model/logs/dino_large_vae/lam_release/checkpoints/pytorch_model.pt"
     lam_yaml: str = "latent_action_model/logs/dino_large_vae/lam_release/dino_large_vae.yaml"
-    action_dim: int = 4              # target = absolute [eef_pos(3), gripper_pos(1)]
+    action_dim: int = 4              # [XYZ, grip], or [XYZ, RZ, grip] with include_rz
     # Horizon in FRAMES = 1.2 s @ 20 Hz = 24 (paper §C.5 robot horizon). Same value
     # for the action chunk (MLP head output) and the LaWM future pair (o_{t+H} ->
     # z_teacher, u_T, loss_wm).
@@ -48,11 +48,12 @@ class MiniLaWAMConfig:
                                       # (never the prior/LaWM -- paper §C.2; wrist moves w/ arm)
     head_type: str = "mlp"           # "mlp" = pooled-features MLP (v0);
                                       # "attn" = token-level cross-attention (no pooling)
-    gripper_head: str = "regression" # "regression" = legacy joint 4D MSE output;
-                                      # "binary" = separate XYZ regression + grip logit
+    gripper_head: str = "regression" # "regression" = joint action MSE output;
+                                      # "binary" = separate motion regression + grip logit
     target_mode: str = "abs"         # "abs" = absolute eef positions;
                                       # "delta" = pos[t+i]-pos[t];
                                       # "joystick" = raw action XYZ + gripper
+    include_rz: bool = False          # joystick only: [XYZ, raw action RZ, gripper]
     gripper_target_offset: int = -1   # 0=same row, 1=one row ahead;
                                       # -1 preserves legacy target-mode behavior
     include_tail_actions: bool = False  # train terminal anchors with masked padding
@@ -60,7 +61,7 @@ class MiniLaWAMConfig:
     attn_hidden: int = 384           # attn head width
     attn_layers: int = 3
     attn_heads: int = 6
-    lambda_gripper: float = 1.0       # binary-head BCE weight relative to XYZ MSE
+    lambda_gripper: float = 1.0       # binary-head BCE weight relative to motion MSE
     lambda_distill: float = 1.0
     lambda_wm: float = 0.1            # subgoal supervision weight (0 to disable)
 
@@ -107,13 +108,17 @@ class MLPActionHead(nn.Module):
                 nn.Linear(hidden, horizon * action_dim),
             )
         elif gripper_head == "binary":
-            if action_dim != 4:
-                raise ValueError("binary gripper head requires action_dim=4 (XYZ + grip)")
+            if action_dim < 4:
+                raise ValueError("binary gripper head requires motion channels + gripper")
+            motion_dim = action_dim - 1
             self.trunk = nn.Sequential(
                 nn.Linear(in_dim, hidden), nn.GELU(),
                 nn.Linear(hidden, hidden), nn.GELU(),
             )
-            self.xyz_out = nn.Linear(hidden, horizon * 3)
+            # Retain the historical `xyz_out` state-dict key so existing 4D
+            # binary checkpoints remain exactly loadable. For a 5D RZ checkpoint
+            # this layer emits XYZ+RZ (four continuous motion channels).
+            self.xyz_out = nn.Linear(hidden, horizon * motion_dim)
             self.gripper_out = nn.Linear(hidden, horizon)
         else:
             raise ValueError(
@@ -126,9 +131,9 @@ class MLPActionHead(nn.Module):
         if self.gripper_head == "regression":
             return self.net(cond).view(b, self.horizon, self.action_dim)
         feat = self.trunk(cond)
-        xyz = self.xyz_out(feat).view(b, self.horizon, 3)
+        motion = self.xyz_out(feat).view(b, self.horizon, self.action_dim - 1)
         grip_logits = self.gripper_out(feat).view(b, self.horizon, 1)
-        return torch.cat([xyz, grip_logits], dim=-1)
+        return torch.cat([motion, grip_logits], dim=-1)
 
 
 class _CrossAttnBlock(nn.Module):
@@ -160,8 +165,8 @@ class AttnActionHead(nn.Module):
     of every view (u_t, u_hat_T, [wrist]) -- so the head reads *where* things are
     (arm/egg patches) instead of a single averaged vector. Optional proprioception
     (current eef_pos) enters as an extra context token. The legacy mode regresses
-    all four outputs. Binary mode splits the final projection into normalized XYZ
-    regression and a single open/close logit per timestep.
+    all action outputs. Binary mode splits the final projection into normalized
+    motion (XYZ or XYZ+RZ) and a single open/close logit per timestep.
     """
 
     def __init__(self, token_dim: int, action_dim: int, horizon: int,
@@ -184,9 +189,11 @@ class AttnActionHead(nn.Module):
             # Preserve the legacy key names (`out.weight`, `out.bias`) for old ckpts.
             self.out = nn.Linear(hidden, action_dim)
         elif gripper_head == "binary":
-            if action_dim != 4:
-                raise ValueError("binary gripper head requires action_dim=4 (XYZ + grip)")
-            self.xyz_out = nn.Linear(hidden, 3)
+            if action_dim < 4:
+                raise ValueError("binary gripper head requires motion channels + gripper")
+            # Keep the `xyz_out` name for legacy checkpoint compatibility; it
+            # emits all continuous motion channels, including optional RZ.
+            self.xyz_out = nn.Linear(hidden, action_dim - 1)
             self.gripper_out = nn.Linear(hidden, 1)
         else:
             raise ValueError(
@@ -209,9 +216,9 @@ class AttnActionHead(nn.Module):
         feat = self.norm(q)
         if self.gripper_head == "regression":
             return self.out(feat)                          # [B, horizon, 4]
-        xyz = self.xyz_out(feat)                           # normalized XYZ
+        motion = self.xyz_out(feat)                        # normalized XYZ[+RZ]
         grip_logits = self.gripper_out(feat)               # unbounded close logits
-        return torch.cat([xyz, grip_logits], dim=-1)       # [B, horizon, 4]
+        return torch.cat([motion, grip_logits], dim=-1)    # [B, horizon, action_dim]
 
 
 def compute_action_losses(
@@ -222,12 +229,11 @@ def compute_action_losses(
     gripper_head: str,
     lambda_gripper: float,
 ):
-    """Compute action losses without mixing continuous XYZ and binary grip targets.
+    """Compute action losses without mixing continuous motion and binary grip targets.
 
-    `pred[..., :3]` and `actions[..., :3]` are normalized XYZ in both modes.
-    In binary mode `pred[..., 3]` is a close logit and `gripper_targets` is raw
-    class supervision (0=open, 1=close). Regression mode exactly preserves the
-    previous four-dimensional masked-MSE objective.
+    The final channel is always gripper. In binary mode all preceding channels
+    (XYZ, plus optional RZ) use normalized MSE and the final prediction is a
+    close logit. Regression mode preserves the joint masked-MSE objective.
     """
 
     def masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]):
@@ -236,13 +242,15 @@ def compute_action_losses(
         m = mask.to(values.dtype)
         return (values * m).sum() / m.sum().clamp_min(1.0)
 
-    xyz_mask = None if actions_mask is None else actions_mask[..., :3]
-    loss_xyz = masked_mean((pred[..., :3] - actions[..., :3]) ** 2, xyz_mask)
+    motion_mask = None if actions_mask is None else actions_mask[..., :-1]
+    # This remains named loss_xyz in checkpoints/logs for compatibility. With
+    # include_rz it covers all four continuous motion dimensions (XYZ+RZ).
+    loss_xyz = masked_mean((pred[..., :-1] - actions[..., :-1]) ** 2, motion_mask)
 
     if gripper_head == "regression":
-        grip_mask = None if actions_mask is None else actions_mask[..., 3]
+        grip_mask = None if actions_mask is None else actions_mask[..., -1]
         loss_gripper = masked_mean(
-            (pred[..., 3] - actions[..., 3]) ** 2, grip_mask
+            (pred[..., -1] - actions[..., -1]) ** 2, grip_mask
         )
         loss_act = masked_mean(
             (pred - actions) ** 2, actions_mask
@@ -260,17 +268,17 @@ def compute_action_losses(
     target = gripper_targets.to(pred.dtype)
     if target.ndim == pred.ndim:
         target = target.squeeze(-1)
-    if target.shape != pred[..., 3].shape:
+    if target.shape != pred[..., -1].shape:
         raise ValueError(
             f"gripper_targets shape {tuple(target.shape)} does not match logits "
-            f"{tuple(pred[..., 3].shape)}"
+            f"{tuple(pred[..., -1].shape)}"
         )
-    grip_mask = None if actions_mask is None else actions_mask[..., 3]
-    bce = F.binary_cross_entropy_with_logits(pred[..., 3], target, reduction="none")
+    grip_mask = None if actions_mask is None else actions_mask[..., -1]
+    bce = F.binary_cross_entropy_with_logits(pred[..., -1], target, reduction="none")
     loss_gripper = masked_mean(bce, grip_mask)
     loss_act = loss_xyz + float(lambda_gripper) * loss_gripper
 
-    correct = ((pred[..., 3] >= 0) == (target >= 0.5)).to(pred.dtype)
+    correct = ((pred[..., -1] >= 0) == (target >= 0.5)).to(pred.dtype)
     gripper_accuracy = masked_mean(correct, grip_mask)
     return loss_act, loss_xyz, loss_gripper, gripper_accuracy
 
@@ -278,6 +286,14 @@ def compute_action_losses(
 class MiniLaWAM(nn.Module):
     def __init__(self, cfg: MiniLaWAMConfig):
         super().__init__()
+        if cfg.include_rz and cfg.target_mode != "joystick":
+            raise ValueError("include_rz is only supported with target_mode='joystick'")
+        expected_action_dim = 5 if cfg.include_rz else 4
+        if cfg.action_dim != expected_action_dim:
+            raise ValueError(
+                f"include_rz={cfg.include_rz} requires action_dim={expected_action_dim}, "
+                f"got {cfg.action_dim}"
+            )
         self.cfg = cfg
         self.lam = load_latent_action_model(cfg.lam_ckpt, cfg.lam_yaml)  # frozen, eval
         vdim = int(self.lam.input_dim)   # DINOv3 ViT-B -> 768
@@ -314,7 +330,7 @@ class MiniLaWAM(nn.Module):
         return out["quantized"].detach().clone(), out["tgt"].detach().clone()
 
     def _action_pred(self, u_t_tok, u_hat_tok, wrist=None, state=None):
-        """(u_t, u_hat_T) patch tokens [B,K,D] -> raw head output [B,H,4].
+        """(u_t, u_hat_T) patch tokens -> raw output [B,H,action_dim].
 
         Branches on cfg.head_type: 'attn' consumes tokens directly (no pooling);
         'mlp' mean-pools each view first. Wrist/state added if configured. In

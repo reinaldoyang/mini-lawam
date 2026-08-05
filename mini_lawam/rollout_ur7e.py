@@ -9,11 +9,12 @@ Pattern follows ur7e_ramen_il/scripts/real_world/lapa_latent_real_servoL.py:
   - DRY-RUN by default; add --execute to actually send servoL/gripper.
 
 mini_lawam-specific differences vs the LAPA baseline:
-  - policy output is an [H, 4] chunk whose checkpoint-stored target mode is:
+  - policy output is an [H, action_dim] chunk whose checkpoint-stored target mode is:
       abs/delta -> absolute [eef_pos_base(3), gripper(1)] targets
-      joystick  -> raw recorded [joystick_xyz(3), gripper(1)] commands
-    Joystick commands are multiplied by --action-scale and added to the measured
-    TCP at each execution tick. Rotation is always locked.
+      joystick  -> raw recorded [joystick_xyz(3), optional rz(1), gripper(1)] commands
+    Joystick motion commands are multiplied by --action-scale and composed with
+    the measured TCP at each execution tick. Roll/pitch stay locked; optional RZ
+    is applied only for a compatible checkpoint when --enable-rz is passed.
   - receding horizon: execute the first --exec-steps (default 8) waypoints of
     each chunk at --control-hz (default 20, matching training), then re-plan
     from a fresh frame.
@@ -101,8 +102,8 @@ def build_parser():
                         "Does not affect the gripper; non-default values require a "
                         "delta-target checkpoint.")
     p.add_argument("--action-scale", type=float, default=0.3,
-                   help="Deployment gain for raw XYZ commands from a joystick-target "
-                        "checkpoint (default: 0.3). Applied after de-normalization and "
+                   help="Deployment gain for raw XYZ and optional RZ commands from a "
+                        "joystick-target checkpoint (default: 0.3). Applied after de-normalization and "
                         "before temporal ensembling/TCP composition. Does not affect "
                         "the gripper and is ignored by abs/delta checkpoints.")
     p.add_argument("--max-steps", type=int, default=2000, help="max control steps per rollout")
@@ -141,6 +142,12 @@ def build_parser():
                    metavar=("RX", "RY", "RZ"),
                    help="override the fixed TCP orientation (axis-angle rotvec). "
                         "Default: DEMO_LOCKED_ROTVEC, measured from the demos.")
+    p.add_argument(
+        "--enable-rz", action="store_true",
+        help="Apply the policy's predicted joystick RZ deltas around base Z while "
+             "keeping roll/pitch locked. Requires a checkpoint trained with "
+             "--target joystick --include-rz. Default: disabled (fully locked).",
+    )
 
     # smoothing (kills prediction jitter between re-plans)
     p.add_argument("--target-ema", type=float, default=1.0,
@@ -159,7 +166,8 @@ def build_parser():
     p.add_argument("--gripper-speed", type=int, default=100)
     p.add_argument("--gripper-force", type=int, default=50)
     p.add_argument("--gripper-threshold", type=float, default=0.0,
-                   help="chunk[:,3] <= thr => open, > thr => close (open=-1, close=+1)")
+                   help="final action channel <= thr => open, > thr => close "
+                        "(open=-1, close=+1)")
     p.add_argument("--gripper-open-lead-steps", type=int, default=1,
                    help="When the commanded gripper is already closed, allow an open "
                         "prediction this many chunk steps ahead to trigger release now. "
@@ -560,12 +568,15 @@ def scale_delta_chunk(chunk, anchor_xyz, delta_scale):
     return scaled
 
 
-def scale_joystick_chunk(chunk, action_scale):
-    """Scale only raw joystick XYZ commands; preserve the gripper exactly."""
+def scale_joystick_chunk(chunk, action_scale, include_rz=False):
+    """Scale raw joystick motion (XYZ[+RZ]); preserve the final gripper channel."""
     scaled = np.asarray(chunk).copy()
-    if scaled.ndim != 2 or scaled.shape[1] != 4:
-        raise ValueError(f"joystick chunk must have shape [H,4], got {scaled.shape}")
-    scaled[:, :3] *= float(action_scale)
+    expected_dim = 5 if include_rz else 4
+    if scaled.ndim != 2 or scaled.shape[1] != expected_dim:
+        raise ValueError(
+            f"joystick chunk must have shape [H,{expected_dim}], got {scaled.shape}"
+        )
+    scaled[:, :-1] *= float(action_scale)
     return scaled
 
 
@@ -581,6 +592,17 @@ def compose_target_xyz(pred_xyz, current_xyz, target_mode):
     if target_mode in ("abs", "delta"):
         return pred
     raise ValueError(f"unsupported target_mode={target_mode!r}")
+
+
+def compose_locked_rotvec_with_rz(locked_rotvec, rz_offset):
+    """Apply an accumulated base-Z rotation to a locked tool-down orientation."""
+    from scipy.spatial.transform import Rotation
+
+    locked = np.asarray(locked_rotvec, dtype=np.float64).reshape(3)
+    rz_rotation = Rotation.from_rotvec(
+        np.asarray([0.0, 0.0, float(rz_offset)], dtype=np.float64)
+    )
+    return (rz_rotation * Rotation.from_rotvec(locked)).as_rotvec()
 
 
 def select_gripper_with_open_lookahead(
@@ -614,16 +636,16 @@ def select_gripper_with_open_lookahead(
     if release_latched:
         return -1.0, True, -1
 
-    immediate = float(rows[idx, 3])
+    immediate = float(rows[idx, -1])
     if last_cmd != "close":
         return immediate, False, idx
 
     end = min(rows.shape[0] - 1, idx + lead)
-    window = rows[idx:end + 1, 3]
+    window = rows[idx:end + 1, -1]
     open_offsets = np.flatnonzero(window <= float(threshold))
     if open_offsets.size:
         source_index = idx + int(open_offsets[0])
-        return float(rows[source_index, 3]), True, source_index
+        return float(rows[source_index, -1]), True, source_index
     return immediate, False, idx
 
 
@@ -753,11 +775,18 @@ def main():
     wrist_reader = None
     rtde_c = rtde_r = servo_state = servo_thread = None
     gripper = None
-    locked_rotvec = None
+    locked_rotvec = (
+        np.asarray(args.locked_rotvec, dtype=np.float64)
+        if args.locked_rotvec is not None
+        else DEMO_LOCKED_ROTVEC.copy()
+    )
+    locked_source = "CLI override" if args.locked_rotvec is not None else "fixed, from demos"
+    print(f"[ROT] locked_rotvec ({locked_source}) = {np.round(locked_rotvec, 4)}")
     pygame = screen = font = clock = None
 
     need_wrist = bool(policy.cfg.use_wrist)
     target_mode = getattr(policy.cfg, "target_mode", "abs")
+    include_rz = bool(getattr(policy.cfg, "include_rz", False))
     # current eef xyz is needed as proprioception (use_state) and/or as the
     # composition anchor for cumulative EEF-delta targets. Joystick commands are
     # composed with the live TCP later, at each execution tick.
@@ -766,8 +795,14 @@ def main():
         raise ValueError("--delta-scale only applies to a checkpoint with target_mode='delta'")
     if target_mode not in ("abs", "delta", "joystick"):
         raise ValueError(f"unsupported checkpoint target_mode={target_mode!r}")
+    if args.enable_rz and not include_rz:
+        raise ValueError(
+            "--enable-rz requires a checkpoint trained with "
+            "--target joystick --include-rz"
+        )
     print(f"[INFO] checkpoint use_wrist={need_wrist} "
           f"use_state={getattr(policy.cfg, 'use_state', False)} target={target_mode} "
+          f"include_rz={include_rz} enable_rz={args.enable_rz} "
           f"gripper_head={getattr(policy.cfg, 'gripper_head', 'regression')} "
           f"delta_scale={args.delta_scale:g}"
           + (f" action_scale={args.action_scale:g}" if target_mode == "joystick" else ""))
@@ -783,8 +818,9 @@ def main():
 
     def update_runtime_policy_config():
         """Refresh checkpoint-controlled rollout semantics after a hot swap."""
-        nonlocal target_mode, need_state
+        nonlocal target_mode, need_state, include_rz
         target_mode = getattr(policy.cfg, "target_mode", "abs")
+        include_rz = bool(getattr(policy.cfg, "include_rz", False))
         need_state = bool(getattr(policy.cfg, "use_state", False)) or target_mode == "delta"
         if target_mode != "delta" and args.delta_scale != 1.0:
             raise ValueError(
@@ -792,6 +828,11 @@ def main():
             )
         if target_mode not in ("abs", "delta", "joystick"):
             raise ValueError(f"unsupported checkpoint target_mode={target_mode!r}")
+        if args.enable_rz and not include_rz:
+            raise ValueError(
+                "--enable-rz requires every task checkpoint to be trained with "
+                "--target joystick --include-rz"
+            )
 
     def activate_task_profile(key):
         """Hot-swap model weights and gripper configuration while IDLE."""
@@ -850,7 +891,9 @@ def main():
         if target_mode == "delta" and args.delta_scale != 1.0:
             chunk = scale_delta_chunk(chunk, anchor_xyz, args.delta_scale)
         elif target_mode == "joystick":
-            chunk = scale_joystick_chunk(chunk, args.action_scale)
+            chunk = scale_joystick_chunk(
+                chunk, args.action_scale, include_rz=include_rz
+            )
         return chunk
 
     try:
@@ -909,15 +952,6 @@ def main():
                                          args.gripper_open_mm, active_close_mm,
                                          args.gripper_speed, args.gripper_force)
 
-            # Locked orientation: FIXED constant (the orientation every demo used),
-            # combined with the policy's predicted xyz at each waypoint.
-            if args.locked_rotvec is not None:
-                locked_rotvec = np.asarray(args.locked_rotvec, dtype=np.float64)
-                print(f"[ROT] locked_rotvec (CLI override) = {np.round(locked_rotvec, 4)}")
-            else:
-                locked_rotvec = DEMO_LOCKED_ROTVEC.copy()
-                print(f"[ROT] locked_rotvec (fixed, from demos) = {np.round(locked_rotvec, 4)}")
-
         pygame, screen, font, clock = init_pygame(args, two_rows=need_wrist)
 
         trial = next_trace_trial_number(args.trace_dir)
@@ -968,7 +1002,8 @@ def main():
 
             # ---- rollout ----
             print(f"\n[ROLLOUT] trial={trial}"
-                  + (f"  locked_rotvec={np.round(locked_rotvec, 4)}" if args.execute else ""))
+                  + f"  locked_rotvec={np.round(locked_rotvec, 4)}"
+                  + ("  RZ=enabled" if args.enable_rz else "  RZ=locked"))
             time.sleep(max(0.0, args.startup_wait_sec))
 
             rollout_stem = format_rollout_stem(trial, rollout_started_wall)
@@ -977,6 +1012,8 @@ def main():
                      "task_profile_key": active_profile_key if task_switching else None,
                      "gripper_close_mm": active_close_mm,
                      "target_mode": target_mode,
+                     "include_rz": include_rz,
+                     "enable_rz": args.enable_rz,
                      "delta_scale": args.delta_scale,
                      "action_scale": args.action_scale if target_mode == "joystick" else None,
                      "gripper_open_lead_steps": args.gripper_open_lead_steps,
@@ -985,6 +1022,7 @@ def main():
             step = 0
             smooth = {"ema_xyz": None, "last_cmd_xyz": None}  # per-rollout smoothing state
             grip_runtime = {"last_cmd": None, "release_latched": False}
+            rotation_runtime = {"rz_accum": 0.0}
 
             def select_grip_value(chunk, step_index):
                 """Apply open-only lookahead and report the release transition once."""
@@ -1005,9 +1043,12 @@ def main():
                           f"(open lookahead={lead} step{'s' if lead != 1 else ''})")
                 return grip_val
 
-            def apply_waypoint(pred_xyz, grip_val, step, sub):
+            def apply_waypoint(pred_xyz, pred_rz, grip_val, step, sub):
                 """One control tick: smooth -> clamp -> servo target + gripper + trace."""
                 pred_xyz = np.asarray(pred_xyz, dtype=np.float64)
+                pred_rz = float(pred_rz)
+                if not np.isfinite(pred_rz):
+                    raise ValueError(f"non-finite predicted RZ at step {step}: {pred_rz}")
                 grip_cmd = "open" if grip_val <= args.gripper_threshold else "close"
                 # For joystick checkpoints pred_xyz is now a scaled incremental
                 # command. Compose it from the live TCP at the moment this row is
@@ -1028,12 +1069,19 @@ def main():
                         and np.linalg.norm(smoothed_xyz - smooth["last_cmd_xyz"])
                         < args.target_deadband):
                     smoothed_xyz = smooth["last_cmd_xyz"]
+                if args.enable_rz:
+                    rotation_runtime["rz_accum"] += pred_rz
+                    target_rotvec = compose_locked_rotvec_with_rz(
+                        locked_rotvec, rotation_runtime["rz_accum"]
+                    )
+                else:
+                    target_rotvec = locked_rotvec
                 if args.execute:
                     cur = np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)
                     tgt_xyz = clamp_abs_target(smoothed_xyz, cur[:3],
                                                args.ws_min, args.ws_max, args.max_reach)
                     update_shared_servo_target(servo_state,
-                                               np.concatenate([tgt_xyz, locked_rotvec]))
+                                               np.concatenate([tgt_xyz, target_rotvec]))
                     if gripper is not None:
                         try:
                             gripper.command(grip_cmd)
@@ -1051,6 +1099,9 @@ def main():
                         else "absolute_target"
                     ),
                     "tgt_xyz": np.asarray(tgt_xyz, dtype=float).tolist(),
+                    "pred_rz_delta": pred_rz if include_rz else None,
+                    "rz_accum": rotation_runtime["rz_accum"] if args.enable_rz else 0.0,
+                    "tgt_rotvec": np.asarray(target_rotvec, dtype=float).tolist(),
                     "grip": float(grip_val), "grip_cmd": grip_cmd,
                 })
                 return grip_cmd
@@ -1107,22 +1158,27 @@ def main():
                     inf_ms = (time.time() - t_inf) * 1e3
                     for j in range(H):
                         ensemble.setdefault(step + j, []).append(chunk[j])
-                    preds = np.asarray(ensemble.pop(step, [chunk[0]]))   # [n,4] oldest..newest
+                    preds = np.asarray(ensemble.pop(step, [chunk[0]]))
                     n = len(preds)
                     age = np.arange(n - 1, -1, -1)                        # newest -> 0
                     w = np.exp(-float(args.te_m) * age)
                     w /= w.sum()
-                    avg = (preds * w[:, None]).sum(0)                     # [4]
-                    # Ensemble-average XYZ targets/commands, but use the newest
+                    avg = (preds * w[:, None]).sum(0)
+                    # Ensemble-average motion targets/commands, but use the newest
                     # chunk for gripper timing. Only release may look ahead.
                     grip_val = select_grip_value(chunk, step_index=0)
-                    grip_cmd = apply_waypoint(avg[:3], grip_val, step, sub=0)
+                    pred_rz = avg[3] if include_rz else 0.0
+                    grip_cmd = apply_waypoint(
+                        avg[:3], pred_rz, grip_val, step, sub=0
+                    )
                     if step % 8 == 0:
-                        print("gripper chunk:", chunk[:, 3])
+                        print("gripper chunk:", chunk[:, -1])
                         mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
                         xyz_label = "avg_joy_delta" if target_mode == "joystick" else "avg_xyz"
+                        rz_text = f"  rz_delta={pred_rz:+.4f}" if include_rz else ""
                         print(f"[STEP {step}] inf={inf_ms:.0f}ms te_n={n}  "
                               f"{xyz_label}={np.round(avg[:3], 4)}  "
+                              f"{rz_text}"
                               f"grip={grip_val:+.2f}->{grip_cmd}  "
                               f"chunk_span[0->{H - 1}]={mv_H:.0f}mm")
                     step += 1
@@ -1153,14 +1209,19 @@ def main():
                         stop_cmd = cmd
                         break
                     grip_val = select_grip_value(chunk, step_index=i)
-                    grip_cmd = apply_waypoint(chunk[i, :3], grip_val, step, sub=i)
+                    pred_rz = chunk[i, 3] if include_rz else 0.0
+                    grip_cmd = apply_waypoint(
+                        chunk[i, :3], pred_rz, grip_val, step, sub=i
+                    )
                     if i == 0:
-                        print("gripper chunk:", chunk[:, 3])
+                        print("gripper chunk:", chunk[:, -1])
                         mv_k = np.linalg.norm(chunk[k - 1, :3] - chunk[0, :3]) * 1e3
                         mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
                         xyz_label = "joy_delta" if target_mode == "joystick" else "pred_xyz"
+                        rz_text = f"  rz_delta={pred_rz:+.4f}" if include_rz else ""
                         print(f"[STEP {step}] inf={inf_ms:.0f}ms  "
                               f"{xyz_label}={np.round(chunk[i, :3], 4)}  "
+                              f"{rz_text}"
                               f"grip={grip_val:+.2f}->{grip_cmd}  "
                               f"chunk_span[0->{k - 1}]={mv_k:.0f}mm "
                               f"[0->{H - 1}]={mv_H:.0f}mm")
@@ -1196,6 +1257,9 @@ def main():
                     "task_profile_key": trace["task_profile_key"],
                     "gripper_close_mm": trace["gripper_close_mm"],
                     "target_mode": target_mode,
+                    "include_rz": include_rz,
+                    "enable_rz": args.enable_rz,
+                    "final_rz_accum": rotation_runtime["rz_accum"],
                     "delta_scale": args.delta_scale,
                     "action_scale": (
                         args.action_scale if target_mode == "joystick" else None

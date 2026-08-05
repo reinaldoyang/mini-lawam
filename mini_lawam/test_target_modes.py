@@ -9,8 +9,10 @@ from mini_lawam.data import (
     _read_gripper_target,
     _read_target_delta,
     _read_target_joystick,
+    compute_action_stats,
 )
 from mini_lawam.rollout_ur7e import (
+    compose_locked_rotvec_with_rz,
     compose_target_xyz,
     scale_delta_chunk,
     scale_joystick_chunk,
@@ -65,6 +67,36 @@ def test_joystick_scale_changes_xyz_but_not_gripper():
     )
 
 
+def test_optional_joystick_rz_is_read_and_scaled_with_motion():
+    actions = np.asarray(
+        [
+            [0.05, -0.05, 0.00, 8.0, 9.0, 0.10, -1.0],
+            [0.00, 0.05, 0.05, 8.0, 9.0, -0.20, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    target = _read_target_joystick(
+        {"actions": actions}, t=0, n=2, grip_col=6, include_rz=True
+    )
+    np.testing.assert_array_equal(target[:, :3], actions[:, :3])
+    np.testing.assert_array_equal(target[:, 3], actions[:, 5])
+    np.testing.assert_array_equal(target[:, -1], actions[:, 6])
+
+    scaled = scale_joystick_chunk(target, action_scale=0.3, include_rz=True)
+    np.testing.assert_allclose(scaled[:, :4], target[:, :4] * 0.3)
+    np.testing.assert_array_equal(scaled[:, -1], target[:, -1])
+
+
+def test_rz_composes_around_base_z_from_locked_orientation():
+    from scipy.spatial.transform import Rotation
+
+    locked = np.asarray([0.0036, 3.14094, -0.00024])
+    rz = 0.25
+    composed = Rotation.from_rotvec(compose_locked_rotvec_with_rz(locked, rz))
+    expected = Rotation.from_rotvec([0.0, 0.0, rz]) * Rotation.from_rotvec(locked)
+    np.testing.assert_allclose(composed.as_matrix(), expected.as_matrix(), atol=1e-10)
+
+
 def test_joystick_xyz_can_keep_same_index_with_next_row_gripper():
     actions = np.asarray(
         [
@@ -83,6 +115,51 @@ def test_joystick_xyz_can_keep_same_index_with_next_row_gripper():
 
     np.testing.assert_array_equal(target[:, :3], actions[:2, :3])
     np.testing.assert_array_equal(target[:, 3], actions[1:3, 6])
+
+
+def test_rz_dataset_keeps_rz_same_index_and_gripper_offset():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "rz.hdf5"
+        with h5py.File(path, "w") as f:
+            demo = f.create_group("data/demo_0")
+            obs = demo.create_group("obs")
+            obs.create_dataset("table_cam", data=np.zeros((4, 2, 2, 3), dtype=np.uint8))
+            obs.create_dataset("eef_pos_base", data=np.zeros((4, 3), dtype=np.float32))
+            actions = np.zeros((4, 7), dtype=np.float32)
+            actions[:, 0] = [0.1, 0.2, 0.3, 0.4]
+            actions[:, 5] = [0.01, 0.02, 0.03, 0.04]
+            actions[:, 6] = [1.0, -1.0, 1.0, -1.0]
+            demo.create_dataset("actions", data=actions)
+
+        ds = MiniLaWAMDataset(
+            str(path), gap=1, horizon=2, target_mode="joystick",
+            include_rz=True, gripper_target_offset=1,
+            action_mean=np.zeros(5, dtype=np.float32),
+            action_std=np.ones(5, dtype=np.float32),
+        )
+        item = ds[ds.index.index(("demo_0", 0))]
+        np.testing.assert_allclose(item["actions"][:2, 0].numpy(), [0.1, 0.2])
+        np.testing.assert_allclose(item["actions"][:2, 3].numpy(), [0.01, 0.02])
+        np.testing.assert_allclose(item["actions"][:2, -1].numpy(), [-1.0, 1.0])
+
+
+def test_include_rz_rejects_dataset_with_constant_rz():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "constant_rz.hdf5"
+        with h5py.File(path, "w") as f:
+            demo = f.create_group("data/demo_0")
+            obs = demo.create_group("obs")
+            obs.create_dataset("eef_pos_base", data=np.zeros((3, 3), dtype=np.float32))
+            demo.create_dataset("actions", data=np.zeros((3, 7), dtype=np.float32))
+        try:
+            compute_action_stats(
+                str(path), "eef_pos_base", 6,
+                target_mode="joystick", include_rz=True,
+            )
+        except ValueError as exc:
+            assert "no RZ variation" in str(exc)
+        else:
+            raise AssertionError("constant-RZ dataset was accepted with include_rz=True")
 
 
 def test_existing_delta_target_and_scale_semantics_are_preserved():
@@ -195,11 +272,33 @@ def test_open_lookahead_preserves_grasp_then_latches_release():
     assert source == -1
 
 
+def test_open_lookahead_uses_final_channel_for_rz_chunks():
+    chunk = np.asarray(
+        [
+            [0.0, 0.0, 0.0, -9.0, 1.0],
+            [0.0, 0.0, 0.0, 9.0, -1.0],
+        ],
+        dtype=np.float32,
+    )
+    grip, latched, source = select_gripper_with_open_lookahead(
+        chunk, step_index=0, last_cmd="close", release_latched=False,
+        open_lead_steps=1,
+    )
+    assert grip == -1.0
+    assert latched
+    assert source == 1
+
+
 if __name__ == "__main__":
     test_joystick_target_uses_same_index_xyz_and_gripper_only()
     test_joystick_scale_changes_xyz_but_not_gripper()
+    test_optional_joystick_rz_is_read_and_scaled_with_motion()
+    test_rz_composes_around_base_z_from_locked_orientation()
     test_joystick_xyz_can_keep_same_index_with_next_row_gripper()
+    test_rz_dataset_keeps_rz_same_index_and_gripper_offset()
+    test_include_rz_rejects_dataset_with_constant_rz()
     test_existing_delta_target_and_scale_semantics_are_preserved()
     test_tail_actions_include_pre_release_anchor_with_masked_padding()
     test_open_lookahead_preserves_grasp_then_latches_release()
-    print("6 focused target-mode tests passed")
+    test_open_lookahead_uses_final_channel_for_rz_chunks()
+    print("11 focused target-mode tests passed")

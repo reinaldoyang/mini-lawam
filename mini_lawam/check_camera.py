@@ -99,7 +99,7 @@ def evaluate(policy, live, ref_feats, baseline_min, home_xyz, wrist_live=None,
     pred_ok = gap_cm <= 5.0
     return {
         "live_cos": live_cos, "best_ref": best_ref, "sims": sims,
-        "pred0": pred0, "grip0": float(chunk[0, 3]), "gap_cm": gap_cm,
+        "pred0": pred0, "grip0": float(chunk[0, -1]), "gap_cm": gap_cm,
         "feat_ok": feat_ok, "pred_ok": pred_ok, "ok": feat_ok and pred_ok,
     }
 

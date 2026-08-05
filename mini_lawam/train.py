@@ -112,7 +112,7 @@ def main():
     ap.add_argument(
         "--gripper-head", choices=["regression", "binary"], default="regression",
         help="'regression' preserves the legacy joint 4D MSE head/checkpoints; "
-             "'binary' uses separate XYZ regression and open/close-logit projections "
+             "'binary' uses separate motion regression and open/close-logit projections "
              "with BCE loss. Use binary for new gripper-focused training.",
     )
     ap.add_argument("--use-state", action="store_true",
@@ -125,6 +125,12 @@ def main():
                          "systematic absolute-position bias); 'joystick' = raw HDF5 "
                          "actions[t+i,0:3] plus actions[t+i,6] gripper. Joystick XYZ is "
                          "scaled and composed with the live TCP only at deployment.")
+    ap.add_argument(
+        "--include-rz", action="store_true",
+        help="Joystick target only: train a 5D [XYZ, RZ, gripper] action chunk "
+             "using raw HDF5 action column 5. Deployment remains orientation-locked "
+             "unless rollout_ur7e also receives --enable-rz.",
+    )
     ap.add_argument("--phase", choices=["1", "2", "joint"], default="joint",
                     help="1: train prior only (L_distill). 2: load --prior-ckpt, train "
                          "action head (L_act + 0.1*L_distill + 0.1*L_wm). joint: original "
@@ -139,7 +145,7 @@ def main():
                     help="Override wm/subgoal weight (default: 0.1).")
     ap.add_argument(
         "--lambda-gripper", type=float, default=1.0,
-        help="Binary gripper BCE weight relative to normalized XYZ MSE (default: 1.0).",
+        help="Binary gripper BCE weight relative to normalized motion MSE (default: 1.0).",
     )
     ap.add_argument(
         "--gripper-target-offset", type=int, choices=[0, 1], default=None,
@@ -206,10 +212,14 @@ def main():
         raise SystemExit(f"--use-state + --target {args.target} unsupported: the checkpoint "
                          "does not store absolute-position stats, so it cannot z-score "
                          "an absolute TCP state.")
+    if args.include_rz and args.target != "joystick":
+        raise SystemExit("--include-rz requires --target joystick")
 
     # One horizon for both the LaWM future pair and the action chunk.
     state_dim = 3 if args.use_state else 0   # proprioception = current eef_pos [x,y,z]
+    action_dim = 5 if args.include_rz else 4
     cfg = MiniLaWAMConfig(use_wrist=args.use_wrist, head_type=args.head,
+                          action_dim=action_dim, include_rz=args.include_rz,
                           gripper_head=args.gripper_head,
                           use_state=args.use_state, state_dim=state_dim,
                           target_mode=args.target,
@@ -219,13 +229,15 @@ def main():
                           lambda_gripper=args.lambda_gripper,
                           lambda_distill=lambda_distill, lambda_wm=lambda_wm)
     print(f"head={args.head} | use_wrist={args.use_wrist} | use_state={args.use_state} "
-          f"| gripper_head={args.gripper_head} | target={args.target}")
+          f"| gripper_head={args.gripper_head} | target={args.target} "
+          f"| include_rz={args.include_rz} | action_dim={action_dim}")
 
     # gap = future horizon (LaWM pair, o_{t+future_horizon}); horizon = action chunk.
     ds = MiniLaWAMDataset(
         args.hdf5, gap=cfg.future_horizon, horizon=cfg.action_horizon,
         sample_stride=args.sample_stride, use_wrist=args.use_wrist,
         use_state=args.use_state, target_mode=args.target,
+        include_rz=cfg.include_rz,
         gripper_target_offset=cfg.gripper_target_offset,
         include_tail_actions=cfg.include_tail_actions,
     )

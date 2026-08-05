@@ -65,6 +65,15 @@ def decode_action_prediction(pred, action_mean, action_std,
 class MiniLaWAMPolicy:
     """Loads a trained checkpoint and maps frames -> physical 4D action chunks."""
 
+    # These fields determine the modules and tensor shapes constructed by
+    # MiniLaWAM.__init__. Training/deployment metadata such as target_mode and
+    # loss weights may differ between hot-swapped checkpoints.
+    _ARCHITECTURE_FIELDS = (
+        "lam_ckpt", "lam_yaml", "action_dim", "action_horizon",
+        "use_state", "state_dim", "use_wrist", "head_type",
+        "gripper_head", "hidden", "attn_hidden", "attn_layers", "attn_heads",
+    )
+
     def __init__(self, ckpt_path: str, device: Optional[str] = None,
                  image_hw=(256, 256), train_frame_hw=(168, 224)):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -82,6 +91,7 @@ class MiniLaWAMPolicy:
         # dimensions are EEF positions/deltas or joystick XYZ depending on target_mode.
         self.action_mean = np.asarray(ckpt["action_mean"], dtype=np.float32)  # [4]
         self.action_std = np.asarray(ckpt["action_std"], dtype=np.float32)    # [4]
+        self.ckpt_path = str(ckpt_path)
 
         # Same resize the Dataset applied before normalization (data.py:_frame).
         self.resize = v2.Resize(image_hw, antialias=True)
@@ -94,6 +104,75 @@ class MiniLaWAMPolicy:
         self.train_frame_hw = tuple(train_frame_hw) if train_frame_hw else None
         self.pre_resize = (v2.Resize(self.train_frame_hw, antialias=True)
                            if self.train_frame_hw else None)
+
+    @classmethod
+    def _architecture_signature(cls, cfg: MiniLaWAMConfig):
+        return tuple(getattr(cfg, field) for field in cls._ARCHITECTURE_FIELDS)
+
+    @staticmethod
+    def checkpoint_config(ckpt_path: str):
+        """Read a checkpoint's runtime/model config without constructing a model."""
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        return MiniLaWAMConfig(**ckpt["cfg"])
+
+    def assert_hot_swap_compatible(self, cfg: MiniLaWAMConfig):
+        """Reject configs that cannot reuse this policy's constructed modules."""
+        if self._architecture_signature(cfg) == self._architecture_signature(self.cfg):
+            return
+        changed = [
+            field for field in self._ARCHITECTURE_FIELDS
+            if getattr(cfg, field) != getattr(self.cfg, field)
+        ]
+        raise ValueError(
+            "task checkpoint is not hot-swap compatible; architecture fields "
+            f"differ: {', '.join(changed)}"
+        )
+
+    @staticmethod
+    def _assert_state_dict_compatible(module, incoming, label):
+        """Validate keys/shapes before load_state_dict can partially mutate a module."""
+        current = module.state_dict()
+        missing = sorted(set(current) - set(incoming))
+        unexpected = sorted(set(incoming) - set(current))
+        mismatched = sorted(
+            key for key in set(current) & set(incoming)
+            if tuple(current[key].shape) != tuple(incoming[key].shape)
+        )
+        if missing or unexpected or mismatched:
+            details = []
+            if missing:
+                details.append(f"missing={missing}")
+            if unexpected:
+                details.append(f"unexpected={unexpected}")
+            if mismatched:
+                details.append(f"shape_mismatch={mismatched}")
+            raise ValueError(f"incompatible {label} state dict: {'; '.join(details)}")
+
+    def reload_checkpoint(self, ckpt_path: str):
+        """Hot-swap compatible trained weights without duplicating the LAM on GPU.
+
+        The frozen vision/latent-action model is reused, while the task-specific
+        prior, action head, normalization statistics, and runtime config are
+        replaced. A clear error is raised before mutation when the checkpoint
+        requires a different model architecture.
+        """
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        cfg = MiniLaWAMConfig(**ckpt["cfg"])
+        self.assert_hot_swap_compatible(cfg)
+        self._assert_state_dict_compatible(self.model.prior, ckpt["prior"], "prior")
+        self._assert_state_dict_compatible(
+            self.model.action_head, ckpt["action_head"], "action_head"
+        )
+
+        self.model.prior.load_state_dict(ckpt["prior"])
+        self.model.action_head.load_state_dict(ckpt["action_head"])
+        self.cfg = cfg
+        self.model.cfg = cfg
+        self.action_mean = np.asarray(ckpt["action_mean"], dtype=np.float32)
+        self.action_std = np.asarray(ckpt["action_std"], dtype=np.float32)
+        self.ckpt_path = str(ckpt_path)
+        self.model.eval()
+        return cfg
 
     # ---- preprocessing: raw frame -> model input (must match training) ----
     def preprocess(self, frame_hwc_uint8: np.ndarray) -> torch.Tensor:

@@ -67,6 +67,13 @@ TRACE_TRIAL_RE = re.compile(r"^trial_(\d+)(?:_|$)")
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ckpt", default="results/mini_lawam/ckpt_114ep_wrist.pt")
+    p.add_argument(
+        "--task-profile", action="append", nargs=3,
+        metavar=("KEY", "CKPT", "CLOSE_MM"),
+        help="Bind a numeric key (1-9) to a checkpoint and gripper closing width. "
+             "Repeat for multiple tasks; press the key while IDLE to switch. "
+             "When omitted, --ckpt and --gripper-close-mm retain their usual behavior.",
+    )
     p.add_argument("--device", default="cuda")
     p.add_argument("--realworld-dir", default=DEFAULT_REALWORLD_DIR,
                    help="ur7e_ramen_il/scripts/real_world (real_servo_utils + rtde_gripper)")
@@ -381,24 +388,42 @@ class RealSenseTableReader:
 # ----------------------------------------------------------------------------
 class LatchedGripper:
     def __init__(self, RobotiqGripper, robot_ip, open_mm, close_mm, speed, force):
-        def mm_to_raw(v, open_ref):
-            open_ref = max(float(open_ref), 1e-6)
-            return int(np.clip(round(255.0 * (1.0 - float(v) / open_ref)), 0, 255))
-
         def pct_to_raw(v):
             v = float(v)
             return int(np.clip(round(v * 255.0 / 100.0 if v <= 100.0 else v), 0, 255))
 
         self._g = RobotiqGripper()
         self._g.connect(str(robot_ip), ROBOTIQ_SOCKET_PORT)
-        self.open_raw = mm_to_raw(open_mm, open_mm)
-        self.close_raw = mm_to_raw(close_mm, open_mm)
+        self.open_mm = float(open_mm)
+        self.close_mm = float(close_mm)
+        self.open_raw = self._mm_to_raw(self.open_mm)
+        self.close_raw = self._mm_to_raw(self.close_mm)
         self.speed_raw = pct_to_raw(speed)
         self.force_raw = pct_to_raw(force)
         self.state = None
         if hasattr(self._g, "activate"):
             print("[GRIPPER] activating")
             self._g.activate(auto_calibrate=False)
+
+    def _mm_to_raw(self, width_mm):
+        open_ref = max(self.open_mm, 1e-6)
+        return int(np.clip(round(255.0 * (1.0 - float(width_mm) / open_ref)), 0, 255))
+
+    def set_close_mm(self, close_mm):
+        """Change the width used by the next close command without moving now."""
+        close_mm = float(close_mm)
+        if not np.isfinite(close_mm) or not 0.0 <= close_mm <= self.open_mm:
+            raise ValueError(
+                f"gripper close width must be in [0, {self.open_mm:g}] mm, got {close_mm}"
+            )
+        self.close_mm = close_mm
+        self.close_raw = self._mm_to_raw(close_mm)
+        # If the prior task ended closed, ensure its cached command cannot suppress
+        # the first close command at the newly selected width.
+        if self.state == "close":
+            self.state = None
+        print(f"[GRIPPER] configured close width={self.close_mm:g} mm "
+              f"(raw={self.close_raw}); no movement until the next command")
 
     def command(self, cmd: str):
         if cmd == self.state:
@@ -436,14 +461,18 @@ def init_pygame(args, two_rows=False):
 
 
 def draw_status(pygame, screen, font, mode, extra="", frame_rgb=None,
-                wrist_rgb=None, subgoal_rgb=None, video_scale=1.0):
+                wrist_rgb=None, subgoal_rgb=None, video_scale=1.0,
+                task_keys=""):
     """Status text + policy inputs and optional predicted-subgoal overlay.
 
     `subgoal_rgb` is the table input overlaid with per-patch
     `||u_hat_T-u_t||`; it is already 256x256 RGB.
     """
     screen.fill((20, 20, 20))
-    for i, line in enumerate([f"Mode: {mode}", "S=start  E=end  H=home  Q=quit", extra]):
+    controls = "S=start  E=end  H=home  Q=quit"
+    if task_keys:
+        controls += f"  {task_keys}=task"
+    for i, line in enumerate([f"Mode: {mode}", controls, extra]):
         if line:
             screen.blit(font.render(line, True, (0, 255, 0)), (16, 18 + 26 * i))
     vs = float(video_scale)
@@ -472,9 +501,40 @@ def poll_cmd(pygame):
         if ev.type == pygame.QUIT:
             return "quit"
         if ev.type == pygame.KEYDOWN:
-            return {pygame.K_s: "start", pygame.K_e: "end",
-                    pygame.K_h: "home", pygame.K_q: "quit"}.get(ev.key)
+            cmd = {pygame.K_s: "start", pygame.K_e: "end",
+                   pygame.K_h: "home", pygame.K_q: "quit"}.get(ev.key)
+            if cmd is not None:
+                return cmd
+            if getattr(ev, "unicode", "") in "123456789":
+                return f"task:{ev.unicode}"
     return None
+
+
+def build_task_profiles(raw_profiles, default_ckpt, default_close_mm, open_mm):
+    """Parse repeatable CLI task profiles while preserving single-task behavior."""
+    open_mm = float(open_mm)
+    if not np.isfinite(open_mm) or open_mm <= 0.0:
+        raise ValueError(f"--gripper-open-mm must be finite and > 0, got {open_mm}")
+
+    entries = raw_profiles or [("1", default_ckpt, str(default_close_mm))]
+    profiles = {}
+    for raw_key, ckpt, raw_close_mm in entries:
+        key = str(raw_key)
+        if len(key) != 1 or key not in "123456789":
+            raise ValueError(f"task profile KEY must be one digit from 1 to 9, got {key!r}")
+        if key in profiles:
+            raise ValueError(f"duplicate task profile key {key!r}")
+        close_mm = float(raw_close_mm)
+        if not np.isfinite(close_mm) or not 0.0 <= close_mm <= open_mm:
+            raise ValueError(
+                f"task {key} CLOSE_MM must be in [0, {open_mm:g}], got {close_mm}"
+            )
+        profiles[key] = {
+            "key": key,
+            "ckpt": str(ckpt),
+            "close_mm": close_mm,
+        }
+    return profiles, bool(raw_profiles)
 
 
 # ----------------------------------------------------------------------------
@@ -636,6 +696,13 @@ def main():
         raise ValueError("--execute cannot be combined with --offline-image")
     if args.execute and not args.table_cam_serial:
         raise ValueError("--execute requires --table-cam-serial")
+    task_profiles, task_switching = build_task_profiles(
+        args.task_profile, args.ckpt, args.gripper_close_mm, args.gripper_open_mm
+    )
+    active_profile_key = next(iter(task_profiles))
+    initial_profile = task_profiles[active_profile_key]
+    active_ckpt = initial_profile["ckpt"]
+    active_close_mm = initial_profile["close_mm"]
 
     # Import the battle-tested hardware utils from the ur7e_ramen_il codebase.
     rw_dir = str(Path(args.realworld_dir).resolve())
@@ -651,7 +718,25 @@ def main():
 
     print(f"[INFO] execute={args.execute} ({'ROBOT COMMANDS ENABLED' if args.execute else 'dry-run'})")
     train_hw = None if args.train_frame_hw[0] <= 0 else tuple(args.train_frame_hw)
-    policy = MiniLaWAMPolicy(args.ckpt, device=args.device, train_frame_hw=train_hw)
+    policy = MiniLaWAMPolicy(active_ckpt, device=args.device, train_frame_hw=train_hw)
+    if task_switching:
+        print("[TASK] configured profiles:")
+        for key, profile in task_profiles.items():
+            cfg = MiniLaWAMPolicy.checkpoint_config(profile["ckpt"])
+            policy.assert_hot_swap_compatible(cfg)
+            profile_target_mode = getattr(cfg, "target_mode", "abs")
+            if profile_target_mode not in ("abs", "delta", "joystick"):
+                raise ValueError(
+                    f"task {key} has unsupported target_mode={profile_target_mode!r}"
+                )
+            if profile_target_mode != "delta" and args.delta_scale != 1.0:
+                raise ValueError(
+                    f"task {key} target_mode={profile_target_mode!r} is incompatible "
+                    "with non-default --delta-scale"
+                )
+            print(f"[TASK]   key {key}: ckpt={profile['ckpt']}  "
+                  f"close={profile['close_mm']:g} mm")
+        print(f"[TASK] active key {active_profile_key}")
     if train_hw:
         print(f"[POLICY] live frames matched to training resolution {train_hw} (h, w) "
               "before the 256x256 resize")
@@ -695,6 +780,45 @@ def main():
 
     latest_subgoal_overlay = None
     subgoal_inference_index = 0
+
+    def update_runtime_policy_config():
+        """Refresh checkpoint-controlled rollout semantics after a hot swap."""
+        nonlocal target_mode, need_state
+        target_mode = getattr(policy.cfg, "target_mode", "abs")
+        need_state = bool(getattr(policy.cfg, "use_state", False)) or target_mode == "delta"
+        if target_mode != "delta" and args.delta_scale != 1.0:
+            raise ValueError(
+                "--delta-scale only applies to a checkpoint with target_mode='delta'"
+            )
+        if target_mode not in ("abs", "delta", "joystick"):
+            raise ValueError(f"unsupported checkpoint target_mode={target_mode!r}")
+
+    def activate_task_profile(key):
+        """Hot-swap model weights and gripper configuration while IDLE."""
+        nonlocal active_profile_key, active_ckpt, active_close_mm
+        nonlocal latest_subgoal_overlay, subgoal_inference_index
+        profile = task_profiles.get(str(key))
+        if profile is None:
+            print(f"[TASK] no profile is assigned to key {key}")
+            return False
+        if str(key) == active_profile_key:
+            print(f"[TASK] key {key} already active: {Path(active_ckpt).name}, "
+                  f"close={active_close_mm:g} mm")
+            return True
+
+        print(f"[TASK] loading key {key}: {profile['ckpt']}")
+        policy.reload_checkpoint(profile["ckpt"])
+        update_runtime_policy_config()
+        active_profile_key = str(key)
+        active_ckpt = profile["ckpt"]
+        active_close_mm = profile["close_mm"]
+        if gripper is not None:
+            gripper.set_close_mm(active_close_mm)
+        latest_subgoal_overlay = None
+        subgoal_inference_index = 0
+        print(f"[TASK] active key {active_profile_key}: {Path(active_ckpt).name}, "
+              f"close={active_close_mm:g} mm, target={target_mode}")
+        return True
 
     def cur_state():
         if not need_state:
@@ -782,7 +906,7 @@ def main():
             )
             if args.use_gripper_control:
                 gripper = LatchedGripper(RobotiqGripper, args.robot_ip,
-                                         args.gripper_open_mm, args.gripper_close_mm,
+                                         args.gripper_open_mm, active_close_mm,
                                          args.gripper_speed, args.gripper_force)
 
             # Locked orientation: FIXED constant (the orientation every demo used),
@@ -806,13 +930,25 @@ def main():
             latest_subgoal_overlay = None
             subgoal_inference_index = 0
             # ---- idle: wait for S / H / Q ----
-            print("[IDLE] S=start  H=home  Q=quit")
+            task_keys = "/".join(task_profiles) if task_switching else ""
+            task_status = (f"task {active_profile_key}: {Path(active_ckpt).stem}  "
+                           f"close={active_close_mm:g}mm")
+            print("[IDLE] S=start  H=home  Q=quit"
+                  + (f"  {task_keys}=task" if task_keys else ""))
             while True:
-                draw_status(pygame, screen, font, "IDLE", "waiting for S / H / Q",
+                draw_status(pygame, screen, font, "IDLE", task_status,
                             frame_rgb=live_frame(), wrist_rgb=live_wrist(),
                             subgoal_rgb=latest_subgoal_overlay,
-                            video_scale=args.video_scale)
+                            video_scale=args.video_scale, task_keys=task_keys)
                 cmd = poll_cmd(pygame)
+                if cmd is not None and cmd.startswith("task:"):
+                    if task_switching:
+                        activate_task_profile(cmd.split(":", 1)[1])
+                        task_status = (
+                            f"task {active_profile_key}: {Path(active_ckpt).stem}  "
+                            f"close={active_close_mm:g}mm"
+                        )
+                    continue
                 if cmd == "start":
                     rollout_started_wall = time.time()
                     rollout_started_perf = time.perf_counter()
@@ -837,7 +973,9 @@ def main():
 
             rollout_stem = format_rollout_stem(trial, rollout_started_wall)
             first_table_frame = None
-            trace = {"ckpt": str(Path(args.ckpt).resolve()), "execute": args.execute,
+            trace = {"ckpt": str(Path(active_ckpt).resolve()), "execute": args.execute,
+                     "task_profile_key": active_profile_key if task_switching else None,
+                     "gripper_close_mm": active_close_mm,
                      "target_mode": target_mode,
                      "delta_scale": args.delta_scale,
                      "action_scale": args.action_scale if target_mode == "joystick" else None,
@@ -952,6 +1090,9 @@ def main():
                             subgoal_rgb=latest_subgoal_overlay,
                             video_scale=args.video_scale)
                 cmd = poll_cmd(pygame)
+                if cmd is not None and cmd.startswith("task:"):
+                    print("[TASK] switch ignored during rollout; press E, then select "
+                          "the task from the IDLE screen")
                 if cmd in ("end", "home", "quit"):
                     stop_cmd = cmd
                     break
@@ -1005,6 +1146,9 @@ def main():
                                     subgoal_rgb=latest_subgoal_overlay,
                                     video_scale=args.video_scale)
                     cmd = poll_cmd(pygame)
+                    if cmd is not None and cmd.startswith("task:"):
+                        print("[TASK] switch ignored during rollout; press E, then select "
+                              "the task from the IDLE screen")
                     if cmd in ("end", "home", "quit"):
                         stop_cmd = cmd
                         break
@@ -1049,6 +1193,8 @@ def main():
                 summary = {
                     "trial": trial,
                     "ckpt": trace["ckpt"],
+                    "task_profile_key": trace["task_profile_key"],
+                    "gripper_close_mm": trace["gripper_close_mm"],
                     "target_mode": target_mode,
                     "delta_scale": args.delta_scale,
                     "action_scale": (

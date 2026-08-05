@@ -137,6 +137,36 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
   --csv-log results/mini_lawam/log_100ep_attn_joystick_binary_grip_t1.csv
 ```
 
+To train from VR demonstrations with RZ enabled, add `--include-rz` to the
+joystick command above and use a new checkpoint name. The resulting action is
+`[X, Y, Z, RZ, gripper]`; commands without this flag remain 4D. Training fails
+fast if action column 5 is constant, since that dataset cannot teach RZ.
+
+First create the matching visual prior if it does not already exist:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
+  --hdf5 dataset/vr_teleop_egg_exp_30ep.hdf5 \
+  --phase 1 --steps 10000 --batch 32 \
+  --out results/mini_lawam/phase1_vr_teleop_egg_exp_30ep.pt \
+  --csv-log results/mini_lawam/log_phase1_vr_teleop_egg_exp_30ep.csv
+```
+
+Then train the 5D action head:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
+  --hdf5 dataset/vr_teleop_egg_exp_30ep.hdf5 \
+  --phase 2 --head attn --gripper-head binary \
+  --use-wrist --target joystick --include-rz \
+  --gripper-target-offset 1 --include-tail-actions \
+  --prior-ckpt results/mini_lawam/phase1_vr_teleop_egg_exp_30ep.pt \
+  --lambda-gripper 1.0 \
+  --steps 10000 --batch 32 --lr 1e-4 \
+  --out results/mini_lawam/ckpt_vr_attn_joystick_rz_binary_grip_t1.pt \
+  --csv-log results/mini_lawam/log_vr_attn_joystick_rz_binary_grip_t1.csv
+```
+
 Experiment 2: add proprioception
 
 
@@ -260,10 +290,11 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --servol-max-pos-step 0.002 \
   --trace-dir results/mini_lawam/traces \
   --show-camera --show-subgoal \
-  --subgoal-update-steps 8
-  --gripper-threshold 0.0 \
+  --subgoal-update-steps 8 \
   --gripper-open-lead-steps 1 \
 ```
+Smaller `--te-m` values retain more weight from older predictions, producing a
+less reactive temporal-ensemble policy.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
@@ -284,9 +315,10 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --trace-dir results/mini_lawam/traces \
   --show-camera --show-subgoal \
   --subgoal-update-steps 8 \
-  --gripper-threshold 0.0 \
   --gripper-open-lead-steps 0
 ```
+
+### Receding-horizon rollout without temporal ensembling
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
@@ -298,7 +330,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --robot-ip 140.96.93.7 \
   --execute --use-gripper-control \
   --train-frame-hw 168 224 \
-  --exec-steps 1 \
+  --exec-steps 4 \
   --gripper-threshold 0.0 \
   --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.02 \
@@ -309,7 +341,62 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --subgoal-update-steps 8
 ```
 
-## Evaluation 
+### Bamboo checkpoint with temporal ensembling
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
+  --ckpt results/mini_lawam/ckpt_50ep_multi_egg_bamboo_attn_joystick_binary_grip.pt \
+  --table-cam-serial 244422300964 \
+  --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 \
+  --wrist-exposure 100 --wrist-gain 16 \
+  --robot-ip 140.96.93.7 \
+  --execute --use-gripper-control \
+  --train-frame-hw 168 224 \
+  --temporal-ensemble --te-m 0.1 \
+  --action-scale 0.28 \
+  --gripper-threshold 0.0 \
+  --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.02 \
+  --servol-max-pos-step 0.002 \
+  --trace-dir results/mini_lawam/traces \
+  --show-camera --show-subgoal \
+  --subgoal-update-steps 8 \
+  --gripper-open-lead-steps 0
+```
+
+### Rollout with VR RZ control
+
+For a checkpoint trained with `--include-rz`, add `--enable-rz`. This applies
+predicted RZ while roll/pitch remain locked. The flag is rejected for existing
+4D checkpoints.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
+  --ckpt results/mini_lawam/ckpt_vr_attn_joystick_rz_binary_grip_t1.pt \
+  --table-cam-serial 244422300964 \
+  --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 \
+  --wrist-exposure 100 --wrist-gain 16 \
+  --robot-ip 140.96.93.7 \
+  --execute --use-gripper-control \
+  --train-frame-hw 168 224 \
+  --exec-steps 4 \
+  --gripper-threshold 0.0 \
+  --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.02 \
+  --ws-min -0.165 -0.164 0.158 \
+  --ws-max 0.54 0.63 0.518 \
+  --servol-max-pos-step 0.002 \
+  --trace-dir results/mini_lawam/traces \
+  --save-frames 1 \
+  --show-camera --show-subgoal \
+  --subgoal-update-steps 8 \
+  --enable-rz \
+  --action-scale 1
+```
+
+## Evaluation
 ### Phase 1 evaluation
 ```bash
 python -m mini_lawam.eval_prior --ckpt results/mini_lawam/prior_phase1.pt --hdf5 dataset/multi_egg_114ep.hdf5
@@ -327,4 +414,3 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.viz_subgoal \
     --ckpt results/mini_lawam/prior_phase1.pt \
     --hdf5 dataset/multi_egg.hdf5 --demo demo_0 --t 40 80 120
 ```
-

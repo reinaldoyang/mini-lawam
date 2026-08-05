@@ -39,7 +39,8 @@ teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distil
   action chunk (`--horizon`, default 24).
 - Target (`--target`, stored in ckpt as `target_mode`): `abs` = absolute
   `[eef_pos_base(3), gripper]` (v0); `delta` = cumulative EEF displacement from
-  the current frame; `joystick` = recorded `[actions[0:3], actions[6]]`. See the
+  the current frame; `joystick` = recorded `[actions[0:3], actions[6]]`, or
+  `[actions[0:3], actions[5] (RZ), actions[6]]` with `--include-rz`. See the
   exact contracts below.
 - Gripper timing is independently checkpointed as `gripper_target_offset`.
   `--gripper-target-offset 1` means action-head row `i` uses the gripper command
@@ -58,7 +59,7 @@ teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distil
 - `head_type="attn"` (~7.4M): `AttnActionHead` — per-timestep queries, 3
   cross-attn blocks (hidden 384, 6 heads) over all patch tokens. **Use this.**
 - `gripper_head="regression"` preserves old checkpoint state dictionaries.
-  `gripper_head="binary"` shares the attention trunk but splits the final XYZ
+  `gripper_head="binary"` shares the attention trunk but splits the final motion
   and gripper projections; use it for new training.
 
 ### Delta action contract (current deployment)
@@ -101,18 +102,28 @@ recorded command at the same index:
 chunk[i] = [actions[t+i, 0:3], actions[t+i, 6]],  i = 0..23
 ```
 
+With `--include-rz`, the checkpoint uses a five-dimensional target:
+
+```
+chunk[i] = [actions[t+i, 0:3], actions[t+i, 5], actions[t+i, 6]]
+```
+
 - The formula above is the legacy same-index checkpoint contract
   (`gripper_target_offset=0`). The recommended binary-gripper run uses
-  `gripper_target_offset=1`, changing only the fourth channel to
+  `gripper_target_offset=1`, changing only the final channel to
   `actions[t+i+1, 6]`. This teaches `chunk[0]` the next-row release command
   without shifting joystick XYZ.
-- Rotation columns `3:6` are omitted; the rollout keeps its locked orientation.
+- Roll and pitch action columns `3:5` are always omitted. RZ column 5 is omitted
+  by default and included only with `--include-rz`. Training rejects an
+  RZ-enabled run if column 5 has no variation.
 - Training uses the original joystick values and target-specific mean/std. It
   does not apply the deployment gain.
 - `MiniLaWAMPolicy.act()` denormalizes back to the original joystick scale.
-- `rollout_ur7e --action-scale 0.3` multiplies only XYZ. Each scaled command is
-  added to the live TCP when that row is executed. Gripper is never scaled and
-  is thresholded at zero.
+- `rollout_ur7e --action-scale 0.3` multiplies XYZ and optional RZ. Each scaled
+  XYZ command is added to the live TCP when that row is executed. With
+  `--enable-rz`, each scaled RZ command is accumulated around base Z from
+  `DEMO_LOCKED_ROTVEC`; without that deployment flag, the full orientation stays
+  locked. Gripper is never scaled and is thresholded at zero.
 - Switch back without code changes by selecting a checkpoint trained with
   `--target delta`.
 
@@ -146,7 +157,9 @@ python -m mini_lawam.train --hdf5 <data.hdf5> --phase 2 --head attn --use-wrist 
 ```
 `--phase joint` = original single-phase. Phase-2 ckpt is self-contained
 (prior + head + cfg + action stats) → deployment needs only that one file.
-`head_type`/`gripper_head`/`use_wrist`/`use_state`/`target_mode` are stored in
+Add `--include-rz` and use a distinct output filename to train a five-dimensional
+joystick checkpoint; omit it for the legacy four-dimensional contract.
+`head_type`/`gripper_head`/`use_wrist`/`use_state`/`target_mode`/`include_rz` are stored in
 the ckpt and auto-detected everywhere downstream. Old checkpoints without
 `gripper_head` default to legacy regression. Phase 1 itself is target-independent
 (distillation only), so the same prior can be reused for delta and joystick
@@ -195,8 +208,10 @@ statistics cannot normalize an absolute TCP state.
 ## 6. Deployment (`rollout_ur7e.py`)
 
 servoL stack: background 500 Hz thread interpolates toward a shared target TCP;
-policy loop at 20 Hz. Orientation locked to `DEMO_LOCKED_ROTVEC` (tool down);
-gripper close at 23 mm. Keys: S start / E end / H home / Q quit.
+policy loop at 20 Hz. Orientation is locked to `DEMO_LOCKED_ROTVEC` (tool down)
+by default. A five-dimensional joystick checkpoint plus `--enable-rz` unlocks
+only base-Z rotation while roll/pitch remain locked. Gripper close at 23 mm.
+Keys: S start / E end / H home / Q quit.
 
 **Current best-practice command (100ep attention + delta checkpoint):**
 ```bash
@@ -241,9 +256,10 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   gradually (`1.25`, then `1.5`; test `2.0` only after confirming TCP tracking).
   Non-default values are rejected for absolute-target checkpoints.
 - `--action-scale` is the corresponding deployment-only gain for joystick
-  checkpoints (default `0.3`). It scales only the denormalized XYZ command;
-  gripper is unchanged. The scaled command is composed from the live TCP at each
-  execution tick, before target smoothing and safety clamps.
+  checkpoints (default `0.3`). It scales the denormalized XYZ and optional RZ
+  motion commands; gripper is unchanged. XYZ is composed from the live TCP at
+  each execution tick, before target smoothing and safety clamps. RZ is ignored
+  unless `--enable-rz` is passed.
 - `--save-frames 8` dumps the exact policy-input frames per rollout → offline
   forensics (`policy.act` on saved frames, nearest-neighbor vs dataset, etc.).
 - `--trace-dir` always saves the first table frame plus a compact summary JSON

@@ -11,10 +11,10 @@ understand the whole system before touching code. Last updated: 2026-07-30.
 a latent action, decodes it through a frozen Latent World Model (LaWM) into a
 latent visual **subgoal**, and conditions a flow-matching action expert on it.
 `mini_lawam` keeps the frozen LaWM + teacher-student distillation but replaces the
-VLM with a small **ConvPrior** (CNN over DINO tokens) and the flow expert with
-either an **MLP head** (v0, pooled features) or a **cross-attention head**
-(`--head attn`, token-level — the current best; fixed the grasp-precision problems
-the pooled MLP had). Single-task, language-free.
+VLM with a small **ConvPrior** (CNN over DINO tokens) and the flow expert with a
+**cross-attention head** (`--head attn`, token-level). The legacy pooled MLP
+action head was removed because it discarded fine spatial information.
+Single-task, language-free.
 
 ## 2. Architecture / data flow
 
@@ -22,11 +22,10 @@ the pooled MLP had). Single-task, language-free.
 o_t(table) ─DINO(frozen)─► u_t ─ConvPrior─► ẑ ─LaWM decoder(frozen)─► subgoal û_T
                             │                                            │
                             ▼                                            ▼
-        action head:  MLP:  [pool(u_t) ‖ pool(û_T) ‖ pool(wrist)] ──► chunk [H,4]
-                      ATTN: 24 learned queries cross-attend the RAW tokens of
-                            {u_t, û_T, wrist} (+optional state token)
-                              ├─ XYZ regression projection ─► [H,3]
-                              └─ optional binary grip projection ─► [H,1] logits
+        action head: 24 learned queries cross-attend the RAW tokens of
+                     {u_t, û_T, wrist} (+optional state token)
+                       ├─ motion regression projection ─► [H,3 or 4]
+                       └─ optional binary grip projection ─► [H,1] logits
 teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distill ẑ ← z
 ```
 
@@ -53,11 +52,10 @@ teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distil
 - Inference `predict()`: current frame(s) only → chunk. No future frame.
 
 ### Heads
-- `head_type="mlp"` (~1.1–1.5M params): 3-layer MLP on mean-pooled features.
-  Weakness (measured): pooling destroys fine spatial signal → coarse z, early
-  grasp commits.
-- `head_type="attn"` (~7.4M): `AttnActionHead` — per-timestep queries, 3
-  cross-attn blocks (hidden 384, 6 heads) over all patch tokens. **Use this.**
+- `head_type="attn"` (~7.4M) is the only supported action head:
+  `AttnActionHead` uses per-timestep queries and 3 cross-attention blocks
+  (hidden 384, 6 heads) over all patch tokens.
+- Legacy checkpoints with `head_type="mlp"` are intentionally unsupported.
 - `gripper_head="regression"` preserves old checkpoint state dictionaries.
   `gripper_head="binary"` shares the attention trunk but splits the final motion
   and gripper projections; use it for new training.

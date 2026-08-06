@@ -3,7 +3,8 @@ import torch
 
 from mini_lawam.model import (
     AttnActionHead,
-    MLPActionHead,
+    MiniLaWAM,
+    MiniLaWAMConfig,
     compute_action_losses,
 )
 from mini_lawam.rollout import decode_action_prediction
@@ -45,20 +46,13 @@ def test_attention_binary_head_has_independent_outputs_and_gradients():
     assert float(head.gripper_out.weight.grad.abs().sum()) > 0.0
 
 
-def test_mlp_binary_head_shape():
-    head = MLPActionHead(
-        in_dim=10, action_dim=4, horizon=3, hidden=16,
-        gripper_head="binary",
-    )
-    assert head(torch.randn(2, 10)).shape == (2, 3, 4)
-
-
 def test_binary_head_supports_xyz_rz_plus_final_gripper():
-    head = MLPActionHead(
-        in_dim=10, action_dim=5, horizon=3, hidden=16,
+    head = AttnActionHead(
+        token_dim=8, action_dim=5, horizon=3, n_views=2,
+        hidden=12, n_layers=1, n_heads=3,
         gripper_head="binary",
     )
-    pred = head(torch.randn(2, 10))
+    pred = head([torch.randn(2, 5, 8), torch.randn(2, 5, 8)])
     assert pred.shape == (2, 3, 5)
 
     actions = torch.randn_like(pred)
@@ -78,6 +72,15 @@ def test_binary_head_supports_xyz_rz_plus_final_gripper():
     decoded = decode_action_prediction(raw, mean, std, gripper_head="binary")
     np.testing.assert_allclose(decoded[0, :4], [1.1, 4.2, 9.3, 16.4])
     assert decoded[0, -1] == -1.0
+
+
+def test_mlp_action_head_config_is_rejected():
+    try:
+        MiniLaWAM(MiniLaWAMConfig(head_type="mlp"))
+    except ValueError as exc:
+        assert "only 'attn' is supported" in str(exc)
+    else:
+        raise AssertionError("legacy MLP action head config was accepted")
 
 
 def test_regression_attention_layout_remains_checkpoint_compatible():
@@ -130,8 +133,8 @@ def test_regression_loss_preserves_legacy_four_dimensional_mse():
 
 if __name__ == "__main__":
     test_attention_binary_head_has_independent_outputs_and_gradients()
-    test_mlp_binary_head_shape()
     test_binary_head_supports_xyz_rz_plus_final_gripper()
+    test_mlp_action_head_config_is_rejected()
     test_regression_attention_layout_remains_checkpoint_compatible()
     test_binary_decode_denormalizes_xyz_and_emits_exact_gripper_states()
     test_regression_loss_preserves_legacy_four_dimensional_mse()

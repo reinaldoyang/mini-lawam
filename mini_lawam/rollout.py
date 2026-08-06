@@ -73,7 +73,7 @@ class MiniLaWAMPolicy:
     _ARCHITECTURE_FIELDS = (
         "lam_ckpt", "lam_yaml", "action_dim", "action_horizon",
         "use_state", "state_dim", "use_wrist", "head_type",
-        "gripper_head", "include_rz", "hidden", "attn_hidden", "attn_layers",
+        "gripper_head", "include_rz", "attn_hidden", "attn_layers",
         "attn_heads",
     )
 

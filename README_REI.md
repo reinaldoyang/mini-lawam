@@ -60,69 +60,15 @@ cd /home/iclu200/reinaldoyang/LaWAM
 
 Train 2 Phase: ConvPrior and Action expert, to better understand the model, we divide the training into two phase
 
-For the phase 1 and phase 2 command below, it uses an MLP head
+The action model uses the token-level attention head. The legacy pooled MLP
+action head is no longer supported.
 ### Phase 1: distill the ConvPrior (run once; reused by both phase-2 variants)
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
     --phase 1 --steps 10000 --out results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt
 ```
 
-### Phase 2 — reuse the phase-1 prior above, to use wrist cam, just add --use-wrist, MLP head version
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
-    --phase 2 --use-wrist --prior-ckpt results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt \
-    --steps 10000 --batch 32 \
-    --out results/mini_lawam/ckpt_new_100ep_multi_egg_exp_plate_256.pt \
-    --csv-log results/mini_lawam/train_log_new_100ep_multi_exp_256_wrist.csv
-```
-
-### To use attention head
-
-Experiment 1 — attn head, isolate the un-pooling fix (your existing phase-1 prior, no proprioception, lower LR since transformers are LR-sensitive):
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
-  --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 --phase 2 --head attn --use-wrist \
-  --prior-ckpt results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt \
-  --steps 10000 --batch 32 --lr 1e-4 \
-  --out results/mini_lawam/ckpt_new_100ep_multi_egg_exp_plate_attn_256.pt --csv-log results/mini_lawam/log_attn.csv
-```
-
-### Train attention head joystick
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
-  --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
-  --phase 2 --head attn --use-wrist --target joystick \
-  --prior-ckpt results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt \
-  --steps 10000 --batch 32 --lr 1e-4 \
-  --out results/mini_lawam/ckpt_100ep_attn_joystick.pt \
-  --csv-log results/mini_lawam/log_100ep_attn_joystick.csv
-```
-
-### Train attention head with binary gripper
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
-  --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
-  --phase 2 --head attn --gripper-head binary \
-  --use-wrist --target joystick \
-  --prior-ckpt results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt \
-  --lambda-gripper 1.0 \
-  --steps 10000 --batch 32 --lr 1e-4 \
-  --out results/mini_lawam/ckpt_100ep_attn_joystick_binary.pt \
-  --csv-log results/mini_lawam/log_100ep_attn_joystick_binary.csv
-```
-
-### To use delta eef position instead of absolute position
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
-  --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
-  --phase 2 --head attn --use-wrist --target delta \
-  --prior-ckpt results/mini_lawam/phase1_moved_256.pt \
-  --steps 10000 --batch 32 --lr 1e-4 \
-  --out results/mini_lawam/ckpt_100ep_attn_delta.pt \
-  --csv-log results/mini_lawam/log_100ep_attn_delta.csv
-```
-
-### To train attention head, with binary gripper head, and changed gripper timing
+### To train attention head, with binary gripper head, and changed gripper timing (fixed)
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
   --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
@@ -271,30 +217,6 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
 ```
 
 ### Rollout of joystick target with binary gripper head
-the gripper open lead step will make the gripper open command to be sent 1 step earlier
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_100ep_attn_joystick_binary.pt \
-  --table-cam-serial 244422300964 \
-  --wrist-cam-serial 252122300792 \
-  --table-exposure 180 --table-gain 16 \
-  --wrist-exposure 100 --wrist-gain 16 \
-  --robot-ip 140.96.93.7 \
-  --execute --use-gripper-control \
-  --train-frame-hw 168 224 \
-  --temporal-ensemble --te-m 0.1 \
-  --action-scale 0.28 \
-  --gripper-threshold 0.0 \
-  --target-ema 1.0 --target-deadband 0.0 \
-  --max-reach 0.02 \
-  --servol-max-pos-step 0.002 \
-  --trace-dir results/mini_lawam/traces \
-  --show-camera --show-subgoal \
-  --subgoal-update-steps 8 \
-  --gripper-open-lead-steps 1 \
-```
-Smaller `--te-m` values retain more weight from older predictions, producing a
-less reactive temporal-ensemble policy.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
@@ -303,7 +225,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --wrist-cam-serial 252122300792 \
   --table-exposure 180 --table-gain 16 \
   --wrist-exposure 100 --wrist-gain 16 \
-  --robot-ip 140.96.93.7 \
+  --robot-ip 140.96.93.123 \
   --execute --use-gripper-control \
   --train-frame-hw 168 224 \
   --temporal-ensemble --te-m 0.1 \
@@ -316,29 +238,6 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --show-camera --show-subgoal \
   --subgoal-update-steps 8 \
   --gripper-open-lead-steps 0
-```
-
-### Receding-horizon rollout without temporal ensembling
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_100ep_attn_joystick_binary_grip_t1.pt \
-  --table-cam-serial 244422300964 \
-  --wrist-cam-serial 252122300792 \
-  --table-exposure 180 --table-gain 16 \
-  --wrist-exposure 100 --wrist-gain 16 \
-  --robot-ip 140.96.93.7 \
-  --execute --use-gripper-control \
-  --train-frame-hw 168 224 \
-  --exec-steps 4 \
-  --gripper-threshold 0.0 \
-  --target-ema 1.0 --target-deadband 0.0 \
-  --max-reach 0.02 \
-  --servol-max-pos-step 0.002 \
-  --trace-dir results/mini_lawam/traces \
-  --save-frames 1 \
-  --show-camera --show-subgoal \
-  --subgoal-update-steps 8
 ```
 
 ### Bamboo checkpoint with temporal ensembling

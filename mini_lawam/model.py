@@ -4,7 +4,7 @@ Structure (your diagram):
     o_t --DINO(frozen)--> u_t --ConvPrior--> z_hat --LaWM(frozen)--> subgoal u_hat_T
                           u_t ---------------------------------------------\
                                                                            v
-                          [pool(u_t), pool(u_hat_T), (state)] --MLP--> action chunk
+                          raw tokens --cross-attention head--> action chunk
 
 Losses:
     loss_act     = XYZ MSE + gripper BCE (binary-head mode), or legacy action MSE
@@ -12,7 +12,7 @@ Losses:
     loss_wm      = MSE(u_hat_T, u_T)                          # subgoal supervision (light)
 
 Everything in the LAM (DINO encoder, inverse-dynamics teacher, LaWM decoder) is
-frozen; only ConvPrior + the MLP action head train. Training can be joint or
+frozen; only ConvPrior + the cross-attention action head train. Training can be joint or
 two-phase (see mini_lawam.train --phase): phase 1 trains ConvPrior alone with
 loss_distill (forward(..., prior_only=True)); phase 2 loads that prior
 (frozen or finetuned) and trains the action head with the full loss.
@@ -38,7 +38,7 @@ class MiniLaWAMConfig:
     lam_yaml: str = "latent_action_model/logs/dino_large_vae/lam_release/dino_large_vae.yaml"
     action_dim: int = 4              # target = absolute [eef_pos(3), gripper_pos(1)]
     # Horizon in FRAMES = 1.2 s @ 20 Hz = 24 (paper §C.5 robot horizon). Same value
-    # for the action chunk (MLP head output) and the LaWM future pair (o_{t+H} ->
+    # for the action chunk and the LaWM future pair (o_{t+H} ->
     # z_teacher, u_T, loss_wm).
     action_horizon: int = 24
     future_horizon: int = 24
@@ -46,8 +46,9 @@ class MiniLaWAMConfig:
     state_dim: int = 0               # e.g. 3 for [x,y,z]; set with use_state
     use_wrist: bool = False           # add wrist_cam as aux view to the ACTION HEAD only
                                       # (never the prior/LaWM -- paper §C.2; wrist moves w/ arm)
-    head_type: str = "mlp"           # "mlp" = pooled-features MLP (v0);
-                                      # "attn" = token-level cross-attention (no pooling)
+    # Kept in checkpoint metadata for compatibility with existing attention
+    # checkpoints. Only token-level cross-attention is supported.
+    head_type: str = "attn"
     gripper_head: str = "regression" # "regression" = legacy joint 4D MSE output;
                                       # "binary" = separate XYZ regression + grip logit
     target_mode: str = "abs"         # "abs" = absolute eef positions;
@@ -56,7 +57,7 @@ class MiniLaWAMConfig:
     gripper_target_offset: int = -1   # 0=same row, 1=one row ahead;
                                       # -1 preserves legacy target-mode behavior
     include_tail_actions: bool = False  # train terminal anchors with masked padding
-    hidden: int = 512                # MLP head width
+    hidden: int = 512                # legacy checkpoint metadata; unused
     attn_hidden: int = 384           # attn head width
     attn_layers: int = 3
     attn_heads: int = 6
@@ -87,48 +88,6 @@ class ConvPrior(nn.Module):
         b, k, d = u_t.shape
         x = u_t.transpose(1, 2).reshape(b, d, self.grid, self.grid)
         return self.net(x).unsqueeze(1)  # [B, 1, code_dim]
-
-
-class MLPActionHead(nn.Module):
-    """Pooled conditioning -> action chunk, with optional split binary grip head."""
-
-    def __init__(self, in_dim: int, action_dim: int, horizon: int, hidden: int = 512,
-                 gripper_head: str = "regression"):
-        super().__init__()
-        self.horizon = horizon
-        self.action_dim = action_dim
-        self.gripper_head = gripper_head
-        if gripper_head == "regression":
-            # Keep the exact legacy module layout/state-dict keys so all existing
-            # checkpoints remain loadable.
-            self.net = nn.Sequential(
-                nn.Linear(in_dim, hidden), nn.GELU(),
-                nn.Linear(hidden, hidden), nn.GELU(),
-                nn.Linear(hidden, horizon * action_dim),
-            )
-        elif gripper_head == "binary":
-            if action_dim != 4:
-                raise ValueError("binary gripper head requires action_dim=4 (XYZ + grip)")
-            self.trunk = nn.Sequential(
-                nn.Linear(in_dim, hidden), nn.GELU(),
-                nn.Linear(hidden, hidden), nn.GELU(),
-            )
-            self.xyz_out = nn.Linear(hidden, horizon * 3)
-            self.gripper_out = nn.Linear(hidden, horizon)
-        else:
-            raise ValueError(
-                f"unknown gripper_head {gripper_head!r} "
-                "(use 'regression' or 'binary')"
-            )
-
-    def forward(self, cond: torch.Tensor) -> torch.Tensor:
-        b = cond.shape[0]
-        if self.gripper_head == "regression":
-            return self.net(cond).view(b, self.horizon, self.action_dim)
-        feat = self.trunk(cond)
-        xyz = self.xyz_out(feat).view(b, self.horizon, 3)
-        grip_logits = self.gripper_out(feat).view(b, self.horizon, 1)
-        return torch.cat([xyz, grip_logits], dim=-1)
 
 
 class _CrossAttnBlock(nn.Module):
@@ -278,6 +237,10 @@ def compute_action_losses(
 class MiniLaWAM(nn.Module):
     def __init__(self, cfg: MiniLaWAMConfig):
         super().__init__()
+        if cfg.head_type != "attn":
+            raise ValueError(
+                f"unsupported head_type {cfg.head_type!r}; only 'attn' is supported"
+            )
         self.cfg = cfg
         self.lam = load_latent_action_model(cfg.lam_ckpt, cfg.lam_yaml)  # frozen, eval
         vdim = int(self.lam.input_dim)   # DINOv3 ViT-B -> 768
@@ -285,21 +248,12 @@ class MiniLaWAM(nn.Module):
         self.prior = ConvPrior(vdim, cdim)
         n_views = 2 + (1 if cfg.use_wrist else 0)   # u_t, u_hat_T, [wrist]
         state_dim = cfg.state_dim if cfg.use_state else 0
-        if cfg.head_type == "attn":
-            self.action_head = AttnActionHead(
-                token_dim=vdim, action_dim=cfg.action_dim, horizon=cfg.action_horizon,
-                n_views=n_views, hidden=cfg.attn_hidden, n_layers=cfg.attn_layers,
-                n_heads=cfg.attn_heads, state_dim=state_dim,
-                gripper_head=cfg.gripper_head,
-            )
-        elif cfg.head_type == "mlp":
-            # cond = [pool(u_t), pool(u_hat_T), (pool(wrist)), (state)]
-            cond_dim = n_views * vdim + state_dim
-            self.action_head = MLPActionHead(cond_dim, cfg.action_dim,
-                                             cfg.action_horizon, cfg.hidden,
-                                             gripper_head=cfg.gripper_head)
-        else:
-            raise ValueError(f"unknown head_type {cfg.head_type!r} (use 'mlp' or 'attn')")
+        self.action_head = AttnActionHead(
+            token_dim=vdim, action_dim=cfg.action_dim, horizon=cfg.action_horizon,
+            n_views=n_views, hidden=cfg.attn_hidden, n_layers=cfg.attn_layers,
+            n_heads=cfg.attn_heads, state_dim=state_dim,
+            gripper_head=cfg.gripper_head,
+        )
 
     def _feat(self, imgs: torch.Tensor) -> torch.Tensor:
         # no_grad frozen DINO features, usable as constants in the autograd graph.
@@ -316,26 +270,19 @@ class MiniLaWAM(nn.Module):
     def _action_pred(self, u_t_tok, u_hat_tok, wrist=None, state=None):
         """(u_t, u_hat_T) patch tokens [B,K,D] -> raw head output [B,H,4].
 
-        Branches on cfg.head_type: 'attn' consumes tokens directly (no pooling);
-        'mlp' mean-pools each view first. Wrist/state added if configured. In
-        binary-gripper mode the final channel is a logit, not a normalized action.
+        The attention head consumes raw patch tokens without mean-pooling.
+        Wrist/state are added if configured. In binary-gripper mode the final
+        channel is a logit, not a normalized action.
         """
         wrist_tok = None
         if self.cfg.use_wrist:
             assert wrist is not None, "cfg.use_wrist=True but no wrist image was passed"
             wrist_tok = self._feat(wrist)[:, 0]         # [B,K,D]
         st = state if (self.cfg.use_state and state is not None) else None
-        if self.cfg.head_type == "attn":
-            views = [u_t_tok, u_hat_tok]
-            if wrist_tok is not None:
-                views.append(wrist_tok)
-            return self.action_head(views, state=st)
-        cond = torch.cat([u_t_tok.mean(1), u_hat_tok.mean(1)], dim=-1)
+        views = [u_t_tok, u_hat_tok]
         if wrist_tok is not None:
-            cond = torch.cat([cond, wrist_tok.mean(1)], dim=-1)
-        if st is not None:
-            cond = torch.cat([cond, st], dim=-1)
-        return self.action_head(cond)
+            views.append(wrist_tok)
+        return self.action_head(views, state=st)
 
     def forward(
         self,
@@ -410,26 +357,25 @@ class MiniLaWAM(nn.Module):
 
 
 if __name__ == "__main__":
-    # Shape smoke test: both head types x wrist on/off x state on/off.
+    # Shape smoke test: attention head x wrist on/off x state on/off.
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    for head_type in ("mlp", "attn"):
-        for use_wrist in (False, True):
-            for use_state in (False, True):
-                cfg = MiniLaWAMConfig(head_type=head_type, use_wrist=use_wrist,
-                                      use_state=use_state, state_dim=3 if use_state else 0)
-                model = MiniLaWAM(cfg).to(dev)
-                model.prior.train(); model.action_head.train()
-                B, H = 2, cfg.action_horizon
-                o_t = torch.randn(B, 1, 3, 256, 256, device=dev)
-                o_T = torch.randn(B, 1, 3, 256, 256, device=dev)
-                wrist = torch.randn(B, 1, 3, 256, 256, device=dev) if use_wrist else None
-                state = torch.randn(B, 3, device=dev) if use_state else None
-                acts = torch.randn(B, H, cfg.action_dim, device=dev)
-                out = model(o_t, o_T, acts, wrist=wrist, state=state)
-                out["loss_total"].backward()  # check gradients flow to the head
-                gh = sum(p.grad.abs().sum().item() for p in model.action_head.parameters()
-                         if p.grad is not None)
-                n = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                print(f"[{head_type} wrist={use_wrist} state={use_state}] "
-                      f"pred={tuple(out['pred'].shape)} act={float(out['loss_act']):.3f} "
-                      f"head_grad={gh:.1f} trainable={n:,}")
+    for use_wrist in (False, True):
+        for use_state in (False, True):
+            cfg = MiniLaWAMConfig(use_wrist=use_wrist,
+                                  use_state=use_state, state_dim=3 if use_state else 0)
+            model = MiniLaWAM(cfg).to(dev)
+            model.prior.train(); model.action_head.train()
+            B, H = 2, cfg.action_horizon
+            o_t = torch.randn(B, 1, 3, 256, 256, device=dev)
+            o_T = torch.randn(B, 1, 3, 256, 256, device=dev)
+            wrist = torch.randn(B, 1, 3, 256, 256, device=dev) if use_wrist else None
+            state = torch.randn(B, 3, device=dev) if use_state else None
+            acts = torch.randn(B, H, cfg.action_dim, device=dev)
+            out = model(o_t, o_T, acts, wrist=wrist, state=state)
+            out["loss_total"].backward()  # check gradients flow to the head
+            gh = sum(p.grad.abs().sum().item() for p in model.action_head.parameters()
+                     if p.grad is not None)
+            n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"[attn wrist={use_wrist} state={use_state}] "
+                  f"pred={tuple(out['pred'].shape)} act={float(out['loss_act']):.3f} "
+                  f"head_grad={gh:.1f} trainable={n:,}")

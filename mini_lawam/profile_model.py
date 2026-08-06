@@ -161,18 +161,10 @@ def predict_with_component_markers(model, o_t, wrist=None, state=None):
 
         with record_function("action_head"):
             st = state if (model.cfg.use_state and state is not None) else None
-            if model.cfg.head_type == "attn":
-                views = [u_t[:, 0], u_hat_t[:, 0]]
-                if wrist_tok is not None:
-                    views.append(wrist_tok)
-                return model.action_head(views, state=st)
-
-            cond = torch.cat([u_t[:, 0].mean(1), u_hat_t[:, 0].mean(1)], dim=-1)
+            views = [u_t[:, 0], u_hat_t[:, 0]]
             if wrist_tok is not None:
-                cond = torch.cat([cond, wrist_tok.mean(1)], dim=-1)
-            if st is not None:
-                cond = torch.cat([cond, st], dim=-1)
-            return model.action_head(cond)
+                views.append(wrist_tok)
+            return model.action_head(views, state=st)
 
 
 def run_torch_profiler(

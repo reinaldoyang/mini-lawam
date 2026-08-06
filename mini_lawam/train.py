@@ -106,9 +106,10 @@ def main():
                          "1.2s @ 20Hz = 24 (paper §C.5).")
     ap.add_argument("--use-wrist", action="store_true",
                     help="Add wrist_cam as an aux view to the action head (paper §C.2).")
-    ap.add_argument("--head", choices=["mlp", "attn"], default="mlp",
-                    help="Action head: 'mlp' = pooled-features MLP (v0); 'attn' = "
-                         "token-level cross-attention (no mean-pooling, fixes precision).")
+    ap.add_argument(
+        "--head", choices=["attn"], default="attn",
+        help="Action head (attention-only; the legacy pooled MLP was removed).",
+    )
     ap.add_argument(
         "--gripper-head", choices=["regression", "binary"], default="regression",
         help="'regression' preserves the legacy joint 4D MSE head/checkpoints; "

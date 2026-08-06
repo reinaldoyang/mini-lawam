@@ -11,10 +11,9 @@ understand the whole system before touching code. Last updated: 2026-07-30.
 a latent action, decodes it through a frozen Latent World Model (LaWM) into a
 latent visual **subgoal**, and conditions a flow-matching action expert on it.
 `mini_lawam` keeps the frozen LaWM + teacher-student distillation but replaces the
-VLM with a small **ConvPrior** (CNN over DINO tokens) and the flow expert with
-either an **MLP head** (v0, pooled features) or a **cross-attention head**
-(`--head attn`, token-level — the current best; fixed the grasp-precision problems
-the pooled MLP had). Single-task, language-free.
+VLM with a small **ConvPrior** (CNN over DINO tokens) and the flow expert with a
+**cross-attention head** (`--head attn`, token-level). The legacy pooled MLP head
+has been removed. Single-task, language-free.
 
 ## 2. Architecture / data flow
 
@@ -22,11 +21,10 @@ the pooled MLP had). Single-task, language-free.
 o_t(table) ─DINO(frozen)─► u_t ─ConvPrior─► ẑ ─LaWM decoder(frozen)─► subgoal û_T
                             │                                            │
                             ▼                                            ▼
-        action head:  MLP:  [pool(u_t) ‖ pool(û_T) ‖ pool(wrist)] ──► chunk [H,4]
-                      ATTN: 24 learned queries cross-attend the RAW tokens of
-                            {u_t, û_T, wrist} (+optional state token)
-                              ├─ XYZ regression projection ─► [H,3]
-                              └─ optional binary grip projection ─► [H,1] logits
+        action head:  24 learned queries cross-attend the RAW tokens of
+                      {u_t, û_T, wrist} (+optional state token)
+                        ├─ XYZ regression projection ─► [H,3]
+                        └─ optional binary grip projection ─► [H,1] logits
 teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distill ẑ ← z
 ```
 
@@ -52,11 +50,9 @@ teacher (train only): LAM inverse-dynamics(u_t, u_T) ─► z_teacher ⇒ distil
 - Inference `predict()`: current frame(s) only → chunk. No future frame.
 
 ### Heads
-- `head_type="mlp"` (~1.1–1.5M params): 3-layer MLP on mean-pooled features.
-  Weakness (measured): pooling destroys fine spatial signal → coarse z, early
-  grasp commits.
-- `head_type="attn"` (~7.4M): `AttnActionHead` — per-timestep queries, 3
-  cross-attn blocks (hidden 384, 6 heads) over all patch tokens. **Use this.**
+- `head_type="attn"` (~7.4M) is the only supported action head:
+  `AttnActionHead` uses per-timestep queries and 3 cross-attention blocks
+  (hidden 384, 6 heads) over all patch tokens.
 - `gripper_head="regression"` preserves old checkpoint state dictionaries.
   `gripper_head="binary"` shares the attention trunk but splits the final XYZ
   and gripper projections; use it for new training.
@@ -147,8 +143,9 @@ python -m mini_lawam.train --hdf5 <data.hdf5> --phase 2 --head attn --use-wrist 
 `--phase joint` = original single-phase. Phase-2 ckpt is self-contained
 (prior + head + cfg + action stats) → deployment needs only that one file.
 `head_type`/`gripper_head`/`use_wrist`/`use_state`/`target_mode` are stored in
-the ckpt and auto-detected everywhere downstream. Old checkpoints without
-`gripper_head` default to legacy regression. Phase 1 itself is target-independent
+the ckpt and auto-detected everywhere downstream. MLP-head checkpoints are no
+longer supported. Old attention checkpoints without `gripper_head` default to
+legacy regression. Phase 1 itself is target-independent
 (distillation only), so the same prior can be reused for delta and joystick
 phase 2 runs; phase 2 must pass the intended `--target`. Do not combine
 `--use-state` with `--target delta` or `--target joystick`: their target
@@ -278,7 +275,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
    of steps). Fix: temporal ensembling.
 6. **Grasped 4 cm high**: TE-averaged gripper fired early (far-horizon "+1"
    leaking into the average). Fix: newest-chunk gripper.
-7. **MLP pooled head plateau**: 2.2–3.2 cm offline, train≈val (fit limit, not
+7. **Legacy MLP pooled head plateau**: 2.2–3.2 cm offline, train≈val (fit limit, not
    data limit) → replaced pooling with cross-attention head → clear improvement
    (user-confirmed on robot; offline 1.6 cm on 100ep).
 8. **Absolute-target live offset**: the 100ep absolute-attn policy overshot the

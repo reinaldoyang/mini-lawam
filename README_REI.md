@@ -58,25 +58,16 @@ cd /home/iclu200/reinaldoyang/LaWAM
 
 ## Training
 
-Train 2 Phase: ConvPrior and Action expert, to better understand the model, we divide the training into two phase
+Train in two phases: first distill the ConvPrior, then train the attention action head.
+The legacy pooled MLP action head has been removed.
 
-For the phase 1 and phase 2 command below, it uses an MLP head
-### Phase 1: distill the ConvPrior (run once; reused by both phase-2 variants)
+### Phase 1: distill the ConvPrior (run once; reuse for phase 2)
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
     --phase 1 --steps 10000 --out results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt
 ```
 
-### Phase 2 — reuse the phase-1 prior above, to use wrist cam, just add --use-wrist, MLP head version
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train --hdf5 dataset/new_100ep_multi_egg_exp_plate_256.hdf5 \
-    --phase 2 --use-wrist --prior-ckpt results/mini_lawam/phase1_new_100ep_multi_egg_exp_plate_256.pt \
-    --steps 10000 --batch 32 \
-    --out results/mini_lawam/ckpt_new_100ep_multi_egg_exp_plate_256.pt \
-    --csv-log results/mini_lawam/train_log_new_100ep_multi_exp_256_wrist.csv
-```
-
-### To use attention head
+### Phase 2 — train the attention head
 
 Experiment 1 — attn head, isolate the un-pooling fix (your existing phase-1 prior, no proprioception, lower LR since transformers are LR-sensitive):
 ```bash
@@ -327,4 +318,3 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.viz_subgoal \
     --ckpt results/mini_lawam/prior_phase1.pt \
     --hdf5 dataset/multi_egg.hdf5 --demo demo_0 --t 40 80 120
 ```
-

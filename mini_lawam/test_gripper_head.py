@@ -3,7 +3,8 @@ import torch
 
 from mini_lawam.model import (
     AttnActionHead,
-    MLPActionHead,
+    MiniLaWAM,
+    MiniLaWAMConfig,
     compute_action_losses,
 )
 from mini_lawam.rollout import decode_action_prediction
@@ -45,12 +46,13 @@ def test_attention_binary_head_has_independent_outputs_and_gradients():
     assert float(head.gripper_out.weight.grad.abs().sum()) > 0.0
 
 
-def test_mlp_binary_head_shape():
-    head = MLPActionHead(
-        in_dim=10, action_dim=4, horizon=3, hidden=16,
-        gripper_head="binary",
-    )
-    assert head(torch.randn(2, 10)).shape == (2, 3, 4)
+def test_mlp_action_head_config_is_rejected():
+    try:
+        MiniLaWAM(MiniLaWAMConfig(head_type="mlp"))
+    except ValueError as exc:
+        assert "only 'attn' is supported" in str(exc)
+    else:
+        raise AssertionError("legacy MLP action head config was accepted")
 
 
 def test_regression_attention_layout_remains_checkpoint_compatible():
@@ -103,7 +105,7 @@ def test_regression_loss_preserves_legacy_four_dimensional_mse():
 
 if __name__ == "__main__":
     test_attention_binary_head_has_independent_outputs_and_gradients()
-    test_mlp_binary_head_shape()
+    test_mlp_action_head_config_is_rejected()
     test_regression_attention_layout_remains_checkpoint_compatible()
     test_binary_decode_denormalizes_xyz_and_emits_exact_gripper_states()
     test_regression_loss_preserves_legacy_four_dimensional_mse()

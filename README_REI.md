@@ -19,7 +19,7 @@ python3 scripts/view_hdf5_gui.py --input /home/iclu200/reinaldoyang/LaWAM/datase
 
 ### Convert data image observation size to 256
 ```bash
-CUDA_VISIBLE_DEVICES=0 /home/ovxuser02@itriovx.local/miniconda3/envs/lawam/bin/python     convert_hdf5_to_256.py     --in  dataset/new_100ep_multi_egg_exp_plate.hdf5     --out dataset/new_100ep_multi_egg_exp_plate_256.hdf5 --overwrite
+CUDA_VISIBLE_DEVICES=0 /home/ovxuser02@itriovx.local/miniconda3/envs/lawam/bin/python     convert_hdf5_to_256.py     --in  dataset/new_vr_teleop_egg_30ep.hdf5   --out dataset/new_vr_teleop_egg_30ep_256.hdf5 --overwrite
 ```
 
 ## Evaluate pretrained LaWM
@@ -92,29 +92,30 @@ First create the matching visual prior if it does not already exist:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
-  --hdf5 dataset/vr_teleop_egg_exp_30ep.hdf5 \
+  --hdf5 dataset/new_vr_teleop_egg_30ep_256.hdf5 \
   --phase 1 --steps 10000 --batch 32 \
-  --out results/mini_lawam/phase1_vr_teleop_egg_exp_30ep.pt \
-  --csv-log results/mini_lawam/log_phase1_vr_teleop_egg_exp_30ep.csv
+  --out results/mini_lawam/phase1_new_vr_teleop_egg_exp_30ep.pt \
+  --csv-log results/mini_lawam/log_phase1_vr_teleop_egg_exp_30ep.csv \
+  --wandb --wandb-project mini_lawam \
+  --run-name phase1-new-vr-teleop-egg-30ep
 ```
 
 Then train the 5D action head:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
-  --hdf5 dataset/vr_teleop_egg_exp_30ep.hdf5 \
+  --hdf5 dataset/new_vr_teleop_egg_30ep_256.hdf5 \
   --phase 2 --head attn --gripper-head binary \
   --use-wrist --target joystick --include-rz \
   --gripper-target-offset 1 --include-tail-actions \
-  --prior-ckpt results/mini_lawam/phase1_vr_teleop_egg_exp_30ep.pt \
+  --prior-ckpt results/mini_lawam/phase1_new_vr_teleop_egg_exp_30ep.pt \
   --lambda-gripper 1.0 \
   --steps 10000 --batch 32 --lr 1e-4 \
-  --out results/mini_lawam/ckpt_vr_attn_joystick_rz_binary_grip_t1.pt \
-  --csv-log results/mini_lawam/log_vr_attn_joystick_rz_binary_grip_t1.csv
+  --out results/mini_lawam/ckpt_new_vr_teleop_egg_30ep_attn_rz_binary_grip_t1.pt \
+  --csv-log results/mini_lawam/log_new_vr_teleop_egg_30ep_attn_rz_binary_grip_t1.csv \
+  --wandb --wandb-project mini_lawam \
+  --run-name phase2-new-vr-teleop-egg-30ep-attn-rz-binary-grip-t1
 ```
-
-Experiment 2: add proprioception
-
 
 ## Real Robot Rollout
 ### Check camera serial number

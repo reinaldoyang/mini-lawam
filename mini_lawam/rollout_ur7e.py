@@ -65,8 +65,8 @@ DEMO_LOCKED_ROTVEC = np.array([0.0036, 3.14094, -0.00024], dtype=np.float64)
 TRACE_TRIAL_RE = re.compile(r"^trial_(\d+)(?:_|$)")
 
 
-def build_parser():
-    p = argparse.ArgumentParser(description=__doc__)
+def build_parser(description=None, *, command_relative=False):
+    p = argparse.ArgumentParser(description=description or __doc__)
     p.add_argument("--ckpt", default="results/mini_lawam/ckpt_114ep_wrist.pt")
     p.add_argument(
         "--task-profile", action="append", nargs=3,
@@ -101,9 +101,11 @@ def build_parser():
                         "translations. Applied before temporal ensembling and safety clamps. "
                         "Does not affect the gripper; non-default values require a "
                         "delta-target checkpoint.")
-    p.add_argument("--action-scale", type=float, default=0.3,
+    action_scale_default = 1.0 if command_relative else 0.3
+    p.add_argument("--action-scale", type=float, default=action_scale_default,
                    help="Deployment gain for raw XYZ and optional RZ commands from a "
-                        "joystick-target checkpoint (default: 0.3). Applied after de-normalization and "
+                        "joystick-target checkpoint "
+                        f"(default: {action_scale_default:g}). Applied after de-normalization and "
                         "before temporal ensembling/TCP composition. Does not affect "
                         "the gripper and is ignored by abs/delta checkpoints.")
     p.add_argument("--max-steps", type=int, default=2000, help="max control steps per rollout")
@@ -136,7 +138,8 @@ def build_parser():
                    metavar=("X", "Y", "Z"), help="workspace box min (base frame, m)")
     p.add_argument("--ws-max", type=float, nargs=3, default=[0.523, 0.612, 0.518],
                    metavar=("X", "Y", "Z"), help="workspace box max (base frame, m)")
-    p.add_argument("--max-reach", type=float, default=0.06,
+    max_reach_default = 0.015 if command_relative else 0.06
+    p.add_argument("--max-reach", type=float, default=max_reach_default,
                    help="max distance (m) toward the predicted target per re-plan")
     p.add_argument("--locked-rotvec", type=float, nargs=3, default=None,
                    metavar=("RX", "RY", "RZ"),
@@ -580,15 +583,28 @@ def scale_joystick_chunk(chunk, action_scale, include_rz=False):
     return scaled
 
 
-def compose_target_xyz(pred_xyz, current_xyz, target_mode):
+def compose_target_xyz(
+    pred_xyz,
+    current_xyz,
+    target_mode,
+    joystick_command_xyz=None,
+):
     """Convert a policy XYZ row into an absolute TCP target.
 
     Joystick rows are incremental commands (already deployment-scaled);
-    abs/delta policy rows are already absolute by this boundary.
+    abs/delta policy rows are already absolute by this boundary. By default a
+    joystick row is anchored at the measured TCP. Passing joystick_command_xyz
+    instead advances from a persistent commanded target, matching the VR data
+    collector's forward-command action semantics.
     """
     pred = np.asarray(pred_xyz, dtype=np.float64)
     if target_mode == "joystick":
-        return np.asarray(current_xyz, dtype=np.float64) + pred
+        anchor = joystick_command_xyz
+        if anchor is None:
+            anchor = current_xyz
+        if anchor is None:
+            raise ValueError("joystick target composition requires an XYZ anchor")
+        return np.asarray(anchor, dtype=np.float64) + pred
     if target_mode in ("abs", "delta"):
         return pred
     raise ValueError(f"unsupported target_mode={target_mode!r}")
@@ -603,6 +619,41 @@ def compose_locked_rotvec_with_rz(locked_rotvec, rz_offset):
         np.asarray([0.0, 0.0, float(rz_offset)], dtype=np.float64)
     )
     return (rz_rotation * Rotation.from_rotvec(locked)).as_rotvec()
+
+
+def stop_servo_pipeline_for_idle(
+    shared_state,
+    servo_thread,
+    stop_servo_pipeline_fn,
+):
+    """Stop and join the servo worker before IDLE or a blocking moveJ.
+
+    Merely setting the worker's ``paused`` flag is not sufficient for a safety
+    boundary: it may already have read the old target and be about to issue one
+    more servoL call. Joining guarantees no background servoL call can race a
+    subsequent moveJ or reactivate a cached rollout target.
+    """
+    if shared_state is None and servo_thread is None:
+        return None, None
+    stop_servo_pipeline_fn(shared_state, servo_thread)
+    if servo_thread is not None and servo_thread.is_alive():
+        raise RuntimeError(
+            "servo worker did not stop; refusing to enter IDLE or execute moveJ"
+        )
+    return None, None
+
+
+def read_checked_actual_tcp(rtde_r):
+    """Read a finite six-axis TCP pose, failing closed on RTDE disconnect."""
+    if rtde_r is None:
+        raise RuntimeError("RTDE receive interface is unavailable")
+    is_connected = getattr(rtde_r, "isConnected", None)
+    if callable(is_connected) and not is_connected():
+        raise RuntimeError("RTDE receive connection is down; refusing robot command")
+    pose = np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)
+    if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+        raise RuntimeError(f"invalid actual TCP pose from RTDE: {pose!r}")
+    return pose
 
 
 def select_gripper_with_open_lookahead(
@@ -686,6 +737,20 @@ def format_duration_hms(duration_sec: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
 
 
+def format_action_log(step, xyz, gripper_cmd, rz=None) -> str:
+    """Format one concise executed-action log line."""
+    x, y, z = np.asarray(xyz, dtype=np.float64).reshape(3)
+    fields = [
+        f"x={x:+.4f}",
+        f"y={y:+.4f}",
+        f"z={z:+.4f}",
+    ]
+    if rz is not None:
+        fields.append(f"rz={float(rz):+.4f}")
+    fields.append(f"gripper={gripper_cmd}")
+    return f"[STEP {int(step)}] " + "  ".join(fields)
+
+
 def load_offline_frame(path: str, cam: str = "table_cam") -> np.ndarray:
     p = Path(path)
     if p.suffix in (".hdf5", ".h5"):
@@ -700,8 +765,22 @@ def load_offline_frame(path: str, cam: str = "table_cam") -> np.ndarray:
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
-def main():
-    args = build_parser().parse_args()
+def main(*, joystick_anchor_mode="actual", description=None):
+    """Run a rollout using actual- or commanded-pose joystick anchoring.
+
+    ``actual`` preserves the keyboard-teleoperation semantics used by this
+    module historically. ``commanded`` is selected by rollout_ur7e_vr and
+    matches VR datasets whose actions are deltas between commanded poses.
+    """
+    if joystick_anchor_mode not in ("actual", "commanded"):
+        raise ValueError(
+            "joystick_anchor_mode must be 'actual' or 'commanded', got "
+            f"{joystick_anchor_mode!r}"
+        )
+    args = build_parser(
+        description=description,
+        command_relative=(joystick_anchor_mode == "commanded"),
+    ).parse_args()
     if not np.isfinite(args.delta_scale) or args.delta_scale < 0.0:
         raise ValueError("--delta-scale must be a finite value >= 0")
     if not np.isfinite(args.action_scale) or args.action_scale < 0.0:
@@ -784,6 +863,50 @@ def main():
     print(f"[ROT] locked_rotvec ({locked_source}) = {np.round(locked_rotvec, 4)}")
     pygame = screen = font = clock = None
 
+    def start_rollout_servo():
+        """Create a fresh servo worker anchored at the current measured TCP."""
+        nonlocal servo_state, servo_thread
+        if not args.execute:
+            return
+        if servo_thread is not None and servo_thread.is_alive():
+            raise RuntimeError("servo worker is already active")
+        read_checked_actual_tcp(rtde_r)
+        servo_state, servo_thread = start_servo_pipeline(
+            rtde_r=rtde_r, rtde_c=rtde_c, control_hz=args.servo_hz,
+            speed=args.servol_speed, acc=args.servol_acc,
+            lookahead_time=args.servol_lookahead, gain=args.servol_gain,
+            interp_alpha=args.servol_interp_alpha,
+            max_pos_step=args.servol_max_pos_step,
+            max_rot_step=args.servol_max_rot_step,
+        )
+        print("[SERVO] armed for rollout from current TCP")
+
+    def stop_rollout_servo(reason):
+        """Disarm servoL and wait until its worker has fully exited."""
+        nonlocal servo_state, servo_thread
+        if servo_state is None and servo_thread is None:
+            return
+        servo_state, servo_thread = stop_servo_pipeline_for_idle(
+            servo_state, servo_thread, stop_servo_pipeline
+        )
+        print(f"[SERVO] disarmed ({reason}); no servo target is active")
+
+    def move_home_with_servo_off():
+        """Execute moveJ only after proving the background servo worker is gone."""
+        stop_rollout_servo("before home")
+        if gripper is not None:
+            gripper.command("open")
+        move_robot_home(
+            rtde_c, rtde_r, None,
+            args.home_movej_speed, args.home_movej_acc,
+            home_q=args.home_q,
+        )
+        # A held H may have queued keyboard-repeat events while blocking in
+        # moveJ. Drop them so one press cannot launch several home motions.
+        if pygame is not None:
+            pygame.event.clear(pygame.KEYDOWN)
+        print("[HOME] complete; servo remains off until S starts a new rollout")
+
     need_wrist = bool(policy.cfg.use_wrist)
     target_mode = getattr(policy.cfg, "target_mode", "abs")
     include_rz = bool(getattr(policy.cfg, "include_rz", False))
@@ -795,6 +918,11 @@ def main():
         raise ValueError("--delta-scale only applies to a checkpoint with target_mode='delta'")
     if target_mode not in ("abs", "delta", "joystick"):
         raise ValueError(f"unsupported checkpoint target_mode={target_mode!r}")
+    if joystick_anchor_mode == "commanded" and target_mode != "joystick":
+        raise ValueError(
+            "the VR command-relative rollout requires a checkpoint with "
+            "target_mode='joystick'"
+        )
     if args.enable_rz and not include_rz:
         raise ValueError(
             "--enable-rz requires a checkpoint trained with "
@@ -805,7 +933,14 @@ def main():
           f"include_rz={include_rz} enable_rz={args.enable_rz} "
           f"gripper_head={getattr(policy.cfg, 'gripper_head', 'regression')} "
           f"delta_scale={args.delta_scale:g}"
-          + (f" action_scale={args.action_scale:g}" if target_mode == "joystick" else ""))
+          + (f" action_scale={args.action_scale:g}"
+             f" joystick_anchor={joystick_anchor_mode}"
+             if target_mode == "joystick" else ""))
+    if joystick_anchor_mode == "commanded" and args.max_reach > 0.03:
+        print(
+            f"[WARN] command-relative max target lead is {args.max_reach:.3f} m; "
+            "start near 0.015 m and increase only after checking actual TCP tracking"
+        )
     print(f"[INFO] gripper open lookahead={args.gripper_open_lead_steps} step(s) "
           "(release latches open for the rest of each rollout)")
     if args.show_subgoal:
@@ -828,6 +963,11 @@ def main():
             )
         if target_mode not in ("abs", "delta", "joystick"):
             raise ValueError(f"unsupported checkpoint target_mode={target_mode!r}")
+        if joystick_anchor_mode == "commanded" and target_mode != "joystick":
+            raise ValueError(
+                "the VR command-relative rollout requires every task checkpoint "
+                "to use target_mode='joystick'"
+            )
         if args.enable_rz and not include_rz:
             raise ValueError(
                 "--enable-rz requires every task checkpoint to be trained with "
@@ -866,7 +1006,7 @@ def main():
             return None
         if not args.execute:
             return np.zeros(3, dtype=np.float64)   # dry-run: predictions print as deltas
-        return np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)[:3]
+        return read_checked_actual_tcp(rtde_r)[:3]
 
     def predict_chunk(frame, wrist_frame):
         """Run inference and apply the target-mode-specific deployment gain."""
@@ -939,14 +1079,6 @@ def main():
             print(f"[RTDE] connecting to {args.robot_ip}")
             rtde_r = rtde_receive.RTDEReceiveInterface(args.robot_ip)
             rtde_c = rtde_control.RTDEControlInterface(args.robot_ip)
-            servo_state, servo_thread = start_servo_pipeline(
-                rtde_r=rtde_r, rtde_c=rtde_c, control_hz=args.servo_hz,
-                speed=args.servol_speed, acc=args.servol_acc,
-                lookahead_time=args.servol_lookahead, gain=args.servol_gain,
-                interp_alpha=args.servol_interp_alpha,
-                max_pos_step=args.servol_max_pos_step,
-                max_rot_step=args.servol_max_rot_step,
-            )
             if args.use_gripper_control:
                 gripper = LatchedGripper(RobotiqGripper, args.robot_ip,
                                          args.gripper_open_mm, active_close_mm,
@@ -988,11 +1120,7 @@ def main():
                     rollout_started_perf = time.perf_counter()
                     break
                 if cmd == "home" and args.execute:
-                    if gripper is not None:
-                        gripper.command("open")
-                    move_robot_home(rtde_c, rtde_r, servo_state,
-                                    args.home_movej_speed, args.home_movej_acc,
-                                    home_q=args.home_q)
+                    move_home_with_servo_off()
                 if cmd == "quit":
                     quit_all = True
                     break
@@ -1005,6 +1133,7 @@ def main():
                   + f"  locked_rotvec={np.round(locked_rotvec, 4)}"
                   + ("  RZ=enabled" if args.enable_rz else "  RZ=locked"))
             time.sleep(max(0.0, args.startup_wait_sec))
+            start_rollout_servo()
 
             rollout_stem = format_rollout_stem(trial, rollout_started_wall)
             first_table_frame = None
@@ -1012,6 +1141,9 @@ def main():
                      "task_profile_key": active_profile_key if task_switching else None,
                      "gripper_close_mm": active_close_mm,
                      "target_mode": target_mode,
+                     "joystick_anchor": (
+                         joystick_anchor_mode if target_mode == "joystick" else None
+                     ),
                      "include_rz": include_rz,
                      "enable_rz": args.enable_rz,
                      "delta_scale": args.delta_scale,
@@ -1023,6 +1155,17 @@ def main():
             smooth = {"ema_xyz": None, "last_cmd_xyz": None}  # per-rollout smoothing state
             grip_runtime = {"last_cmd": None, "release_latched": False}
             rotation_runtime = {"rz_accum": 0.0}
+            joystick_runtime = {"command_xyz": None}
+            if target_mode == "joystick" and joystick_anchor_mode == "commanded":
+                joystick_runtime["command_xyz"] = (
+                    read_checked_actual_tcp(rtde_r)[:3]
+                    if args.execute else np.zeros(3, dtype=np.float64)
+                )
+                print(
+                    "[CONTROL] VR command-relative XYZ initialized at "
+                    f"{np.round(joystick_runtime['command_xyz'], 4)}; "
+                    f"max target lead={args.max_reach:g} m"
+                )
 
             def select_grip_value(chunk, step_index):
                 """Apply open-only lookahead and report the release transition once."""
@@ -1050,15 +1193,28 @@ def main():
                 if not np.isfinite(pred_rz):
                     raise ValueError(f"non-finite predicted RZ at step {step}: {pred_rz}")
                 grip_cmd = "open" if grip_val <= args.gripper_threshold else "close"
-                # For joystick checkpoints pred_xyz is now a scaled incremental
-                # command. Compose it from the live TCP at the moment this row is
-                # executed. abs/delta policy outputs are already absolute targets.
+                # Joystick checkpoints produce scaled incremental commands. The
+                # keyboard rollout anchors each row at the live TCP; the VR entry
+                # point advances from its previous safety-clamped command target.
+                # abs/delta policy outputs are already absolute targets.
+                cur = (
+                    read_checked_actual_tcp(rtde_r)
+                    if args.execute else None
+                )
                 if target_mode == "joystick":
                     current_xyz = (
-                        np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)[:3]
-                        if args.execute else np.zeros(3, dtype=np.float64)
+                        cur[:3] if cur is not None
+                        else np.zeros(3, dtype=np.float64)
                     )
-                    command_xyz = compose_target_xyz(pred_xyz, current_xyz, target_mode)
+                    command_xyz = compose_target_xyz(
+                        pred_xyz,
+                        current_xyz,
+                        target_mode,
+                        joystick_command_xyz=(
+                            joystick_runtime["command_xyz"]
+                            if joystick_anchor_mode == "commanded" else None
+                        ),
+                    )
                 else:
                     command_xyz = compose_target_xyz(pred_xyz, None, target_mode)
                 beta = float(args.target_ema)
@@ -1077,7 +1233,10 @@ def main():
                 else:
                     target_rotvec = locked_rotvec
                 if args.execute:
-                    cur = np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)
+                    if servo_state is None:
+                        raise RuntimeError(
+                            "servo worker is not armed; refusing to queue a robot target"
+                        )
                     tgt_xyz = clamp_abs_target(smoothed_xyz, cur[:3],
                                                args.ws_min, args.ws_max, args.max_reach)
                     update_shared_servo_target(servo_state,
@@ -1089,6 +1248,15 @@ def main():
                             print(f"[GRIPPER] failed: {exc}")
                 else:
                     tgt_xyz = smoothed_xyz
+                if target_mode == "joystick" and joystick_anchor_mode == "commanded":
+                    # Persist the target that survived smoothing and safety
+                    # clamps. Any tracking residual is therefore carried into
+                    # the next policy step without allowing the target lead to
+                    # exceed --max-reach.
+                    joystick_runtime["command_xyz"] = np.asarray(
+                        tgt_xyz, dtype=np.float64
+                    ).copy()
+                    smooth["ema_xyz"] = joystick_runtime["command_xyz"].copy()
                 smooth["last_cmd_xyz"] = np.asarray(tgt_xyz, dtype=np.float64)
                 grip_runtime["last_cmd"] = grip_cmd
                 trace["steps"].append({
@@ -1153,9 +1321,7 @@ def main():
                     # chunks' predictions for THIS timestep (newest weighted most).
                     frame, wrist_frame = read_frames()
                     dump_frames(step, frame, wrist_frame)
-                    t_inf = time.time()
                     chunk = predict_chunk(frame, wrist_frame)
-                    inf_ms = (time.time() - t_inf) * 1e3
                     for j in range(H):
                         ensemble.setdefault(step + j, []).append(chunk[j])
                     preds = np.asarray(ensemble.pop(step, [chunk[0]]))
@@ -1172,15 +1338,10 @@ def main():
                         avg[:3], pred_rz, grip_val, step, sub=0
                     )
                     if step % 8 == 0:
-                        print("gripper chunk:", chunk[:, -1])
-                        mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
-                        xyz_label = "avg_joy_delta" if target_mode == "joystick" else "avg_xyz"
-                        rz_text = f"  rz_delta={pred_rz:+.4f}" if include_rz else ""
-                        print(f"[STEP {step}] inf={inf_ms:.0f}ms te_n={n}  "
-                              f"{xyz_label}={np.round(avg[:3], 4)}  "
-                              f"{rz_text}"
-                              f"grip={grip_val:+.2f}->{grip_cmd}  "
-                              f"chunk_span[0->{H - 1}]={mv_H:.0f}mm")
+                        print(format_action_log(
+                            step, avg[:3], grip_cmd,
+                            rz=pred_rz if args.enable_rz else None,
+                        ))
                     step += 1
                     sleep_t = dt - (time.time() - t0)
                     if sleep_t > 0:
@@ -1190,9 +1351,7 @@ def main():
                 # --- default: receding horizon, execute k waypoints per re-plan ---
                 frame, wrist_frame = read_frames()
                 dump_frames(step, frame, wrist_frame)
-                t_inf = time.time()
                 chunk = predict_chunk(frame, wrist_frame)
-                inf_ms = (time.time() - t_inf) * 1e3
                 for i in range(k):
                     t0 = time.time()
                     if args.show_camera:
@@ -1214,17 +1373,10 @@ def main():
                         chunk[i, :3], pred_rz, grip_val, step, sub=i
                     )
                     if i == 0:
-                        print("gripper chunk:", chunk[:, -1])
-                        mv_k = np.linalg.norm(chunk[k - 1, :3] - chunk[0, :3]) * 1e3
-                        mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
-                        xyz_label = "joy_delta" if target_mode == "joystick" else "pred_xyz"
-                        rz_text = f"  rz_delta={pred_rz:+.4f}" if include_rz else ""
-                        print(f"[STEP {step}] inf={inf_ms:.0f}ms  "
-                              f"{xyz_label}={np.round(chunk[i, :3], 4)}  "
-                              f"{rz_text}"
-                              f"grip={grip_val:+.2f}->{grip_cmd}  "
-                              f"chunk_span[0->{k - 1}]={mv_k:.0f}mm "
-                              f"[0->{H - 1}]={mv_H:.0f}mm")
+                        print(format_action_log(
+                            step, chunk[i, :3], grip_cmd,
+                            rz=pred_rz if args.enable_rz else None,
+                        ))
                     step += 1
                     if step >= args.max_steps:
                         break
@@ -1236,6 +1388,9 @@ def main():
 
             if stop_cmd is not None:
                 result = {"end": "ended", "home": "go_home", "quit": "quit"}[stop_cmd]
+
+            if args.execute:
+                stop_rollout_servo("rollout finished")
 
             trace["result"] = result
             rollout_finished_wall = time.time()
@@ -1257,6 +1412,7 @@ def main():
                     "task_profile_key": trace["task_profile_key"],
                     "gripper_close_mm": trace["gripper_close_mm"],
                     "target_mode": target_mode,
+                    "joystick_anchor": trace["joystick_anchor"],
                     "include_rz": include_rz,
                     "enable_rz": args.enable_rz,
                     "final_rz_accum": rotation_runtime["rz_accum"],
@@ -1279,18 +1435,17 @@ def main():
                 print(f"[SUMMARY] {fp}")
 
             if result == "go_home" and args.execute:
-                if gripper is not None:
-                    gripper.command("open")
-                move_robot_home(rtde_c, rtde_r, servo_state,
-                                args.home_movej_speed, args.home_movej_acc,
-                                home_q=args.home_q)
+                move_home_with_servo_off()
             if result == "quit":
                 quit_all = True
             trial += 1
             session_rollouts += 1
 
     finally:
-        stop_servo_pipeline(servo_state, servo_thread)
+        try:
+            stop_rollout_servo("shutdown")
+        except Exception as exc:
+            print(f"[SAFETY] failed to join servo worker during shutdown: {exc}")
         if gripper is not None:
             gripper.stop()
         if reader is not None:

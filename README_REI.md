@@ -269,16 +269,22 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --gripper-open-lead-steps 0
 ```
 
-### Rollout with VR RZ control
+### Rollout with VR command-relative control
 
-For a checkpoint trained with `--include-rz`, add `--enable-rz`. This applies
-predicted RZ while roll/pitch remain locked. The flag is rejected for existing
-4D checkpoints. The `_t1` checkpoint already stores
-`gripper_target_offset=1`; use `--gripper-open-lead-steps 0` during rollout to
-avoid adding a second runtime lookahead step.
+Use `mini_lawam.rollout_ur7e_vr` for VR datasets that store forward deltas
+between consecutive commanded poses. Its persistent XYZ target starts at the
+measured TCP, accumulates predicted deltas, and stays within `--max-reach` of
+the current measured TCP. Start with the native `--action-scale 1.0` and a
+small `--max-reach 0.015` target lead.
+
+For a checkpoint trained with `--include-rz`, additionally pass `--enable-rz`.
+This applies predicted RZ while roll/pitch remain locked. The flag is rejected
+for 4D checkpoints such as the locked-RZ checkpoint below. The `_t1` checkpoint
+stores `gripper_target_offset=1`; use `--gripper-open-lead-steps 0` during
+rollout to avoid adding a second runtime lookahead step.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e_vr \
   --ckpt results/mini_lawam/ckpt_new_vr_teleop_egg_30ep_attn_rz_binary_grip_t1.pt \
   --table-cam-serial 244422300964 \
   --wrist-cam-serial 252122300792 \
@@ -287,24 +293,18 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
   --robot-ip 140.96.93.123 \
   --execute --use-gripper-control \
   --train-frame-hw 240 320 \
-  --control-hz 20 \
-  --temporal-ensemble --te-m 0.5 \
-  --gripper-threshold 0.0 \
+  --temporal-ensemble --te-m 0.7 \
   --gripper-open-lead-steps 0 \
   --target-ema 1.0 --target-deadband 0.0 \
-  --max-reach 0.012 \
+  --max-reach 0.015 \
   --ws-min -0.165 -0.164 0.158 \
   --ws-max 0.54 0.63 0.518 \
-  --servo-hz 100 \
-  --servol-interp-alpha 1.0 \
   --servol-max-pos-step 0.002 \
   --servol-max-rot-step 0.005 \
-  --trace-dir results/mini_lawam/traces \
-  --save-frames 1 \
   --show-camera --show-subgoal \
   --subgoal-update-steps 8 \
-  --action-scale 1.2 \
-  --enable-rz 
+  --action-scale 1.0 \
+  --enable-rz
 ```
 
 ## Evaluation

@@ -12,12 +12,33 @@ from mini_lawam.data import (
     compute_action_stats,
 )
 from mini_lawam.rollout_ur7e import (
+    build_parser,
+    clamp_abs_target,
     compose_locked_rotvec_with_rz,
     compose_target_xyz,
+    format_action_log,
     scale_delta_chunk,
     scale_joystick_chunk,
     select_gripper_with_open_lookahead,
 )
+
+
+def test_action_log_hides_locked_orientation():
+    line = format_action_log(8, [0.0012, -0.0034, 0.0056], "close")
+    assert line == (
+        "[STEP 8] x=+0.0012  y=-0.0034  z=+0.0056  gripper=close"
+    )
+    assert "rz=" not in line
+
+
+def test_action_log_shows_enabled_rz():
+    line = format_action_log(
+        16, [0.0012, -0.0034, 0.0056], "open", rz=-0.0078
+    )
+    assert line == (
+        "[STEP 16] x=+0.0012  y=-0.0034  z=+0.0056  "
+        "rz=-0.0078  gripper=open"
+    )
 
 
 def test_joystick_target_uses_same_index_xyz_and_gripper_only():
@@ -65,6 +86,39 @@ def test_joystick_scale_changes_xyz_but_not_gripper():
         compose_target_xyz(scaled[0, :3], current, target_mode="joystick"),
         current + chunk[0, :3] * 0.3,
     )
+
+
+def test_vr_joystick_target_advances_from_previous_command_and_clamps_lead():
+    previous_command = np.asarray([0.410, -0.100, 0.200])
+    lagging_actual = np.asarray([0.405, -0.100, 0.200])
+    predicted_delta = np.asarray([0.010, 0.000, 0.000])
+
+    requested = compose_target_xyz(
+        predicted_delta,
+        lagging_actual,
+        target_mode="joystick",
+        joystick_command_xyz=previous_command,
+    )
+    np.testing.assert_allclose(requested, [0.420, -0.100, 0.200])
+
+    clamped = clamp_abs_target(
+        requested,
+        lagging_actual,
+        ws_min=[-1.0, -1.0, -1.0],
+        ws_max=[1.0, 1.0, 1.0],
+        max_reach=0.012,
+    )
+    np.testing.assert_allclose(clamped, [0.417, -0.100, 0.200])
+
+
+def test_vr_entrypoint_uses_native_scale_and_conservative_target_lead_defaults():
+    keyboard_parser = build_parser()
+    vr_parser = build_parser(command_relative=True)
+
+    assert keyboard_parser.get_default("action_scale") == 0.3
+    assert keyboard_parser.get_default("max_reach") == 0.06
+    assert vr_parser.get_default("action_scale") == 1.0
+    assert vr_parser.get_default("max_reach") == 0.015
 
 
 def test_optional_joystick_rz_is_read_and_scaled_with_motion():
@@ -290,8 +344,12 @@ def test_open_lookahead_uses_final_channel_for_rz_chunks():
 
 
 if __name__ == "__main__":
+    test_action_log_hides_locked_orientation()
+    test_action_log_shows_enabled_rz()
     test_joystick_target_uses_same_index_xyz_and_gripper_only()
     test_joystick_scale_changes_xyz_but_not_gripper()
+    test_vr_joystick_target_advances_from_previous_command_and_clamps_lead()
+    test_vr_entrypoint_uses_native_scale_and_conservative_target_lead_defaults()
     test_optional_joystick_rz_is_read_and_scaled_with_motion()
     test_rz_composes_around_base_z_from_locked_orientation()
     test_joystick_xyz_can_keep_same_index_with_next_row_gripper()
@@ -301,4 +359,4 @@ if __name__ == "__main__":
     test_tail_actions_include_pre_release_anchor_with_masked_padding()
     test_open_lookahead_preserves_grasp_then_latches_release()
     test_open_lookahead_uses_final_channel_for_rz_chunks()
-    print("11 focused target-mode tests passed")
+    print("15 focused target-mode tests passed")

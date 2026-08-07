@@ -314,6 +314,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="results/mini_lawam/ckpt.pt")
     ap.add_argument("--hdf5", required=True)
+    ap.add_argument(
+        "--train-frame-hw", type=int, nargs=2, default=(168, 224),
+        metavar=("H", "W"),
+        help="Original recorded frame size before the model's 256x256 resize; "
+             "pass 0 0 to disable the pre-resize.",
+    )
     ap.add_argument("--mode", choices=["single", "eval"], default="eval")
     # single-mode:
     ap.add_argument("--demo", default=None, help="[single] demo key; default = first")
@@ -324,9 +330,22 @@ if __name__ == "__main__":
     ap.add_argument("--sample-stride", type=int, default=2, help="[eval] match train.py")
     ap.add_argument("--val-frac", type=float, default=0.05, help="[eval] match train.py")
     ap.add_argument("--split-seed", type=int, default=0, help="[eval] match train.py seed")
+    ap.add_argument(
+        "--analysis-prefix-steps", type=int, default=8,
+        help="[eval] analyze cumulative motion over this many executed chunk rows",
+    )
     args = ap.parse_args()
+    if args.analysis_prefix_steps < 1:
+        ap.error("--analysis-prefix-steps must be >= 1")
 
-    policy = MiniLaWAMPolicy(args.ckpt)
+    if tuple(args.train_frame_hw) == (0, 0):
+        train_frame_hw = None
+    elif any(value < 1 for value in args.train_frame_hw):
+        ap.error("--train-frame-hw must contain positive values or exactly 0 0")
+    else:
+        train_frame_hw = tuple(args.train_frame_hw)
+
+    policy = MiniLaWAMPolicy(args.ckpt, train_frame_hw=train_frame_hw)
     step = torch.load(args.ckpt, map_location="cpu", weights_only=False).get("step")
     H = policy.cfg.action_horizon
     target_mode = getattr(policy.cfg, "target_mode", "abs")
@@ -340,7 +359,8 @@ if __name__ == "__main__":
           f"use_wrist={policy.cfg.use_wrist} target={target_mode} "
           f"include_rz={include_rz} "
           f"gripper_head={getattr(policy.cfg, 'gripper_head', 'regression')} "
-          f"gripper_target_offset={gripper_target_offset}")
+          f"gripper_target_offset={gripper_target_offset} "
+          f"train_frame_hw={train_frame_hw}")
     print(f"action_mean={np.round(policy.action_mean,4)} action_std={np.round(policy.action_std,4)}")
 
     def read_gt(g, t):
@@ -408,6 +428,10 @@ if __name__ == "__main__":
             pos_l2, step0_l2 = 0.0, 0.0
             mae = np.zeros(policy.cfg.action_dim)
             grip_ok, cnt = 0, 0
+            executed_pred, executed_gt = [], []
+            prefix_pred, prefix_gt = [], []
+            step0_pred, step0_gt = [], []
+            prefix_cases = []
             for i in take:
                 demo, t = ds.index[int(i)]
                 g = data[demo]
@@ -420,6 +444,23 @@ if __name__ == "__main__":
                 gt = read_gt(g, t)                          # [H,action_dim] target units
                 pred = policy.act(frame, wrist, state_xyz=st)
                 pred = pred[:len(gt)]
+                prefix_len = min(args.analysis_prefix_steps, len(gt))
+                pred_prefix = pred[:prefix_len, :3]
+                gt_prefix = gt[:prefix_len, :3]
+                pred_displacement = pred_prefix.sum(axis=0)
+                gt_displacement = gt_prefix.sum(axis=0)
+                endpoint_error = float(
+                    np.linalg.norm(pred_displacement - gt_displacement)
+                )
+                executed_pred.append(pred_prefix)
+                executed_gt.append(gt_prefix)
+                prefix_pred.append(pred_displacement)
+                prefix_gt.append(gt_displacement)
+                step0_pred.append(pred[0, :3])
+                step0_gt.append(gt[0, :3])
+                prefix_cases.append(
+                    (endpoint_error, demo, int(t), pred_displacement, gt_displacement)
+                )
                 pos_l2 += np.linalg.norm(pred[:, :3] - gt[:, :3], axis=1).mean()
                 step0_l2 += np.linalg.norm(pred[0, :3] - gt[0, :3])
                 mae += np.abs(pred - gt).mean(axis=0)
@@ -436,3 +477,69 @@ if __name__ == "__main__":
                 print(f"  pos L2 err  (step 0 only)      : {step0_l2/cnt*100:.2f} cm")
                 print(f"  per-dim MAE [x y z](m) grip    : {np.round(mae/cnt,4)}")
             print(f"  gripper sign accuracy          : {grip_ok/cnt*100:.1f}%")
+
+            row_pred = np.concatenate(executed_pred, axis=0)
+            row_gt = np.concatenate(executed_gt, axis=0)
+            row_pred_norm = np.linalg.norm(row_pred, axis=1)
+            row_gt_norm = np.linalg.norm(row_gt, axis=1)
+            moving = row_gt_norm >= 0.001
+            if moving.any():
+                row_cosine = (
+                    (row_pred[moving] * row_gt[moving]).sum(axis=1)
+                    / np.maximum(row_pred_norm[moving] * row_gt_norm[moving], 1e-12)
+                )
+                print(
+                    f"  first-{args.analysis_prefix_steps} moving-row cosine  : "
+                    f"mean={row_cosine.mean():.3f} median={np.median(row_cosine):.3f}"
+                )
+                print(
+                    "  first-"
+                    f"{args.analysis_prefix_steps} opposite-direction rows: "
+                    f"{(row_cosine < 0.0).mean()*100:.1f}%"
+                )
+
+            stationary = row_gt_norm < 0.001
+            if stationary.any():
+                print(
+                    "  predicted motion when GT <1 mm : "
+                    f"mean={row_pred_norm[stationary].mean()*1000:.2f} mm, "
+                    f">2 mm={(row_pred_norm[stationary] > 0.002).mean()*100:.1f}%"
+                )
+
+            prefix_pred_arr = np.asarray(prefix_pred)
+            prefix_gt_arr = np.asarray(prefix_gt)
+            prefix_error = np.linalg.norm(prefix_pred_arr - prefix_gt_arr, axis=1)
+            prefix_pred_norm = np.linalg.norm(prefix_pred_arr, axis=1)
+            prefix_gt_norm = np.linalg.norm(prefix_gt_arr, axis=1)
+            meaningful_prefix = prefix_gt_norm >= 0.005
+            print(
+                f"  first-{args.analysis_prefix_steps} cumulative endpoint err: "
+                f"mean={prefix_error.mean()*100:.2f} cm "
+                f"p95={np.percentile(prefix_error, 95)*100:.2f} cm"
+            )
+            if meaningful_prefix.any():
+                prefix_cosine = (
+                    (prefix_pred_arr[meaningful_prefix] * prefix_gt_arr[meaningful_prefix]).sum(axis=1)
+                    / np.maximum(
+                        prefix_pred_norm[meaningful_prefix]
+                        * prefix_gt_norm[meaningful_prefix],
+                        1e-12,
+                    )
+                )
+                print(
+                    f"  first-{args.analysis_prefix_steps} cumulative cosine     : "
+                    f"mean={prefix_cosine.mean():.3f}, "
+                    f"opposite={(prefix_cosine < 0.0).mean()*100:.1f}%"
+                )
+
+            step0_bias = np.asarray(step0_pred).mean(axis=0) - np.asarray(step0_gt).mean(axis=0)
+            print(f"  step-0 signed XYZ bias (mm)     : {np.round(step0_bias*1000, 3)}")
+            print(f"  worst first-{args.analysis_prefix_steps} cumulative cases:")
+            for error, demo, t, pred_disp, gt_disp in sorted(
+                prefix_cases, reverse=True, key=lambda item: item[0]
+            )[:5]:
+                print(
+                    f"    {demo} t={t:<4d} err={error*100:.2f} cm "
+                    f"pred_mm={np.round(pred_disp*1000, 1)} "
+                    f"gt_mm={np.round(gt_disp*1000, 1)}"
+                )

@@ -5,11 +5,13 @@ DINO, the LAM IDM (teacher), and the LaWM decoder are ALWAYS frozen.
 Modes (--phase):
     1     : train ConvPrior only.  loss = L_distill = MSE(z_hat, z_teacher).
             Action head untouched. Saves a prior-only checkpoint
-            (default results/mini_lawam/prior_phase1.pt), best on val loss_distill.
+            (default results/mini_lawam/prior_phase1.pt), best on val loss_distill,
+            plus a sibling ``*_last.pt`` checkpoint from the final step.
     2     : load the phase-1 prior (--prior-ckpt), train the action head.
             Prior frozen by default; --finetune-prior keeps it trainable.
             loss = L_act + 0.1*L_distill + 0.1*L_wm (weights overridable).
-            Saves the full rollout checkpoint, best on val loss_act.
+            Saves the full rollout checkpoint, best on val loss_act, plus a
+            sibling ``*_last.pt`` checkpoint from the final step.
     joint : original single-phase behavior (prior + head together,
             L_act + 1.0*L_distill + 0.1*L_wm).
 
@@ -34,6 +36,12 @@ from torch.utils.data import DataLoader, Subset
 from latent_action_model.data_loader.video_aug import gpu_two_view_video_aug
 from mini_lawam.data import MiniLaWAMDataset, split_o_t_o_T
 from mini_lawam.model import MiniLaWAM, MiniLaWAMConfig
+
+
+def last_checkpoint_path(best_path):
+    """Return the final-step checkpoint path paired with ``best_path``."""
+    stem, suffix = os.path.splitext(best_path)
+    return f"{stem}_last{suffix}"
 
 
 def make_loaders(ds, batch, workers, val_frac, seed=0):
@@ -164,8 +172,9 @@ def main():
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--out", default=None,
-                    help="Checkpoint path (default: results/mini_lawam/prior_phase1.pt "
-                         "for phase 1, results/mini_lawam/ckpt.pt otherwise).")
+                    help="Best checkpoint path (default: results/mini_lawam/prior_phase1.pt "
+                         "for phase 1, results/mini_lawam/ckpt.pt otherwise). The final "
+                         "step is also saved to a sibling path ending in _last.pt.")
     ap.add_argument("--csv-log", default="results/mini_lawam/train_log.csv",
                     help="Per-step metric log (always written). Plot via mini_lawam.plot_log.")
     ap.add_argument("--wandb", action="store_true",
@@ -306,6 +315,24 @@ def main():
 
     # Phase 1 selects best on val loss_distill; phases 2/joint on val loss_act.
     best_key = "loss_distill" if prior_only else "loss_act"
+    last_out = last_checkpoint_path(args.out)
+
+    def checkpoint():
+        ckpt = {
+            "prior": model.prior.state_dict(),
+            "cfg": cfg.__dict__,
+            "step": step,
+            "phase": args.phase,
+        }
+        if not prior_only:
+            # Full rollout checkpoint (same keys as before).
+            ckpt.update(
+                action_head=model.action_head.state_dict(),
+                action_mean=ds.action_mean,
+                action_std=ds.action_std,
+            )
+        return ckpt
+
     step, best_val = 0, float("inf")
     while step < args.steps:
         for batch in train_loader:
@@ -340,7 +367,9 @@ def main():
                 if run is not None:
                     run.log({**{f"train/{k}": v for k, v in train_m.items()},
                              "train/lr": lr}, step=step)
-            if step % args.eval_every == 0:
+            # Always validate the final step so even short/non-aligned runs produce
+            # a best checkpoint in addition to the final-step checkpoint.
+            if step % args.eval_every == 0 or step == args.steps:
                 val = evaluate(model, val_loader, device,
                                prior_only=prior_only, set_train_mode=set_train_mode)
                 print(f"  [val] " + " ".join(f"{k}={v:.4f}" for k, v in val.items()))
@@ -350,23 +379,13 @@ def main():
                 if val.get(best_key, 1e9) < best_val:
                     best_val = val[best_key]
                     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-                    ckpt = {
-                        "prior": model.prior.state_dict(),
-                        "cfg": cfg.__dict__,
-                        "step": step,
-                        "phase": args.phase,
-                    }
-                    if not prior_only:
-                        # Full rollout checkpoint (same keys as before).
-                        ckpt.update(
-                            action_head=model.action_head.state_dict(),
-                            action_mean=ds.action_mean,
-                            action_std=ds.action_std,
-                        )
-                    torch.save(ckpt, args.out)
+                    torch.save(checkpoint(), args.out)
                     print(f"  [ckpt] saved best (val {best_key}={best_val:.4f}) -> {args.out}")
             if step >= args.steps:
                 break
+    os.makedirs(os.path.dirname(last_out) or ".", exist_ok=True)
+    torch.save(checkpoint(), last_out)
+    print(f"  [ckpt] saved last (step {step}) -> {last_out}")
     csv_file.close()
     if run is not None:
         run.finish()

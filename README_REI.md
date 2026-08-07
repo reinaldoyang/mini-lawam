@@ -22,6 +22,10 @@ python3 scripts/view_hdf5_gui.py --input /home/iclu200/reinaldoyang/LaWAM/datase
 CUDA_VISIBLE_DEVICES=0 /home/ovxuser02@itriovx.local/miniconda3/envs/lawam/bin/python     convert_hdf5_to_256.py     --in  dataset/new_vr_teleop_egg_30ep.hdf5   --out dataset/new_vr_teleop_egg_30ep_256.hdf5 --overwrite
 ```
 
+```bash
+CUDA_VISIBLE_DEVICES=0 python convert_hdf5_to_256.py     --in  dataset/new_vr_teleop_egg_locked_rz_101ep.hdf5  --out dataset/new_vr_teleop_egg_locked_rz_101ep_256.hdf5 --overwrite
+```
+
 ## Evaluate pretrained LaWM
 
 ```bash
@@ -269,31 +273,38 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
 
 For a checkpoint trained with `--include-rz`, add `--enable-rz`. This applies
 predicted RZ while roll/pitch remain locked. The flag is rejected for existing
-4D checkpoints.
+4D checkpoints. The `_t1` checkpoint already stores
+`gripper_target_offset=1`; use `--gripper-open-lead-steps 0` during rollout to
+avoid adding a second runtime lookahead step.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_vr_attn_joystick_rz_binary_grip_t1.pt \
+  --ckpt results/mini_lawam/ckpt_new_vr_teleop_egg_30ep_attn_rz_binary_grip_t1.pt \
   --table-cam-serial 244422300964 \
   --wrist-cam-serial 252122300792 \
   --table-exposure 180 --table-gain 16 \
   --wrist-exposure 100 --wrist-gain 16 \
-  --robot-ip 140.96.93.7 \
+  --robot-ip 140.96.93.123 \
   --execute --use-gripper-control \
-  --train-frame-hw 168 224 \
-  --exec-steps 4 \
+  --train-frame-hw 240 320 \
+  --control-hz 20 \
+  --temporal-ensemble --te-m 0.5 \
   --gripper-threshold 0.0 \
+  --gripper-open-lead-steps 0 \
   --target-ema 1.0 --target-deadband 0.0 \
-  --max-reach 0.02 \
+  --max-reach 0.012 \
   --ws-min -0.165 -0.164 0.158 \
   --ws-max 0.54 0.63 0.518 \
+  --servo-hz 100 \
+  --servol-interp-alpha 1.0 \
   --servol-max-pos-step 0.002 \
+  --servol-max-rot-step 0.005 \
   --trace-dir results/mini_lawam/traces \
   --save-frames 1 \
   --show-camera --show-subgoal \
   --subgoal-update-steps 8 \
-  --enable-rz \
-  --action-scale 1
+  --action-scale 1.2 \
+  --enable-rz 
 ```
 
 ## Evaluation

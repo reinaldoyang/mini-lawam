@@ -42,6 +42,7 @@ tyro==1.0.3
 numpy==1.26.4
 pandas==2.3.3
 scipy==1.15.3
+h5py==3.16.0
 # scikit-learn==1.7.2
 pyarrow==23.0.0
 fastparquet==2024.11.0

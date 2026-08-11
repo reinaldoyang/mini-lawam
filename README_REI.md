@@ -299,7 +299,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e_vr \
   --robot-ip 140.96.93.7 \
   --execute --use-gripper-control \
   --train-frame-hw 240 320 \
-  --temporal-ensemble --te-m 0.2 \
+  --temporal-ensemble --te-m 1.0 \
   --gripper-open-lead-steps 0 \
   --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.015 \

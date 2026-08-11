@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Interactive GUI viewer for robomimic-style HDF5 robot datasets.
+"""Interactive GUI viewer for robomimic-style and HIL HDF5 datasets.
 
 Shows each timestep's camera images alongside the end-effector pose, joint
-positions and action vector. Switch frames with the Next/Prev buttons or the
-slider, and switch demos with the demo buttons. Arrow keys also work:
+positions, base-policy/executed actions, residual, and intervention state.
+Switch frames with the Next/Prev buttons or the slider, and switch demos with
+the demo buttons. Arrow keys also work:
     left/right  -> previous/next frame
     up/down     -> next/previous demo
 
@@ -37,6 +38,14 @@ def is_image(dataset: h5py.Dataset) -> bool:
     return dataset.ndim == 4 and dataset.shape[-1] in (1, 3, 4)
 
 
+def first_dataset(group: h5py.Group, *names: str):
+    """Return the first available dataset among canonical and legacy names."""
+    for name in names:
+        if name in group and isinstance(group[name], h5py.Dataset):
+            return group[name]
+    return None
+
+
 class HDF5Viewer:
     def __init__(self, path: str):
         self.file = h5py.File(path, "r")
@@ -65,11 +74,35 @@ class HDF5Viewer:
         self.image_keys = [k for k in obs.keys() if is_image(obs[k])]
         self.vector_keys = [k for k in obs.keys() if not is_image(obs[k])]
         self.obs = obs
-        self.actions = demo["actions"] if "actions" in demo else None
+        self.base_policy_actions = first_dataset(demo, "base_policy_actions", "bc_actions", "base_actions")
+        self.executed_actions = first_dataset(demo, "executed_actions", "actions")
+        self.human_actions = first_dataset(demo, "human_delta_actions")
+        self.residual_targets = first_dataset(demo, "residual_targets")
+        self.intervene_mask = first_dataset(demo, "intervene_mask")
+        self.manual_control_mask = first_dataset(demo, "manual_control_mask")
+        self.gripper_labels = first_dataset(demo, "gripper_labels")
+        self.is_hil = any(
+            dataset is not None
+            for dataset in (self.base_policy_actions, self.residual_targets, self.intervene_mask)
+        )
+
+        # New HIL files expose an obs-level compatibility alias for the base
+        # action. It is already shown below from the canonical episode array.
+        if self.base_policy_actions is not None:
+            self.vector_keys = [key for key in self.vector_keys if key not in ("bc_action", "base_policy_action")]
 
         lengths = [obs[k].shape[0] for k in obs.keys()]
-        if self.actions is not None:
-            lengths.append(self.actions.shape[0])
+        for dataset in (
+            self.base_policy_actions,
+            self.executed_actions,
+            self.human_actions,
+            self.residual_targets,
+            self.intervene_mask,
+            self.manual_control_mask,
+            self.gripper_labels,
+        ):
+            if dataset is not None and dataset.ndim:
+                lengths.append(dataset.shape[0])
         self.num_frames = min(lengths)
         self.frame_index = min(self.frame_index, self.num_frames - 1)
 
@@ -183,18 +216,46 @@ class HDF5Viewer:
             f"file : {Path(self.path).name}",
             f"demo : {self.demo_name}  ({self.demo_index + 1}/{len(self.demos)})",
             f"frame: {t}/{self.num_frames - 1}",
-            "",
         ]
+
+        if self.intervene_mask is not None:
+            intervention = bool(self.intervene_mask[t])
+            lines.append(f"owner: {'VR INTERVENTION' if intervention else 'BASE POLICY'}")
+        lines.append("")
 
         def fmt(arr):
             return "[" + ", ".join(f"{v:+.4f}" for v in np.asarray(arr).ravel()) + "]"
 
         for key in self.vector_keys:
-            lines.append(f"{key}:")
+            if key == "quest_controller":
+                lines.append("quest_controller [px,py,pz,qx,qy,qz,qw,trigger,side_grip]:")
+            else:
+                lines.append(f"{key}:")
             lines.append(f"  {fmt(self.obs[key][t])}")
-        if self.actions is not None:
+        if self.is_hil:
+            if self.base_policy_actions is not None:
+                lines.append("base_policy_action:")
+                lines.append(f"  {fmt(self.base_policy_actions[t])}")
+            if self.executed_actions is not None:
+                lines.append("executed_action:")
+                lines.append(f"  {fmt(self.executed_actions[t])}")
+            if self.human_actions is not None:
+                lines.append("human_vr_action:")
+                lines.append(f"  {fmt(self.human_actions[t])}")
+            if self.residual_targets is not None:
+                lines.append("residual_target (executed - base policy):")
+                lines.append(f"  {fmt(self.residual_targets[t])}")
+            if self.intervene_mask is not None:
+                lines.append(f"intervene_mask: {bool(self.intervene_mask[t])}")
+            if self.manual_control_mask is not None:
+                lines.append(f"manual_control_mask: {bool(self.manual_control_mask[t])}")
+            if self.gripper_labels is not None:
+                label = int(self.gripper_labels[t])
+                meaning = "CLOSE" if label == 1 else "OPEN"
+                lines.append(f"gripper_label: {label} ({meaning})")
+        elif self.executed_actions is not None:
             lines.append("action:")
-            lines.append(f"  {fmt(self.actions[t])}")
+            lines.append(f"  {fmt(self.executed_actions[t])}")
         return "\n".join(lines)
 
     def _draw(self, update_slider: bool = True):

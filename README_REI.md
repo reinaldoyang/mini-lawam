@@ -18,8 +18,14 @@ python3 scripts/view_hdf5_gui.py --input /home/iclu200/reinaldoyang/LaWAM/datase
 ```
 
 ### Convert data image observation size to 256
+ovx server path 
 ```bash
-CUDA_VISIBLE_DEVICES=0 /home/ovxuser02@itriovx.local/miniconda3/envs/lawam/bin/python     convert_hdf5_to_256.py     --in  dataset/new_vr_teleop_egg_30ep.hdf5   --out dataset/new_vr_teleop_egg_30ep_256.hdf5 --overwrite
+CUDA_VISIBLE_DEVICES=0 /home/ovxuser02@itriovx.local/miniconda3/envs/lawam/bin/python     convert_hdf5_to_256.py     --in  dataset/new_vr_teleop_egg_rz_75ep.hdf5  --out dataset/new_vr_teleop_egg_rz_75ep_256.hdf5 --overwrite
+```
+
+local pc path
+```bash
+CUDA_VISIBLE_DEVICES=0 python convert_hdf5_to_256.py     --in  dataset/new_vr_teleop_egg_rz_103ep_combined.hdf5 --out dataset/new_vr_teleop_egg_rz_103ep_256.hdf5 --overwrite
 ```
 
 ```bash
@@ -179,14 +185,14 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
 ### use delta scale
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_100ep_attn_delta.pt \
+  --ckpt results/mini_lawam/checkpoint/delta_controller/ckpt_100ep_attn_joystick_binary_grip_t1.pt \
   --table-cam-serial 244422300964 --wrist-cam-serial 252122300792 \
   --table-exposure 180 --table-gain 16 --wrist-exposure 100 --wrist-gain 16 \
   --robot-ip 140.96.93.7 --execute --use-gripper-control \
   --train-frame-hw 168 224 \
   --temporal-ensemble --te-m 0.3 --delta-scale 1.0 \
   --target-ema 1.0 --target-deadband 0.0 \
-  --max-reach 0.02 --servol-max-pos-step 0.002 \
+  --max-reach 0.05 --servol-max-pos-step 0.002 \
   --trace-dir results/mini_lawam/traces --show-camera
 ```
 
@@ -225,19 +231,19 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e \
-  --ckpt results/mini_lawam/ckpt_100ep_attn_joystick_binary_grip_t1.pt \
+  --ckpt results/mini_lawam/checkpoint/joystick_checkpoint/ckpt_100ep_attn_joystick_binary_grip_t1.pt \
   --table-cam-serial 244422300964 \
   --wrist-cam-serial 252122300792 \
   --table-exposure 180 --table-gain 16 \
   --wrist-exposure 100 --wrist-gain 16 \
-  --robot-ip 140.96.93.123 \
+  --robot-ip 140.96.93.7 \
   --execute --use-gripper-control \
   --train-frame-hw 168 224 \
   --temporal-ensemble --te-m 0.1 \
   --action-scale 0.28 \
   --gripper-threshold 0.0 \
   --target-ema 1.0 --target-deadband 0.0 \
-  --max-reach 0.02 \
+  --max-reach 0.05 \
   --servol-max-pos-step 0.002 \
   --trace-dir results/mini_lawam/traces \
   --show-camera --show-subgoal \
@@ -285,15 +291,15 @@ rollout to avoid adding a second runtime lookahead step.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e_vr \
-  --ckpt results/mini_lawam/ckpt_new_vr_teleop_egg_30ep_attn_rz_binary_grip_t1.pt \
+  --ckpt results/mini_lawam/checkpoint/vr_controller/ckpt_new_vr_teleop_egg_rz_103ep_256_attn_rz_binary_grip_t1.pt\
   --table-cam-serial 244422300964 \
   --wrist-cam-serial 252122300792 \
   --table-exposure 180 --table-gain 16 \
   --wrist-exposure 100 --wrist-gain 16 \
-  --robot-ip 140.96.93.123 \
+  --robot-ip 140.96.93.7 \
   --execute --use-gripper-control \
   --train-frame-hw 240 320 \
-  --temporal-ensemble --te-m 0.7 \
+  --temporal-ensemble --te-m 0.2 \
   --gripper-open-lead-steps 0 \
   --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.015 \

@@ -4,6 +4,10 @@ This folder is intentionally self-contained. It does not modify the normal
 `mini_lawam/rollout_ur7e.py` or `mini_lawam/rollout_ur7e_vr.py` entrypoints.
 It uses `MiniLaWAMPolicy` only as the frozen autonomous base policy.
 
+Coding agents and maintainers should also read [`HANDOFF.md`](HANDOFF.md) for
+the design invariants, module map, safety sequencing, current limitations,
+artifact snapshot, and remaining gated-rollout work.
+
 ## Ownership behavior
 
 At every 20 Hz collection step, Mini-LaWAM predicts the action it would take.
@@ -215,8 +219,8 @@ Train the two Stage 1 heads with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m hil.train_stage1 \
-  --data-dir dataset/hil_mini_lawam_vr \
-  --output-dir results/hil/mini_lawam_stage1_xyz_rz_grip \
+  --data-dir dataset/hil_mini_lawam_vr/hil_corrections_24ep_256.hdf5 \
+  --output-dir results/hil/mini_lawam_stage1_xyz_rz_grip_gmm_xyz005 \
   --epochs 100 \
   --batch-size 8 \
   --num-workers 8 \
@@ -228,19 +232,26 @@ CUDA_VISIBLE_DEVICES=0 python -m hil.train_stage1 \
   --freeze-image-backbone \
   --spatial-keypoints 32 \
   --temporal-context 4 \
-  --action-head-type deterministic \
+  --action-head-type gmm \
+  --num-gmm-modes 5 \
   --gripper-loss-weight 0.01 \
   --selection-metric arm_physical_mae \
-  --max-xyz-residual-per-step 0.05 \
+  --max-xyz-residual-per-step 0.005 \
   --max-rz-residual-per-step 0.05
 ```
 
 The trainer splits whole demonstrations by default, then selects intervention
 frames for Stage 1. Arm targets are divided by the configured XYZ/RZ clips and
-clamped to `[-1,1]`; the deterministic arm head uses Smooth-L1 while the
-gripper head uses two-class cross-entropy. It writes `residual_stage1.pt`
-(best validation arm MAE), `residual_stage1_last.pt`, and a JSON training
-history under the output directory.
+clamped to `[-1,1]`; this experiment uses a five-mode GMM arm head trained by
+negative log likelihood, while the gripper head uses two-class cross-entropy.
+The fresh output directory deliberately avoids resuming or overwriting the
+deterministic checkpoint. The trainer writes `residual_stage1.pt` (best
+validation arm MAE), `residual_stage1_last.pt`, and a JSON training history
+under the output directory.
+
+Pass one exact HDF5 file or an isolated directory. The loader recursively reads
+every `.hdf5`/`.h5` below a directory, so a folder containing source, merged,
+resized, or pruned variants would count those variants as separate data.
 
 ## Stage 2: intervention gate
 
@@ -263,7 +274,7 @@ Stage 1:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m hil.train_stage2 \
-  --data-dir dataset/hil_mini_lawam_vr \
+  --data-dir dataset/hil_mini_lawam_vr/hil_corrections_24ep_256.hdf5 \
   --stage1-checkpoint results/hil/mini_lawam_stage1_xyz_rz_grip/residual_stage1.pt \
   --output-dir results/hil/mini_lawam_stage2_gate \
   --epochs 50 \
@@ -278,12 +289,54 @@ CUDA_VISIBLE_DEVICES=0 python -m hil.train_stage2 \
 
 The trainer writes `residual_gate_stage2.pt` (best validation F1),
 `residual_gate_stage2_last.pt`, and a JSON history. Stage 2 only learns when a
-correction should be used; loading the gate and safely composing its output
-with the Mini-LaWAM command belongs to the separate gated rollout stage.
+correction should be used.
+
+## Gated rollout
+
+`hil.rollout_gated` runs Mini-LaWAM and the Stage 2 checkpoint together. When
+the gate is active, it adds the Stage 1 XYZ/RZ residual to the safe current
+Mini-LaWAM action and replaces the gripper with the predicted OPEN/CLOSE class.
+The composed target is clamped again before it reaches the servo worker.
+
+Run without `--execute` first, then use the same command with `--execute` only
+after checking the camera inputs, gate transitions, residuals, and workspace:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m hil.rollout_gated \
+  --ckpt results/mini_lawam/checkpoint/vr_controller/ckpt_new_vr_teleop_egg_rz_103ep_256_attn_rz_binary_grip_t1.pt \
+  --stage2-checkpoint results/hil/mini_lawam_stage2_gate/residual_gate_stage2.pt \
+  --table-cam-serial 244422300964 \
+  --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 \
+  --wrist-exposure 100 --wrist-gain 16 \
+  --train-frame-hw 240 320 \
+  --correction-source-frame-hw 168 224 \
+  --correction-frame-hw 256 256 \
+  --robot-ip 140.96.93.7 \
+  --use-gripper-control \
+  --temporal-ensemble --te-m 0.2 \
+  --gripper-open-lead-steps 0 \
+  --target-ema 1.0 --target-deadband 0.0 \
+  --gate-threshold 0.3 --gate-hysteresis 0.05 \
+  --max-reach 0.015 \
+  --ws-min -0.165 -0.164 0.158 \
+  --ws-max 0.54 0.63 0.518 \
+  --servol-max-pos-step 0.002 \
+  --servol-max-rot-step 0.005 \
+  --show-camera --show-subgoal \
+  --subgoal-update-steps 8 \
+  --action-scale 1.0 --enable-rz
+```
+
+Keyboard controls are `S=start`, `E=end`, `H=stop and home`, and `Q=quit`.
+Add `--execute` for real robot motion. The default gate threshold comes from
+the Stage 2 checkpoint; specifying `--gate-threshold` overrides it. Hysteresis
+keeps the gate active until its probability falls below `threshold - 0.05`.
 
 Run the hardware-free tests with:
 
 ```bash
 python3 -m pytest hil/test_actions.py hil/test_vr.py hil/test_policy.py \
-  hil/test_cli.py hil/test_data.py hil/test_stage1.py hil/test_stage2.py
+  hil/test_cli.py hil/test_data.py hil/test_stage1.py hil/test_stage2.py \
+  hil/test_rollout_gated.py
 ```

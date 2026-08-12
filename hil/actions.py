@@ -50,6 +50,17 @@ def action_from_target(
     return action
 
 
+def target_from_action(start_pose: Sequence[float], action: Sequence[float]) -> np.ndarray:
+    """Apply one canonical 7D action and return its six-dimensional TCP target."""
+    start = _pose6(start_pose, "start_pose")
+    value = np.asarray(action, dtype=np.float64)
+    if value.shape != (ACTION_DIM,) or not np.all(np.isfinite(value)):
+        raise ValueError(f"action must contain {ACTION_DIM} finite values, got {value!r}")
+    relative = Rotation.from_rotvec(value[3:6])
+    end_rotation = relative * Rotation.from_rotvec(start[3:6])
+    return np.concatenate((start[:3] + value[:3], end_rotation.as_rotvec()))
+
+
 def quat_wxyz_from_rotvec(rotvec: Sequence[float]) -> np.ndarray:
     """Convert a UR rotation vector to dataset quaternion order ``[w,x,y,z]``."""
     xyzw = Rotation.from_rotvec(np.asarray(rotvec, dtype=np.float64)).as_quat()

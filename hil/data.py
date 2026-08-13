@@ -9,7 +9,13 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from .constants import ACTION_DIM, ACTION_MEANING, ACTION_SCHEMA, GRIPPER_LABEL_MEANING
+from .constants import (
+    ACTION_DIM,
+    ACTION_MEANING,
+    ACTION_SCHEMA,
+    GRIPPER_LABEL_MEANING,
+    INTERVENTION_LABEL_SCHEMA,
+)
 
 
 OBS_KEYS = (
@@ -126,6 +132,13 @@ class CorrectionHDF5Writer:
                 "cannot append binary gripper labels to an existing dataset with "
                 f"gripper_labels={existing_gripper_labels!r}; write a new output file"
             )
+        existing_intervention_schema = meta.attrs.get("intervention_label_schema")
+        if len(self.data) and existing_intervention_schema != INTERVENTION_LABEL_SCHEMA:
+            self.file.close()
+            raise ValueError(
+                "cannot append active-motion intervention labels to an existing dataset with "
+                f"intervention_label_schema={existing_intervention_schema!r}; write a new output file"
+            )
 
         identity = {
             "dataset_type": "hil_gated_residual",
@@ -138,6 +151,11 @@ class CorrectionHDF5Writer:
             "wrist_camera_serial": str(args.wrist_cam_serial),
             "image_height": self.image_shape[0],
             "image_width": self.image_shape[1],
+            "intervention_label_schema": INTERVENTION_LABEL_SCHEMA,
+            "intervention_translation_deadband_m": float(
+                args.intervention_translation_deadband
+            ),
+            "intervention_rz_deadband_rad": float(args.intervention_rz_deadband),
         }
         for key, expected in identity.items():
             if key in meta.attrs and meta.attrs[key] != expected:
@@ -159,8 +177,17 @@ class CorrectionHDF5Writer:
         meta.attrs["executed_actions_meaning"] = (
             "VR action while side grip is held, otherwise base_policy_actions"
         )
-        meta.attrs["intervene_mask_meaning"] = "Quest side-grip held; explicit full-control takeover"
-        meta.attrs["manual_control_mask_meaning"] = "same as intervene_mask for momentary VR takeover"
+        meta.attrs["intervene_mask_meaning"] = (
+            "Quest side-grip held and executed VR XYZ/RZ exceeds its deadband, "
+            "or a front-trigger gripper-toggle edge occurred"
+        )
+        meta.attrs["manual_control_mask_meaning"] = (
+            "Quest side-grip held; explicit full-control takeover regardless of correction activity"
+        )
+        meta.attrs["residual_targets_meaning"] = (
+            "arm executed-base only on active arm correction; gripper executed-base only on toggle edge; "
+            "zero otherwise"
+        )
         meta.attrs["gripper_label_schema"] = "binary_executed_state_v1"
         meta.attrs["gripper_labels"] = GRIPPER_LABEL_MEANING
         meta.attrs["gripper_encoding"] = "open=-1, close=+1"

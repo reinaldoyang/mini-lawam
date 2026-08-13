@@ -15,7 +15,7 @@ The Quest side grip then selects who controls the robot:
 
 ```text
 side grip released -> execute Mini-LaWAM action
-side grip held     -> execute VR target and record human - Mini-LaWAM residual
+side grip held     -> execute VR target with full manual ownership
 side grip released -> resume Mini-LaWAM from the last VR command target
 ```
 
@@ -23,10 +23,12 @@ The existing Quest APK protocol is used unchanged. In that protocol `grip` is
 the selected controller's side-grip signal. The front index trigger toggles the
 gripper while VR owns control.
 
-Every side-grip-held frame has `manual_control_mask=True` and
-`intervene_mask=True`. Holding the grip still is therefore an intentional
-correction: it tells the future gate that the policy should not move at that
-observation.
+Following the `lapa_kunn/real_world/hil` labeling logic, ownership and active
+correction are separate. Every side-grip-held frame has
+`manual_control_mask=True`, but `intervene_mask=True` only when the executed VR
+XYZ/RZ step exceeds its configured deadband or the front trigger produces a
+gripper-toggle edge. The robot remains fully under VR control while the grip is
+held even when `intervene_mask=False`.
 
 When requested, the autonomous branch uses the same temporal ensemble,
 gripper-open lookahead/latch, target EMA/deadband, command-relative joystick
@@ -74,7 +76,9 @@ CUDA_VISIBLE_DEVICES=0 python3 -m hil.collect_corrections \
   --wrist-cam-serial 252122300792 \
   --train-frame-hw 240 320 \
   --action-scale 1.0 \
-  --enable-rz
+  --enable-rz \
+  --output-dir dataset/hil_mini_lawam_vr_active_dry_run \
+  --output-file dry_run_active_v2.hdf5
 ```
 
 Check the axis mapping, side-grip handoff, RZ sign, gripper toggle, workspace,
@@ -92,6 +96,7 @@ CUDA_VISIBLE_DEVICES=0 python3 -m hil.collect_corrections \
   --table-exposure 180 --table-gain 16 \
   --wrist-exposure 100 --wrist-gain 16 \
   --train-frame-hw 240 320 \
+  --image-height 256 --image-width 256 \
   --robot-ip 140.96.93.7 \
   --execute --use-gripper-control \
   --temporal-ensemble --te-m 0.2 \
@@ -101,15 +106,17 @@ CUDA_VISIBLE_DEVICES=0 python3 -m hil.collect_corrections \
   --max-linear-speed 0.2 \
   --rz-scale -1.0 \
   --max-angular-speed 0.5 \
+  --intervention-translation-deadband 0.0005 \
+  --intervention-rz-deadband 0.002 \
   --max-reach 0.015 \
   --ws-min -0.165 -0.164 0.158 \
   --ws-max 0.54 0.63 0.518 \
   --servol-max-pos-step 0.002 \
   --servol-max-rot-step 0.005 \
-  --show-camera --show-subgoal \
-  --subgoal-update-steps 8 \
+  --show-camera \
   --action-scale 1.0 --enable-rz \
-  --output-dir dataset/hil_mini_lawam_vr
+  --output-dir dataset/hil_mini_lawam_vr_active \
+  --output-file hil_corrections_active_v2.hdf5
 ```
 
 `--max-reach` and `--max-target-lead` are aliases in this collector. The
@@ -118,6 +125,12 @@ rollout. Their HIL defaults match the VR demonstration recorder (`1.2`
 position scale, `0.2 m/s` linear limit, `-1.0` RZ scale, and `0.5 rad/s`
 angular limit). The `--vr-*` spellings and recorder spellings shown above are
 aliases.
+
+The intervention deadbands affect labels only; they do not suppress or scale
+VR robot commands. A gripper toggle is always labeled as a correction while VR
+owns control. Use the separate `hil_mini_lawam_vr_active` output so these
+active-input labels are not mixed with older files where every held frame was
+positive. The writer also refuses to append this schema to an old file.
 
 Robot motion requires the literal `--execute` flag. A stale Quest stream stops
 the servo worker and saves the valid partial episode with outcome
@@ -157,8 +170,11 @@ data/demo_N/
 
 Actions use forward commanded-pose deltas:
 `[dx,dy,dz,dRx,dRy,dRz,gripper]`, with metres, radians, and gripper
-`-1=open/+1=close`. `residual_targets` is exactly zero outside takeover and is
-`executed_actions - base_policy_actions` while the side grip is held.
+`-1=open/+1=close`. `manual_control_mask` records VR ownership.
+`intervene_mask` records active VR motion or a gripper-toggle edge. Arm
+`residual_targets` is `executed_actions - base_policy_actions` only on active
+arm-correction frames; its gripper channel is populated only on toggle frames,
+and all other residual components are zero.
 
 Inspect these values frame by frame with:
 
@@ -216,11 +232,34 @@ third no-change class. The loader derives this target from `executed_actions`,
 which also makes previously collected HDF5 files usable without recollection.
 
 Train the two Stage 1 heads with:
+first run with the deterministic output with one frame context first, and check if the validation is better
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m hil.train_stage1 \
+  --data-dir dataset/hil_mini_lawam_vr_active/hil_corrections_active_v2.hdf5 \
+  --output-dir results/hil/mini_lawam_stage1_active_v2_det_ctx1_xyz005 \
+  --epochs 100 \
+  --batch-size 8 \
+  --num-workers 8 \
+  --residual-samples intervention_only \
+  --split-unit demo \
+  --low-dim-mode image_bc_xyz_rz_grip \
+  --image-encoder resnet18_spatial \
+  --image-pretrained \
+  --freeze-image-backbone \
+  --spatial-keypoints 32 \
+  --temporal-context 1 \
+  --action-head-type deterministic \
+  --gripper-loss-weight 0.01 \
+  --selection-metric arm_physical_mae \
+  --max-xyz-residual-per-step 0.005 \
+  --max-rz-residual-per-step 0.05
+```
+
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m hil.train_stage1 \
-  --data-dir dataset/hil_mini_lawam_vr/hil_corrections_24ep_256.hdf5 \
-  --output-dir results/hil/mini_lawam_stage1_xyz_rz_grip_gmm_xyz005 \
+  --data-dir dataset/hil_mini_lawam_vr_active/hil_corrections_active_v2.hdf5 \
+  --output-dir results/hil/mini_lawam_stage1_active_v2_gmm_xyz005 \
   --epochs 100 \
   --batch-size 8 \
   --num-workers 8 \
@@ -265,18 +304,19 @@ gate class 1 = apply the Stage 1 arm/gripper correction
 ```
 
 Unlike Stage 1, Stage 2 uses every frame. Its target is `intervene_mask`, which
-is true whenever the Quest side grip was held. To prevent the much more common
-non-intervention frames from dominating training, every positive is retained
-and negatives are randomly retained at the positive rate of each batch.
+is true for active VR motion or a gripper-toggle edge while the side grip is
+held. To prevent the much more common non-intervention frames from dominating
+training, every positive is retained and negatives are randomly retained at
+the positive rate of each batch.
 
 Train Stage 2 with the same seed, validation fraction, and demo split used by
 Stage 1:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m hil.train_stage2 \
-  --data-dir dataset/hil_mini_lawam_vr/hil_corrections_24ep_256.hdf5 \
-  --stage1-checkpoint results/hil/mini_lawam_stage1_xyz_rz_grip/residual_stage1.pt \
-  --output-dir results/hil/mini_lawam_stage2_gate \
+  --data-dir dataset/hil_mini_lawam_vr_active/hil_corrections_active_v2.hdf5 \
+  --stage1-checkpoint results/hil/mini_lawam_stage1_active_v2_gmm_xyz005/residual_stage1.pt \
+  --output-dir results/hil/mini_lawam_stage2_gate_active_v2 \
   --epochs 50 \
   --batch-size 8 \
   --num-workers 8 \
@@ -304,13 +344,13 @@ after checking the camera inputs, gate transitions, residuals, and workspace:
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 -m hil.rollout_gated \
   --ckpt results/mini_lawam/checkpoint/vr_controller/ckpt_new_vr_teleop_egg_rz_103ep_256_attn_rz_binary_grip_t1.pt \
-  --stage2-checkpoint results/hil/mini_lawam_stage2_gate/residual_gate_stage2.pt \
+  --stage2-checkpoint results/hil/mini_lawam_stage2_gate_active_v2/residual_gate_stage2.pt \
   --table-cam-serial 244422300964 \
   --wrist-cam-serial 252122300792 \
   --table-exposure 180 --table-gain 16 \
   --wrist-exposure 100 --wrist-gain 16 \
   --train-frame-hw 240 320 \
-  --correction-source-frame-hw 168 224 \
+  --correction-source-frame-hw 256 256 \
   --correction-frame-hw 256 256 \
   --robot-ip 140.96.93.7 \
   --use-gripper-control \

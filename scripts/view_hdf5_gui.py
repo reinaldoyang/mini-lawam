@@ -218,7 +218,10 @@ class HDF5Viewer:
             f"frame: {t}/{self.num_frames - 1}",
         ]
 
-        if self.intervene_mask is not None:
+        if self.manual_control_mask is not None:
+            manual = bool(self.manual_control_mask[t])
+            lines.append(f"owner: {'VR' if manual else 'BASE POLICY'}")
+        elif self.intervene_mask is not None:
             intervention = bool(self.intervene_mask[t])
             lines.append(f"owner: {'VR INTERVENTION' if intervention else 'BASE POLICY'}")
         lines.append("")
@@ -243,7 +246,7 @@ class HDF5Viewer:
                 lines.append("human_vr_action:")
                 lines.append(f"  {fmt(self.human_actions[t])}")
             if self.residual_targets is not None:
-                lines.append("residual_target (executed - base policy):")
+                lines.append("masked residual_target:")
                 lines.append(f"  {fmt(self.residual_targets[t])}")
             if self.intervene_mask is not None:
                 lines.append(f"intervene_mask: {bool(self.intervene_mask[t])}")

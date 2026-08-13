@@ -122,6 +122,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAPPING_MATRIX.reshape(-1).tolist(),
         metavar=("M00", "M01", "M02", "M10", "M11", "M12", "M20", "M21", "M22"),
     )
+    quest.add_argument(
+        "--intervention-translation-deadband",
+        type=float,
+        default=0.0005,
+        help=(
+            "Minimum executed VR XYZ step norm, in metres, for a side-grip-held "
+            "frame to be labeled as an intervention."
+        ),
+    )
+    quest.add_argument(
+        "--intervention-rz-deadband",
+        type=float,
+        default=0.002,
+        help=(
+            "Minimum absolute executed VR RZ step, in radians, for a side-grip-held "
+            "frame to be labeled as an intervention."
+        ),
+    )
 
     camera = parser.add_argument_group("cameras and display")
     camera.add_argument("--table-cam-serial", required=True)
@@ -218,6 +236,10 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("every --ws-min component must be smaller than --ws-max")
     if not np.isfinite(args.vr_rz_scale):
         parser.error("--vr-rz-scale/--rz-scale must be finite")
+    for name in ("intervention_translation_deadband", "intervention_rz_deadband"):
+        value = float(getattr(args, name))
+        if not np.isfinite(value) or value < 0.0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and non-negative")
     if not np.all(np.isfinite(args.vr_mapping_matrix)):
         parser.error("--vr-mapping-matrix must contain finite values")
     if not np.isfinite(args.action_scale) or args.action_scale < 0.0:
@@ -314,6 +336,27 @@ def draw_display(pygame, screen, font, args, wrist_rgb, table_rgb, status: str) 
 def binary_gripper_label(value: float, threshold: float) -> int:
     """Encode the executed gripper command as OPEN=0 or CLOSE=1."""
     return GRIPPER_CLOSE if gripper_state(value, threshold) > 0.0 else GRIPPER_OPEN
+
+
+def correction_activity(
+    human_action: np.ndarray,
+    *,
+    manual_control: bool,
+    gripper_toggled: bool,
+    translation_deadband: float,
+    rz_deadband: float,
+) -> tuple[bool, bool]:
+    """Return LAPA-style arm/gripper correction activity for one VR frame."""
+    action = np.asarray(human_action, dtype=np.float32)
+    if action.shape != (7,) or not np.all(np.isfinite(action)):
+        raise ValueError(f"human_action must be a finite (7,) array, got {action!r}")
+    if not manual_control:
+        return False, False
+    arm_active = bool(
+        np.linalg.norm(action[:3]) > float(translation_deadband)
+        or abs(float(action[5])) > float(rz_deadband)
+    )
+    return arm_active, bool(gripper_toggled)
 
 
 def main() -> None:
@@ -500,6 +543,7 @@ def main() -> None:
             output: Optional[VRControlOutput] = None
             takeover_started = False
             takeover_released = False
+            gripper_toggled = False
             for sample in samples:
                 output = clutch.update(
                     sample.pose,
@@ -509,6 +553,7 @@ def main() -> None:
                 )
                 takeover_started = takeover_started or output.started
                 takeover_released = takeover_released or output.released
+                gripper_toggled = gripper_toggled or output.gripper_toggled
             assert output is not None
             if takeover_started:
                 # Remove any policy target lead before human ownership begins.
@@ -551,11 +596,21 @@ def main() -> None:
             robot.queue_target(executed_target)
             robot.command_gripper(selected_gripper)
 
-            intervention = bool(output.active)
+            manual_control = bool(output.active)
+            arm_correction_active, gripper_correction_active = correction_activity(
+                human_action,
+                manual_control=manual_control,
+                gripper_toggled=gripper_toggled,
+                translation_deadband=args.intervention_translation_deadband,
+                rz_deadband=args.intervention_rz_deadband,
+            )
+            intervention = arm_correction_active or gripper_correction_active
             residual = np.zeros(7, dtype=np.float32)
             gripper_label = binary_gripper_label(executed_action[6], args.gripper_threshold)
-            if intervention:
-                residual = executed_action - base.action
+            if arm_correction_active:
+                residual[:6] = executed_action[:6] - base.action[:6]
+            if gripper_correction_active:
+                residual[6] = executed_action[6] - base.action[6]
 
             table_store = resize_for_storage(table_rgb, args.image_height, args.image_width)
             wrist_store = resize_for_storage(wrist_rgb, args.image_height, args.image_width)
@@ -574,7 +629,7 @@ def main() -> None:
                 human_action=human_action,
                 executed_action=executed_action,
                 residual_target=residual,
-                manual_control=intervention,
+                manual_control=manual_control,
                 intervention=intervention,
                 gripper_label=gripper_label,
                 timestamp=time.time(),
@@ -583,19 +638,20 @@ def main() -> None:
 
             if takeover_started:
                 print("[CONTROL] VR TAKEOVER — side grip held")
-            if output.gripper_toggled:
+            if gripper_toggled:
                 print(f"[CONTROL] VR gripper -> {int(output.gripper_state):+d}")
             if takeover_released:
                 print("[CONTROL] POLICY RESUMED — side grip released")
             if step_index % 10 == 0:
-                owner = "VR" if intervention else "POLICY"
+                owner = "VR" if manual_control else "POLICY"
                 print(
-                    f"[STEP {step_index:05d}] owner={owner} grip={int(robot.gripper_state):+d} "
+                    f"[STEP {step_index:05d}] owner={owner} correction={int(intervention)} "
+                    f"grip={int(robot.gripper_state):+d} "
                     f"base={np.array2string(base.action, precision=4, suppress_small=True)} "
                     f"exec={np.array2string(executed_action, precision=4, suppress_small=True)}"
                 )
             status = (
-                f"{'VR TAKEOVER' if intervention else 'POLICY'} | step={step_index} "
+                f"{'VR TAKEOVER' if manual_control else 'POLICY'} | step={step_index} "
                 f"corrections={sum(episode.intervene_mask)} grip={int(robot.gripper_state):+d}"
             )
             table_display = base.subgoal_overlay if base.subgoal_overlay is not None else table_rgb

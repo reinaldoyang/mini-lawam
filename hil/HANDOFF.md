@@ -103,20 +103,26 @@ For each recording step:
    action for the same observation as the human correction.
 5. Select the VR target while the side grip is held; otherwise select the
    Mini-LaWAM target.
-6. Queue the selected pose, command the selected gripper state, and append one
+6. Separate manual ownership from LAPA-style correction activity: meaningful
+   executed VR XYZ/RZ motion or a gripper-toggle edge sets `intervene_mask`.
+7. Queue the selected pose, command the selected gripper state, and append one
    aligned frame to the in-memory episode.
 
 Preserve these invariants:
 
-- Ownership is determined only by the explicit side-grip state. Never infer
-  intervention from `executed_action != base_policy_action`.
-- A held side grip with zero human movement is still a positive intervention
-  and may intentionally teach a zero residual.
+- Ownership is determined only by the explicit side-grip state and is stored
+  in `manual_control_mask`. Never infer ownership from action differences.
+- `intervene_mask` follows the reference LAPA HIL semantics: it is positive
+  only while manually owned and meaningful executed VR XYZ/RZ motion or a
+  front-trigger gripper-toggle edge is present. Deadbands filter Quest jitter.
+- A held, stationary side grip retains full VR control but is not Stage 1/2
+  correction supervision.
 - The base policy must continue from the last manual target after release.
   `policy.commit_manual_target()` and the shared `command_pose` provide this
   re-anchoring.
-- `residual_targets` is zero outside intervention. During intervention it is
-  exactly `executed_actions - base_policy_actions`.
+- Arm `residual_targets[:6]` is executed minus base only on active arm frames.
+  The gripper residual is populated only on toggle-edge frames; all other
+  residual components are zero.
 - Roll and pitch remain locked. The stored canonical action is 7D, but the
   learned arm correction uses only indices `(0, 1, 2, 5)` = XYZ/RZ.
 - Gripper commands are exact states: `-1=open`, `+1=close`. Training labels are
@@ -164,12 +170,18 @@ Canonical action order:
 The essential per-frame relationship is:
 
 ```python
-if intervene_mask[k]:
+if manual_control_mask[k]:
     executed_actions[k] = human_delta_actions[k]
-    residual_targets[k] = executed_actions[k] - base_policy_actions[k]
 else:
     executed_actions[k] = base_policy_actions[k]
-    residual_targets[k] = 0
+
+residual_targets[k] = 0
+if active_vr_arm_motion[k]:
+    residual_targets[k, :6] = executed_actions[k, :6] - base_policy_actions[k, :6]
+if vr_gripper_toggle[k]:
+    residual_targets[k, 6] = executed_actions[k, 6] - base_policy_actions[k, 6]
+
+intervene_mask[k] = active_vr_arm_motion[k] or vr_gripper_toggle[k]
 ```
 
 Important names:
@@ -179,9 +191,9 @@ Important names:
 - `executed_actions`: selected command; VR during takeover, otherwise base.
 - `human_delta_actions`: the VR forward-command action during takeover. Away
   from takeover its motion channels are zero and its gripper value is the
-  observed state; use `intervene_mask` before interpreting it as a correction.
-- `intervene_mask`: authoritative side-grip ownership label.
-- `manual_control_mask`: currently identical to `intervene_mask`.
+  observed state; use `manual_control_mask` before interpreting ownership.
+- `intervene_mask`: active VR arm motion or gripper-toggle supervision label.
+- `manual_control_mask`: authoritative side-grip ownership label.
 - `gripper_labels`: binary absolute executed gripper state.
 - `obs/quest_controller`: raw
   `[px,py,pz,qx,qy,qz,qw,front_trigger,side_grip]`. A/B/X/Y are handled as
@@ -189,6 +201,10 @@ Important names:
 
 Compatibility:
 
+- New active-input files declare
+  `intervention_label_schema=vr_active_motion_or_gripper_edge_v2`. Older HDF5
+  files are not relabeled, and the writer refuses to append v2 episodes to
+  files lacking that exact label schema or using different deadbands.
 - New files use `base_policy_actions` and `obs/base_policy_action`.
 - `bc_actions`, `base_actions`, and `obs/bc_action` are HDF5 hard-link aliases,
   not duplicated arrays.
@@ -279,9 +295,10 @@ and gate logits. It does not itself compose or safety-clamp a robot target.
 
 1. Load Mini-LaWAM and Stage 2 and verify base checkpoint name, target mode,
    and action schema.
-2. Reproduce correction-image resizing (`640x480 -> 168x224 -> 256x256` for
-   the current converted training file), low-dimensional normalization,
-   temporal left-padding, and the checkpoint's GRU context.
+2. Reproduce correction-image resizing (`640x480 -> 256x256` for the new v2
+   collection; older converted checkpoints may require
+   `640x480 -> 168x224 -> 256x256`), low-dimensional normalization, temporal
+   left-padding, and the checkpoint's GRU context.
 3. Run Mini-LaWAM with the same rollout post-processing used during collection.
 4. Compute Stage 1 residual/gripper and Stage 2 gate from the same observation
    and safe base action.

@@ -43,6 +43,8 @@ def test_hdf5_writer_emits_gated_residual_schema(tmp_path) -> None:
         ckpt="model.pt",
         table_cam_serial="table",
         wrist_cam_serial="wrist",
+        intervention_translation_deadband=0.0005,
+        intervention_rz_deadband=0.002,
     )
     policy = SimpleNamespace(target_mode="joystick", include_rz=True)
 
@@ -65,5 +67,6 @@ def test_hdf5_writer_emits_gated_residual_schema(tmp_path) -> None:
         assert int(demo["gripper_labels"][0]) == 1
         assert dataset["meta"].attrs["gripper_label_schema"] == "binary_executed_state_v1"
         assert dataset["meta"].attrs["gripper_labels"] == "0=open, 1=close"
+        assert dataset["meta"].attrs["intervention_label_schema"] == "vr_active_motion_or_gripper_edge_v2"
         assert dataset["meta"].attrs["bc_actions_meaning"] == "compatibility alias of base_policy_actions"
         assert int(dataset["data"].attrs["total_interventions"]) == 1

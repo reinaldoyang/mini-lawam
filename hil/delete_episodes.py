@@ -176,6 +176,35 @@ def _staged_copy(
         raise
 
 
+def write_pruned_copy_atomic(
+    source_path: str | Path,
+    destination_path: str | Path,
+    removed: set[str],
+    *,
+    renumber: bool = False,
+    overwrite: bool = False,
+) -> dict[str, str]:
+    """Write a pruned copy and expose it only after the copy succeeds.
+
+    ``source_path`` and ``destination_path`` may be the same when ``overwrite``
+    is true. This is useful for updating a disposable working copy while an
+    original dataset is retained elsewhere.
+    """
+    source = Path(source_path).expanduser().resolve()
+    destination = Path(destination_path).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"input file does not exist: {source}")
+    if destination.exists() and not overwrite:
+        raise FileExistsError(f"output already exists: {destination}")
+
+    mapping, staged = _staged_copy(source, destination, removed, renumber=renumber)
+    try:
+        os.replace(staged, destination)
+    finally:
+        staged.unlink(missing_ok=True)
+    return mapping
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="List or remove data/demo_N episode groups from an HDF5 dataset."

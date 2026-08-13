@@ -5,7 +5,7 @@ import pytest
 
 h5py = pytest.importorskip("h5py")
 
-from hil.delete_episodes import copy_without_episodes, parse_episode_selectors
+from hil.delete_episodes import copy_without_episodes, parse_episode_selectors, write_pruned_copy_atomic
 
 
 def _make_dataset(path) -> None:
@@ -64,3 +64,17 @@ def test_copy_can_renumber_retained_episodes(tmp_path) -> None:
     with h5py.File(output, "r") as file:
         assert list(file["data"]) == ["demo_0", "demo_1"]
         assert file["data/demo_1/bc_actions"].shape == (4, 7)
+
+
+def test_atomic_copy_can_update_a_pruned_working_file(tmp_path) -> None:
+    source = tmp_path / "source.hdf5"
+    working = tmp_path / "source_pruned.hdf5"
+    _make_dataset(source)
+
+    write_pruned_copy_atomic(source, working, {"demo_0"})
+    write_pruned_copy_atomic(working, working, {"demo_2"}, overwrite=True)
+
+    with h5py.File(source, "r") as file:
+        assert list(file["data"]) == ["demo_0", "demo_1", "demo_2"]
+    with h5py.File(working, "r") as file:
+        assert list(file["data"]) == ["demo_1"]

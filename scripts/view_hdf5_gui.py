@@ -7,9 +7,10 @@ Switch frames with the Next/Prev buttons or the slider, and switch demos with
 the demo buttons. Arrow keys also work:
     left/right  -> previous/next frame
     up/down     -> next/previous demo
+    delete      -> delete the current demo after confirmation
 
 Example:
-    python data/view_hdf5_gui.py --input datasets/no_rotation_100.hdf5
+    python scripts/view_hdf5_gui.py --input datasets/no_rotation_100.hdf5
 """
 
 from __future__ import annotations
@@ -25,6 +26,16 @@ import matplotlib
 matplotlib.use("TkAgg")  # interactive backend; falls back below if unavailable
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, Slider
+
+try:
+    from hil.delete_episodes import write_pruned_copy_atomic
+except ModuleNotFoundError:
+    # Keep direct execution (python scripts/view_hdf5_gui.py) working even
+    # when only the script directory was placed on sys.path.
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from hil.delete_episodes import write_pruned_copy_atomic
 
 
 def natural_demo_key(name: str):
@@ -46,15 +57,22 @@ def first_dataset(group: h5py.Group, *names: str):
     return None
 
 
+def next_pruned_path(source: Path) -> Path:
+    """Return a non-existing sibling path for a recoverable pruned copy."""
+    candidate = source.with_name(f"{source.stem}_pruned{source.suffix}")
+    index = 2
+    while candidate.exists():
+        candidate = source.with_name(f"{source.stem}_pruned_{index}{source.suffix}")
+        index += 1
+    return candidate
+
+
 class HDF5Viewer:
     def __init__(self, path: str):
-        self.file = h5py.File(path, "r")
-        if "data" not in self.file:
-            raise KeyError("expected top-level group 'data'")
-        self.path = path
-        self.demos = sorted(self.file["data"].keys(), key=natural_demo_key)
-        if not self.demos:
-            raise ValueError("no demos found under 'data'")
+        self.original_path = Path(path).expanduser().resolve()
+        self.path = self.original_path
+        self.working_path: Path | None = None
+        self._open_file(self.path)
 
         self.demo_index = 0
         self.frame_index = 0
@@ -64,6 +82,21 @@ class HDF5Viewer:
         self._draw()
 
     # ---- data access -------------------------------------------------------
+    def _open_file(self, path: str | Path):
+        file = h5py.File(path, "r")
+        try:
+            if "data" not in file:
+                raise KeyError("expected top-level group 'data'")
+            demos = sorted(file["data"].keys(), key=natural_demo_key)
+            if not demos:
+                raise ValueError("no demos found under 'data'")
+        except BaseException:
+            file.close()
+            raise
+        self.file = file
+        self.path = Path(path).expanduser().resolve()
+        self.demos = demos
+
     def _load_demo(self, demo_index: int):
         self.demo_index = demo_index % len(self.demos)
         demo_name = self.demos[self.demo_index]
@@ -154,14 +187,20 @@ class HDF5Viewer:
             ("< frame", self._prev_frame),
             ("frame >", self._next_frame),
             ("demo >>", self._next_demo),
+            ("Delete demo", self._delete_demo),
         ]
         self.buttons = []
-        width = 0.09
-        gap = 0.01
-        start = 0.60
+        width = 0.075
+        gap = 0.008
+        start = 0.57
         for i, (label, cb) in enumerate(specs):
             ax = self.fig.add_axes([start + i * (width + gap), 0.03, width, 0.06])
-            btn = Button(ax, label)
+            colors = (
+                {"color": "#f4cccc", "hovercolor": "#e6b8b7"}
+                if label == "Delete demo"
+                else {}
+            )
+            btn = Button(ax, label, **colors)
             btn.on_clicked(cb)
             self.buttons.append(btn)
 
@@ -186,6 +225,75 @@ class HDF5Viewer:
     def _prev_demo(self, _event=None):
         self._change_demo(self.demo_index - 1)
 
+    def _delete_demo(self, _event=None):
+        from tkinter import messagebox
+
+        if len(self.demos) == 1:
+            messagebox.showwarning("Cannot delete episode", "The file must retain at least one episode.")
+            return
+
+        demo_name = self.demo_name
+        demo_index = self.demo_index
+        interventions = (
+            int(np.count_nonzero(self.intervene_mask[...])) if self.intervene_mask is not None else 0
+        )
+        manual_frames = (
+            int(np.count_nonzero(self.manual_control_mask[...]))
+            if self.manual_control_mask is not None
+            else 0
+        )
+        first_deletion = self.working_path is None
+        destination = next_pruned_path(self.path) if first_deletion else self.working_path
+        destination_note = (
+            f"\n\nThe original file will remain unchanged. The result will be saved as:\n{destination}"
+            if first_deletion
+            else f"\n\nThis will update the existing pruned copy:\n{destination}"
+        )
+        confirmed = messagebox.askyesno(
+            "Delete episode?",
+            f"Delete {demo_name}?\n"
+            f"Frames: {self.num_frames}\n"
+            f"Intervention frames: {interventions}\n"
+            f"Manual-control frames: {manual_frames}"
+            f"{destination_note}",
+            icon="warning",
+        )
+        if not confirmed:
+            return
+
+        source = self.path
+        self.file.close()
+        try:
+            write_pruned_copy_atomic(
+                source,
+                destination,
+                {demo_name},
+                overwrite=not first_deletion,
+            )
+            self._open_file(destination)
+        except Exception as exc:
+            try:
+                self._open_file(source)
+                self._load_demo(min(demo_index, len(self.demos) - 1))
+            except Exception:
+                pass
+            messagebox.showerror("Episode deletion failed", str(exc))
+            return
+
+        self.working_path = destination
+        self.frame_index = 0
+        self._load_demo(min(demo_index, len(self.demos) - 1))
+        self.slider.valmax = max(1, self.num_frames - 1)
+        self.slider.ax.set_xlim(0, self.slider.valmax)
+        self._sync_slider()
+        self.fig.canvas.manager.set_window_title(f"HDF5 Viewer - {self.path.name}")
+        self._draw(update_slider=False)
+        messagebox.showinfo(
+            "Episode deleted",
+            f"Deleted {demo_name}.\n\nPruned dataset:\n{self.path}\n\n"
+            f"Original retained:\n{self.original_path}",
+        )
+
     def _change_demo(self, new_index):
         self.frame_index = 0
         self._load_demo(new_index)
@@ -203,6 +311,8 @@ class HDF5Viewer:
             self._next_demo()
         elif event.key == "down":
             self._prev_demo()
+        elif event.key == "delete":
+            self._delete_demo()
 
     def _sync_slider(self):
         self.slider.eventson = False

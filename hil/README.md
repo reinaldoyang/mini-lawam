@@ -116,7 +116,7 @@ CUDA_VISIBLE_DEVICES=0 python3 -m hil.collect_corrections \
   --show-camera \
   --action-scale 1.0 --enable-rz \
   --output-dir dataset/hil_mini_lawam_vr_active \
-  --output-file hil_corrections_active_v2.hdf5
+  --output-file hil_corrections_active_v4.hdf5
 ```
 
 `--max-reach` and `--max-target-lead` are aliases in this collector. The
@@ -190,7 +190,14 @@ files containing only the `bc_actions` name are displayed the same way.
 
 ### Removing bad episodes
 
-First list the episode names and their frame/intervention counts:
+In the viewer, navigate to an unwanted episode and click **Delete demo** (or
+press the Delete key), then confirm. The first deletion creates a sibling file
+such as `corrections_pruned.hdf5` and leaves the original dataset untouched.
+Further deletions in that viewer session safely update the pruned copy shown in
+the window.
+
+For batch removal from a terminal, first list the episode names and their
+frame/intervention counts:
 
 ```bash
 python3 -m hil.delete_episodes dataset/hil_mini_lawam_vr/corrections.hdf5 --list

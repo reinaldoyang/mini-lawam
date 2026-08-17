@@ -79,6 +79,7 @@ robot's external safety systems.
 | `gated_policy.py` | Stage 2 checkpoint loading, temporal inference, gate hysteresis and action composition. |
 | `rollout_gated.py` | Separate gated Mini-LaWAM rollout and robot-control entrypoint. |
 | `delete_episodes.py` | Recoverable episode removal with aggregate-count repair. |
+| `analyze_hdf5.py` | Per-episode and aggregate correction-burst/takeover analysis. |
 | `test_*.py` | Focused hardware-free checks. |
 | `../scripts/view_hdf5_gui.py` | Frame viewer with HIL actions, residuals, masks and Quest state. |
 
@@ -399,13 +400,14 @@ Focused test command:
 python3 -m pytest \
   hil/test_actions.py hil/test_vr.py hil/test_policy.py hil/test_cli.py \
   hil/test_data.py hil/test_delete_episodes.py \
-  hil/test_stage1.py hil/test_stage2.py
+  hil/test_stage1.py hil/test_stage2.py hil/test_analyze_hdf5.py
 ```
 
 Useful inspection commands:
 
 ```bash
 python3 scripts/view_hdf5_gui.py --input PATH_TO_DATASET.hdf5
+python3 -m hil.analyze_hdf5 PATH_TO_DATASET.hdf5
 python3 -m hil.delete_episodes PATH_TO_DATASET.hdf5 --list
 ```
 

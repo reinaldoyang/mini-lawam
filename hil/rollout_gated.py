@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 from typing import Optional, Sequence
@@ -133,6 +134,23 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--auto-start", action="store_true", help="Start without waiting for the S key.")
     run.add_argument("--home-after-rollout", action="store_true")
     run.add_argument("--log-every", type=int, default=8)
+    run.add_argument(
+        "--trace-dir",
+        default=None,
+        help=(
+            "Save a summary JSON and the first table-camera frame for each rollout. "
+            "Trial numbering resumes from the highest trial_N already present."
+        ),
+    )
+    run.add_argument(
+        "--save-frames",
+        type=int,
+        default=0,
+        help=(
+            "Save table-camera frames every N control steps under --trace-dir "
+            "(0 disables periodic frame capture)."
+        ),
+    )
     return parser
 
 
@@ -193,6 +211,10 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--no-display requires --auto-start; stop a headless rollout with Ctrl-C")
     if args.gripper_open_lead_steps < 0:
         parser.error("--gripper-open-lead-steps must be non-negative")
+    if args.save_frames < 0:
+        parser.error("--save-frames must be non-negative")
+    if args.save_frames > 0 and not args.trace_dir:
+        parser.error("--save-frames requires --trace-dir")
     if not np.all(np.isfinite(args.locked_rotvec)):
         parser.error("--locked-rotvec must contain finite values")
 
@@ -327,6 +349,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cameras.start()
         robot.connect()
         pygame, screen, font, clock = _init_ui(args)
+        from mini_lawam.rollout_ur7e import (
+            format_duration_hms,
+            format_rollout_stem,
+            next_trace_trial_number,
+        )
+
+        trace_trial = next_trace_trial_number(args.trace_dir)
+        if args.trace_dir:
+            print(
+                f"[TRACE] next persistent trial number={trace_trial} "
+                f"(scanned {Path(args.trace_dir)})"
+            )
         quit_all = False
         rollout_index = 0
         while rollout_index < args.num_rollouts and not quit_all:
@@ -348,15 +382,31 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 if quit_all:
                     break
 
+            rollout_started_wall = time.time()
+            rollout_started_perf = time.perf_counter()
+            rollout_stem = format_rollout_stem(trace_trial, rollout_started_wall)
+            first_table_frame = None
+            frames_dir = None
+            if args.save_frames > 0 and args.trace_dir:
+                frames_dir = Path(args.trace_dir) / f"frames_{rollout_stem}"
+                frames_dir.mkdir(parents=True, exist_ok=True)
+                print(f"[FRAMES] saving every {args.save_frames} steps -> {frames_dir}")
+
             time.sleep(args.startup_wait_sec)
             base_policy.reset()
             correction_policy.reset()
             command_pose = robot.actual_pose()
+            initial_tcp = np.asarray(command_pose, dtype=np.float64).copy()
             robot.start_servo()
             robot.queue_target(command_pose)
-            print(f"[ROLLOUT] started index={rollout_index} from TCP={np.round(command_pose, 4)}")
+            print(
+                f"[ROLLOUT] started index={rollout_index} trace_trial={trace_trial} "
+                f"from TCP={np.round(command_pose, 4)}"
+            )
             stop_command: Optional[str] = None
             previous_gate = False
+            steps_executed = 0
+            gate_active_steps = 0
             period = 1.0 / float(args.control_hz)
 
             for step in range(args.max_steps):
@@ -367,6 +417,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     break
 
                 table_rgb, wrist_rgb = cameras.read_pair(max_age=args.camera_max_age)
+                if first_table_frame is None:
+                    first_table_frame = np.asarray(table_rgb).copy()
+                if frames_dir is not None and step % args.save_frames == 0:
+                    from PIL import Image
+
+                    Image.fromarray(table_rgb).save(
+                        frames_dir / f"{step:05d}_table.jpg",
+                        quality=92,
+                    )
                 robot_observation = robot.observation()
                 actual_pose = robot_observation["tcp_pose"]
                 observed_gripper = float(robot.gripper_state)
@@ -405,6 +464,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 robot.queue_target(executed_target)
                 robot.command_gripper(selected_gripper)
                 command_pose = np.asarray(executed_target, dtype=np.float64).copy()
+                steps_executed += 1
+                gate_active_steps += int(correction.active)
 
                 if correction.active != previous_gate:
                     print(
@@ -443,12 +504,74 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     print(f"[TIMING] step exceeded {period * 1000.0:.1f} ms control budget")
 
             robot.stop_servo()
-            print(f"[ROLLOUT] ended index={rollout_index} reason={stop_command or 'max_steps'}")
+            result = {
+                "end": "ended",
+                "home": "go_home",
+                "quit": "quit",
+            }.get(stop_command, "max_steps")
+            rollout_finished_wall = time.time()
+            duration_sec = round(time.perf_counter() - rollout_started_perf, 3)
+            print(
+                f"[ROLLOUT] ended index={rollout_index} reason={stop_command or 'max_steps'} "
+                f"duration={duration_sec:.3f}s"
+            )
+            # Complete safety-critical motion before any nonessential trace I/O.
             if stop_command == "home" or args.home_after_rollout:
                 _move_home(robot, pygame)
+            if args.trace_dir:
+                from PIL import Image
+
+                trace_dir = Path(args.trace_dir)
+                trace_dir.mkdir(parents=True, exist_ok=True)
+                first_table_path = None
+                if first_table_frame is not None:
+                    table_path = trace_dir / f"{rollout_stem}_table_cam_first.png"
+                    Image.fromarray(first_table_frame).save(table_path)
+                    first_table_path = table_path.as_posix()
+                    print(f"[FIRST FRAME] {table_path}")
+                summary = {
+                    "trial": trace_trial,
+                    "ckpt": str(Path(args.ckpt).expanduser().resolve()),
+                    "stage2_checkpoint": str(
+                        Path(args.stage2_checkpoint).expanduser().resolve()
+                    ),
+                    "execute": bool(args.execute),
+                    "result": result,
+                    "started_at": time.strftime(
+                        "%Y-%m-%dT%H:%M:%S%z",
+                        time.localtime(rollout_started_wall),
+                    ),
+                    "finished_at": time.strftime(
+                        "%Y-%m-%dT%H:%M:%S%z",
+                        time.localtime(rollout_finished_wall),
+                    ),
+                    "duration_sec": duration_sec,
+                    "duration_hms": format_duration_hms(duration_sec),
+                    "steps_executed": steps_executed,
+                    "gate_active_steps": gate_active_steps,
+                    "gate_active_fraction": (
+                        gate_active_steps / steps_executed if steps_executed else 0.0
+                    ),
+                    "gate_on_threshold": correction_policy.gate_threshold,
+                    "gate_off_threshold": correction_policy.gate_off_threshold,
+                    "temporal_context": correction_policy.config.temporal_context,
+                    "initial_tcp": initial_tcp.tolist(),
+                    "final_command_tcp": np.asarray(command_pose, dtype=float).tolist(),
+                    "first_table_frame": first_table_path,
+                    "periodic_frames_dir": (
+                        frames_dir.as_posix() if frames_dir is not None else None
+                    ),
+                }
+                summary_path = trace_dir / f"{rollout_stem}_summary.json"
+                summary_path.write_text(
+                    json.dumps(summary, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                print(f"[SUMMARY] {summary_path}")
             if stop_command == "quit":
                 quit_all = True
             rollout_index += 1
+            trace_trial += 1
     except KeyboardInterrupt:
         print("\n[INFO] interrupted")
     finally:

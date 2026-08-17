@@ -116,7 +116,7 @@ CUDA_VISIBLE_DEVICES=0 python3 -m hil.collect_corrections \
   --show-camera \
   --action-scale 1.0 --enable-rz \
   --output-dir dataset/hil_mini_lawam_vr_active \
-  --output-file hil_corrections_active_v4.hdf5
+  --output-file hil_corrections_active1.hdf5
 ```
 
 `--max-reach` and `--max-target-lead` are aliases in this collector. The
@@ -180,13 +180,29 @@ Inspect these values frame by frame with:
 
 ```bash
 python3 scripts/view_hdf5_gui.py \
-  --input dataset/hil_mini_lawam_vr/corrections.hdf5
+  --input dataset/hil_mini_lawam_vr_active/hil_corrections_32ep.hdf5
 ```
 
 For HIL files, the side panel shows the current controller owner, raw Quest
 controller vector, base-policy action, executed action, human VR action,
 residual target, intervention/manual masks, and binary gripper label. Older
 files containing only the `bc_actions` name are displayed the same way.
+
+### Analyze correction activity
+
+Report correction counts per episode and across the complete HDF5 file:
+
+```bash
+python3 -m hil.analyze_hdf5 \
+  dataset/hil_mini_lawam_vr_active/hil_corrections_30ep.hdf5
+```
+
+A `correction event` is one contiguous run of `intervene_mask=True`, not one
+individual 20 Hz frame. The report separately counts VR takeovers as contiguous
+`manual_control_mask=True` side-grip holds, because one takeover can contain
+several correction bursts separated by short pauses. Use `--summary-only` to
+hide episode rows, or `--json-output results/hil/correction_report.json` to
+save the complete report.
 
 ### Removing bad episodes
 
@@ -261,7 +277,6 @@ CUDA_VISIBLE_DEVICES=0 python -m hil.train_stage1 \
   --max-xyz-residual-per-step 0.005 \
   --max-rz-residual-per-step 0.05
 ```
-
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m hil.train_stage1 \
@@ -372,18 +387,56 @@ CUDA_VISIBLE_DEVICES=0 python3 -m hil.rollout_gated \
   --servol-max-rot-step 0.005 \
   --show-camera --show-subgoal \
   --subgoal-update-steps 8 \
+  --trace-dir results/hil/gated_rollout_traces \
   --action-scale 1.0 --enable-rz
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m hil.rollout_gated \
+  --ckpt results/mini_lawam/checkpoint/vr_controller/ckpt_new_vr_teleop_egg_rz_103ep_256_attn_rz_binary_grip_t1.pt \
+  --stage2-checkpoint results/hil/mini_lawam_stage2_gate/residual_gate_stage2.pt \
+  --table-cam-serial 244422300964 \
+  --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 \
+  --wrist-exposure 100 --wrist-gain 16 \
+  --train-frame-hw 240 320 \
+  --correction-source-frame-hw 256 256 \
+  --correction-frame-hw 256 256 \
+  --robot-ip 140.96.93.7 \
+  --use-gripper-control \
+  --temporal-ensemble --te-m 0.2 \
+  --gripper-open-lead-steps 0 \
+  --target-ema 1.0 --target-deadband 0.0 \
+  --gate-hysteresis 0.05 \
+  --max-reach 0.015 \
+  --ws-min -0.165 -0.164 0.158 \
+  --ws-max 0.54 0.63 0.518 \
+  --servol-max-pos-step 0.002 \
+  --servol-max-rot-step 0.005 \
+  --show-camera --show-subgoal \
+  --subgoal-update-steps 8 \
+  --action-scale 1.0 \
+  --num-rollouts 10 \
+  --trace-dir results/hil/gated_rollout_traces \
+  --execute \
+  --enable-rz
 ```
 
 Keyboard controls are `S=start`, `E=end`, `H=stop and home`, and `Q=quit`.
 Add `--execute` for real robot motion. The default gate threshold comes from
 the Stage 2 checkpoint; specifying `--gate-threshold` overrides it. Hysteresis
 keeps the gate active until its probability falls below `threshold - 0.05`.
+`--trace-dir` saves the initial table frame and a summary JSON for every
+rollout, using the same persistent `trial_N_TIMESTAMP` naming as Mini-LaWAM.
+The initial table image records the object's starting position. Optional
+`--save-frames 8` also saves the table frame every eight control steps, but
+may add control-loop latency; it is unnecessary when only the initial position
+is needed.
 
 Run the hardware-free tests with:
 
 ```bash
 python3 -m pytest hil/test_actions.py hil/test_vr.py hil/test_policy.py \
   hil/test_cli.py hil/test_data.py hil/test_stage1.py hil/test_stage2.py \
-  hil/test_rollout_gated.py
+  hil/test_rollout_gated.py hil/test_analyze_hdf5.py
 ```

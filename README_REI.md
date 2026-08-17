@@ -17,6 +17,15 @@ CUDA_VISIBLE_DEVICES="" /home/iclu200/miniconda3/envs/lawam/bin/python \
 python3 scripts/view_hdf5_gui.py --input /home/iclu200/reinaldoyang/LaWAM/dataset/multi_egg_114ep.hdf5
 ```
 
+to merge two hdf5 files into one, use the following command
+```bash
+python3 scripts/merge_hdf5.py \
+  --inputs \
+    dataset/hil_mini_lawam_vr_active/hil_corrections_active.hdf5 \
+    dataset/hil_mini_lawam_vr_active/hil_corrections_17ep.hdf5 \
+  --output dataset/hil_mini_lawam_vr_active/hil_corrections_34ep.hdf5
+```
+
 ### Convert data image observation size to 256
 ovx server path 
 ```bash
@@ -299,7 +308,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e_vr \
   --robot-ip 140.96.93.7 \
   --execute --use-gripper-control \
   --train-frame-hw 240 320 \
-  --temporal-ensemble --te-m 1.0 \
+  --exec-steps 8 \
   --gripper-open-lead-steps 0 \
   --target-ema 1.0 --target-deadband 0.0 \
   --max-reach 0.015 \
@@ -309,9 +318,12 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e_vr \
   --servol-max-rot-step 0.005 \
   --show-camera --show-subgoal \
   --subgoal-update-steps 8 \
+  --trace-dir results/mini_lawam/traces \
   --action-scale 1.0 \
   --enable-rz
 ```
+  --temporal-ensemble --te-m 1.0 \
+
 
 ## Evaluation
 ### Phase 1 evaluation

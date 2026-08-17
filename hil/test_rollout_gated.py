@@ -55,3 +55,24 @@ def test_rollout_defaults_match_current_checkpoints() -> None:
     assert args.gate_threshold is None
     assert args.gate_hysteresis == 0.05
     assert args.control_hz == 20.0
+    assert args.trace_dir is None
+    assert args.save_frames == 0
+
+
+def test_trace_capture_arguments_parse() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--table-cam-serial",
+            "table",
+            "--wrist-cam-serial",
+            "wrist",
+            "--trace-dir",
+            "results/hil/traces",
+            "--save-frames",
+            "8",
+        ]
+    )
+
+    assert args.trace_dir == "results/hil/traces"
+    assert args.save_frames == 8

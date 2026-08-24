@@ -11,6 +11,11 @@ a float "sampling weight"
 ## {nakename: [(data_name, sampling_weight, robot_type)] }
 DATASET_NAMED_MIXTURES = {
 
+    # Stage-1 LAM domain fine-tuning on the local UR7e demonstrations.
+    # Expected path: <data_root_dir>/ur_lam_finetune
+    "ur_lam_finetune": [
+        ("ur_lam_finetune", 1.0, "robomind_ur_1rgb"),
+    ],
     "custom_dataset": [
         ("custom_dataset_name", 1.0, "custom_robot_config"),
     ],

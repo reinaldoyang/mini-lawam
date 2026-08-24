@@ -1,0 +1,107 @@
+# Stage-1-only domain fine-tuning from the released LaWAM LAM checkpoint.
+# Architecture and losses match lam_release/dino_large_vae.yaml. The local
+# batch size is reduced for one 32 GB GPU while gradient accumulation preserves
+# the released effective batch size of 64.
+
+seed_everything: 42
+
+model:
+  pretrained_ckpt: latent_action_model/logs/dino_large_vae/lam_release/checkpoints/pytorch_model.pt
+  vision_model_id: weights/dinov3-vitb16-pretrain-lvd1689m
+  dim: 1024
+  enc_layers: 24
+  ffn_expansion_factor: 4
+  num_heads: 16
+  max_state_dim: 14
+  num_embodiments: 32
+  codebook_size: 32
+  code_dim: 32
+  num_queries: 1
+  num_frames: 2
+  image_hw: [256, 256]
+  patch_size: 16
+  image_aug: true
+  dual_view_aug: true
+  dec_layers: 12
+  dropout: 0.0
+  # The released 10k-step warmup exceeds this shorter domain-finetuning run.
+  warmup_steps: 500
+  enc_add_state: false
+  enc_modal_mask: true
+  lambda_aux: 1.0
+  loss_type: smooth_l1
+  state_loss_type: l2
+  latent_layer_to_use: -2
+  multi_input: false
+  norm_latents: true
+  norm_latents_type: ln
+  lambda_diversity: 0.0
+  vq_type: vae
+  vq_kwargs:
+    layer_norm: true
+  project: lam
+  task_name: ur_lam_finetune_lr1e5
+  wandb_offline: true
+  optimizer:
+    class_path: torch.optim.AdamW
+    init_args:
+      lr: 1.0e-5
+      weight_decay: 1.0e-2
+  exclude_bias_norm_from_wd: true
+  make_data_pair: false
+  output_dir: output_pairs
+
+data:
+  data_root_dir: dataset
+  data_mix: ur_lam_finetune
+  video_backend: pyav
+  preferred_video_key: video.camera_top
+  # The converter maps the latched command into state.gripper because the
+  # robomimic source has no measured gripper position.
+  state_keys:
+    - state.end_effector_position
+    - state.eef_orientation_rotvec
+    - state.gripper
+  num_frames: 2
+  image_hw: [256, 256]
+  frame_dt_sec: 1.6
+  batch_size: 2
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: false
+  persistent_workers: false
+  in_order: false
+  debug_repeat_batch: false
+  val_tail_ratio: 0.1
+  max_state_dim: 14
+
+trainer:
+  max_epochs: 10
+  accelerator: gpu
+  devices: auto
+  strategy: ddp_find_unused_parameters_false
+  accumulate_grad_batches: 32
+  precision: bf16-mixed
+  log_every_n_steps: 10
+  gradient_clip_val: 1.0
+  val_check_interval: 1.0
+  num_sanity_val_steps: 0
+  limit_val_batches: 1.0
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints
+        monitor: val_loss
+        mode: min
+        verbose: true
+        save_last: true
+        save_top_k: 3
+        save_on_train_epoch_end: true
+        every_n_epochs: 1
+        filename: "epoch={epoch:02d}-val_loss={val_loss:.5f}"
+    - class_path: latent_action_model.core.lam_lightinng.SaveConfigToCheckpointCallback
+  logger:
+    - class_path: lightning.pytorch.loggers.TensorBoardLogger
+      init_args:
+        save_dir: latent_action_model/logs
+        name: ur_lam_finetune_lr1e5

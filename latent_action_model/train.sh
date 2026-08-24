@@ -29,7 +29,7 @@ export TORCH_NCCL_TIMEOUT=720000
 
 
 # CONFIG_FILE="config/lam-vjepa_large.yaml"
-DEFAULT_CONFIG_FILE="${REPO_ROOT_DIR}/latent_action_model/config/dino_base_ae.yaml"
+DEFAULT_CONFIG_FILE="${REPO_ROOT_DIR}/latent_action_model/config/dino_base_vae.yaml"
 TIMESTAMP="$(date +%m%d_%H%M%S)"
 LOG_DIR="${REPO_ROOT_DIR}/latent_action_model/logs/train_logs/${TIMESTAMP}"
 
@@ -37,8 +37,8 @@ LOG_FILE="${LOG_DIR}/train_logs.log"
 
 CKPT_PATH="${CKPT_PATH:-}"
 
-export WANDB_API_KEY="8d44fb58134f3f96e048d943a2543c51ff4f1d09"
 export WANDB_DIR="${REPO_ROOT_DIR}/latent_action_model"
+# Set WANDB_API_KEY in the calling environment when online logging is desired.
 
 # export WANDB_MODE="offline"
 
@@ -115,19 +115,19 @@ else
     echo "⚠️ Config file not found: ${LAM_CONFIG_PATH}" >&2
 fi
 
-if command -v nvidia-smi &> /dev/null; then
-    NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)
-else
-    NUM_GPUS=$(python -c "import torch; print(torch.cuda.device_count())")
+NUM_GPUS=$(python -c "import torch; print(torch.cuda.device_count())")
+if [[ "${NUM_GPUS}" -lt 1 ]]; then
+    echo "❌ No CUDA devices are visible to PyTorch." >&2
+    exit 1
 fi
 echo "🖥️ Detected GPU count: ${NUM_GPUS}"
 
-torchrun --nproc_per_node ${NUM_GPUS} \
+torchrun --nproc_per_node "${NUM_GPUS}" \
          -m latent_action_model.main fit \
          ${CONFIG_CLI} \
          ${CKPT_PATH:+--ckpt_path ${CKPT_PATH}} \
          "$@" \
-         2>&1 | tee -a ${LOG_FILE}
+         2>&1 | tee -a "${LOG_FILE}"
 
 if [ -f "${LOG_FILE}" ]; then
     echo "✅ Training log saved to: ${LOG_FILE}"

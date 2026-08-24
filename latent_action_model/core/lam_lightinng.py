@@ -11,6 +11,7 @@ import lightning.pytorch as pl
 OptimizerCallable = Callable[[Iterable], Optimizer]
 import wandb
 from .lam_model import LatentLAMModel
+from .checkpoint import load_pretrained_weights
 import logging
 logging.basicConfig(format='%(message)s', level=logging.INFO)
 import os
@@ -67,6 +68,7 @@ class VJEPA_LAM(LightningModule):
         image_aug: bool = True,
         dual_view_aug: bool = False,
         decoder_last_ln: bool = True,
+        pretrained_ckpt: Optional[str] = None,
         **kwargs
     ):
         super().__init__()
@@ -111,6 +113,18 @@ class VJEPA_LAM(LightningModule):
             patch_size=self.patch_size,
             decoder_last_ln=decoder_last_ln,
         )
+
+        self.pretrained_ckpt = pretrained_ckpt
+        if self.pretrained_ckpt:
+            loaded_count = load_pretrained_weights(
+                self,
+                self.pretrained_ckpt,
+                strict=True,
+            )
+            print(
+                f"[pretrained] loaded {loaded_count} model tensors from "
+                f"{self.pretrained_ckpt} (weights only; optimizer/trainer state reset)"
+            )
 
 
         

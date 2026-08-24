@@ -41,7 +41,10 @@ model:
     layer_norm: true
   project: lam
   task_name: ur_lam_finetune_lr1e5
-  wandb_offline: true
+  wandb_offline: false
+  # Use Lightning's W&B logger below so train and validation metrics follow the
+  # same logging path. This prevents duplicate manual W&B records.
+  enable_manual_wandb: false
   optimizer:
     class_path: torch.optim.AdamW
     init_args:
@@ -105,3 +108,12 @@ trainer:
       init_args:
         save_dir: latent_action_model/logs
         name: ur_lam_finetune_lr1e5
+    - class_path: lightning.pytorch.loggers.WandbLogger
+      init_args:
+        project: lawam-stage1-lam
+        name: ur_lam_finetune_lr1e5
+        save_dir: latent_action_model
+        # train.sh defaults WANDB_MODE to offline; set WANDB_MODE=online after
+        # `wandb login` when live dashboard logging is desired.
+        offline: false
+        log_model: false

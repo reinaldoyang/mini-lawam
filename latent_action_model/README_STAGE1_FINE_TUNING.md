@@ -208,7 +208,7 @@ Validate the released checkpoint on the held-out part of the converted dataset:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-LAM_ENABLE_MANUAL_WANDB=0 \
+WANDB_MODE=offline \
 python -m latent_action_model.main validate \
   --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml
 ```
@@ -222,7 +222,7 @@ Use Lightning's fast-development mode before committing to a full run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-LAM_ENABLE_MANUAL_WANDB=0 \
+WANDB_MODE=offline \
 python -m latent_action_model.main fit \
   --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
   --trainer.fast_dev_run=true
@@ -237,7 +237,6 @@ Start with the `1e-5` run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-LAM_ENABLE_MANUAL_WANDB=0 \
 bash latent_action_model/train.sh \
   --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml
 ```
@@ -246,7 +245,6 @@ After reviewing that run, optionally launch the `3e-5` comparison:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-LAM_ENABLE_MANUAL_WANDB=0 \
 bash latent_action_model/train.sh \
   --config latent_action_model/config/ur_lam_finetune_lr3e5.yaml
 ```
@@ -256,13 +254,13 @@ to use GPUs 0 and 1:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
-LAM_ENABLE_MANUAL_WANDB=0 \
 bash latent_action_model/train.sh \
   --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml
 ```
 
-The supplied commands disable the model's manual W&B logger. TensorBoard
-logging and checkpointing remain enabled.
+The fine-tuning configurations use Lightning loggers for both TensorBoard and
+W&B. The older manual W&B path is disabled to prevent duplicate metrics and
+runs.
 
 ## 8. Monitor training and find checkpoints
 
@@ -272,6 +270,44 @@ Start TensorBoard from another terminal:
 conda activate lawam
 tensorboard --logdir latent_action_model/logs
 ```
+
+### Weights & Biases
+
+Both fine-tuning configurations log the following metrics to the W&B project
+`lawam-stage1-lam`:
+
+- `train_loss`, `train/recon_loss`, `train/state_loss`, and `train/lr`
+- `val_loss`, `val/recon_loss`, and `val/state_loss`
+
+`train.sh` defaults to `WANDB_MODE=offline`, so a login or network connection is
+not required and an outage cannot stop training. Offline runs are stored under:
+
+```text
+latent_action_model/wandb/
+```
+
+When connectivity is available, upload an offline run with:
+
+```bash
+wandb login
+wandb sync latent_action_model/wandb/offline-run-*
+```
+
+For live dashboard logging during training, authenticate first and override the
+default mode:
+
+```bash
+wandb login
+
+WANDB_MODE=online \
+CUDA_VISIBLE_DEVICES=0 \
+bash latent_action_model/train.sh \
+  --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml
+```
+
+Never put a W&B API key in `train.sh` or a YAML file. Use `wandb login` or an
+environment variable. Model checkpoint upload is disabled because each LAM
+checkpoint is several gigabytes; local checkpoint saving remains enabled.
 
 The two experiments write checkpoints to separate directories:
 
@@ -290,7 +326,7 @@ validation split:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-LAM_ENABLE_MANUAL_WANDB=0 \
+WANDB_MODE=offline \
 python -m latent_action_model.main validate \
   --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
   --model.pretrained_ckpt "/path/to/best.ckpt"
@@ -307,7 +343,7 @@ scheduler, epoch, and global step:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-LAM_ENABLE_MANUAL_WANDB=0 \
+WANDB_MODE=offline \
 CKPT_PATH="latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/last.ckpt" \
 bash latent_action_model/train.sh \
   --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml

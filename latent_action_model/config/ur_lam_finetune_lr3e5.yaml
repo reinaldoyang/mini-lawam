@@ -38,7 +38,8 @@ model:
     layer_norm: true
   project: lam
   task_name: ur_lam_finetune_lr3e5
-  wandb_offline: true
+  wandb_offline: false
+  enable_manual_wandb: false
   optimizer:
     class_path: torch.optim.AdamW
     init_args:
@@ -100,3 +101,10 @@ trainer:
       init_args:
         save_dir: latent_action_model/logs
         name: ur_lam_finetune_lr3e5
+    - class_path: lightning.pytorch.loggers.WandbLogger
+      init_args:
+        project: lawam-stage1-lam
+        name: ur_lam_finetune_lr3e5
+        save_dir: latent_action_model
+        offline: false
+        log_model: false

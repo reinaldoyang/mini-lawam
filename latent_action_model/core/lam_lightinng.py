@@ -46,6 +46,7 @@ class VJEPA_LAM(LightningModule):
         project: str = 'UniVLA-latent_action_model',
         task_name: str = 'vjepa_lam',
         wandb_offline: bool = False,
+        enable_manual_wandb: bool = True,
         optimizer: OptimizerCallable = torch.optim.AdamW,
         weight_decay: float = 0.01,
         exclude_bias_norm_from_wd: bool = False,
@@ -142,7 +143,10 @@ class VJEPA_LAM(LightningModule):
         self._wandb_project = project
         self._wandb_task_name = task_name
         self._wandb_mode = "offline" if wandb_offline else "online"
-        self._manual_wandb_enabled = os.environ.get("LAM_ENABLE_MANUAL_WANDB", "1") != "0"
+        self._manual_wandb_enabled = (
+            bool(enable_manual_wandb)
+            and os.environ.get("LAM_ENABLE_MANUAL_WANDB", "1") != "0"
+        )
         self._wandb_initialized = False
 
         self.loss_type = loss_type
@@ -784,7 +788,7 @@ class VJEPA_LAM(LightningModule):
         self.log_dict(
             {**{"train_loss": loss}, **{f"train/{k}": v for k, v in aux_losses.items()}},
             prog_bar=True,
-            logger=False,
+            logger=True,
             on_step=True,
             on_epoch=False,
             sync_dist=False

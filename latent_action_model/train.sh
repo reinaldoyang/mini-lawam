@@ -39,8 +39,9 @@ CKPT_PATH="${CKPT_PATH:-}"
 
 export WANDB_DIR="${REPO_ROOT_DIR}/latent_action_model"
 # Set WANDB_API_KEY in the calling environment when online logging is desired.
-
-# export WANDB_MODE="offline"
+# Default to local W&B logging so network interruptions cannot stop training.
+# Override with WANDB_MODE=online after running `wandb login` for live logging.
+export WANDB_MODE="${WANDB_MODE:-offline}"
 
 HAS_USER_CONFIG=false
 for arg in "$@"; do

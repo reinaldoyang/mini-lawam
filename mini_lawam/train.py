@@ -26,6 +26,7 @@ Example:
 import argparse
 import csv
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -34,6 +35,41 @@ from torch.utils.data import DataLoader, Subset
 from latent_action_model.data_loader.video_aug import gpu_two_view_video_aug
 from mini_lawam.data import MiniLaWAMDataset, split_o_t_o_T
 from mini_lawam.model import MiniLaWAM, MiniLaWAMConfig
+
+
+def _resolved_path(path):
+    return Path(path).expanduser().resolve()
+
+
+def validate_phase2_prior_contract(prior_sd, cfg):
+    """Ensure phase 2 uses the same frozen teacher and horizon as phase 1."""
+    if not isinstance(prior_sd, dict) or "prior" not in prior_sd:
+        raise ValueError("Phase-1 checkpoint is missing the required `prior` weights.")
+    phase1_cfg = prior_sd.get("cfg")
+    if not isinstance(phase1_cfg, dict):
+        raise ValueError(
+            "Phase-1 checkpoint is missing `cfg`; it cannot be checked against "
+            "the phase-2 LAM settings."
+        )
+
+    mismatches = []
+    for key in ("lam_ckpt", "lam_yaml"):
+        saved = phase1_cfg.get(key)
+        current = getattr(cfg, key)
+        if saved is None or _resolved_path(saved) != _resolved_path(current):
+            mismatches.append(f"{key}: phase 1={saved!r}, phase 2={current!r}")
+
+    for key in ("future_horizon", "action_horizon"):
+        saved = phase1_cfg.get(key)
+        current = getattr(cfg, key)
+        if saved != current:
+            mismatches.append(f"{key}: phase 1={saved!r}, phase 2={current!r}")
+
+    if mismatches:
+        raise ValueError(
+            "Phase 2 must use the same Stage-1 LAM and horizons as the phase-1 "
+            "prior checkpoint:\n  - " + "\n  - ".join(mismatches)
+        )
 
 
 def make_loaders(ds, batch, workers, val_frac, seed=0):
@@ -92,7 +128,16 @@ def evaluate(model, loader, device, max_batches=20, prior_only=False, set_train_
 
 def main():
     ap = argparse.ArgumentParser()
+    lam_defaults = MiniLaWAMConfig()
     ap.add_argument("--hdf5", default="dataset/multi_egg.hdf5")
+    ap.add_argument(
+        "--lam-ckpt", default=lam_defaults.lam_ckpt,
+        help="Frozen Stage-1 LAM checkpoint used by the iDM teacher and fDM.",
+    )
+    ap.add_argument(
+        "--lam-yaml", default=lam_defaults.lam_yaml,
+        help="Model YAML matching --lam-ckpt.",
+    )
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -170,6 +215,18 @@ def main():
     ap.add_argument("--run-name", default=None, help="wandb/CSV run name.")
     args = ap.parse_args()
 
+    required_paths = {
+        "--hdf5": args.hdf5,
+        "--lam-ckpt": args.lam_ckpt,
+        "--lam-yaml": args.lam_yaml,
+    }
+    if args.phase == "2":
+        required_paths["--prior-ckpt"] = args.prior_ckpt
+    missing = [f"{flag} {path}" for flag, path in required_paths.items()
+               if not _resolved_path(path).is_file()]
+    if missing:
+        raise SystemExit("Required input file not found:\n  " + "\n  ".join(missing))
+
     # Fail fast on wandb login BEFORE the expensive dataset/model setup.
     if args.wandb and not args.wandb_offline:
         import wandb
@@ -210,7 +267,8 @@ def main():
 
     # One horizon for both the LaWM future pair and the action chunk.
     state_dim = 3 if args.use_state else 0   # proprioception = current eef_pos [x,y,z]
-    cfg = MiniLaWAMConfig(use_wrist=args.use_wrist, head_type=args.head,
+    cfg = MiniLaWAMConfig(lam_ckpt=args.lam_ckpt, lam_yaml=args.lam_yaml,
+                          use_wrist=args.use_wrist, head_type=args.head,
                           gripper_head=args.gripper_head,
                           use_state=args.use_state, state_dim=state_dim,
                           target_mode=args.target,
@@ -221,6 +279,15 @@ def main():
                           lambda_distill=lambda_distill, lambda_wm=lambda_wm)
     print(f"head={args.head} | use_wrist={args.use_wrist} | use_state={args.use_state} "
           f"| gripper_head={args.gripper_head} | target={args.target}")
+    print(f"frozen Stage-1 LAM: checkpoint={cfg.lam_ckpt} | config={cfg.lam_yaml}")
+
+    prior_sd = None
+    if args.phase == "2":
+        prior_sd = torch.load(args.prior_ckpt, map_location="cpu", weights_only=False)
+        try:
+            validate_phase2_prior_contract(prior_sd, cfg)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
 
     # gap = future horizon (LaWM pair, o_{t+future_horizon}); horizon = action chunk.
     ds = MiniLaWAMDataset(
@@ -241,7 +308,6 @@ def main():
         # Phase 1: action head is untouched (not in the optimizer, never run).
         model.action_head.requires_grad_(False)
     if args.phase == "2":
-        prior_sd = torch.load(args.prior_ckpt, map_location="cpu", weights_only=False)
         model.prior.load_state_dict(prior_sd["prior"])
         print(f"[phase 2] loaded prior from {args.prior_ckpt} "
               f"(phase-1 step {prior_sd.get('step', '?')})")

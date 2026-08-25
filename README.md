@@ -56,7 +56,88 @@ cd /home/iclu200/reinaldoyang/LaWAM
   --hdf5 dataset/multi_egg.hdf5 --demo 0 --frame 0
 ```
 
-## Training
+## Downstream Training with the Fine-Tuned Stage-1 LAM
+
+Complete [Stage-1 fine-tuning](latent_action_model/README_STAGE1_FINE_TUNING.md)
+first. In both commands below, replace `YOUR_BEST.ckpt` with the Stage-1
+checkpoint that has the lowest `val_loss`:
+
+```text
+latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/YOUR_BEST.ckpt
+```
+
+Both downstream phases use the original HDF5 dataset. The converted
+`dataset/ur_lam_finetune` LeRobot directory is only for Stage-1 training.
+`--horizon 32` matches the Stage-1 pair spacing of 1.6 seconds at 20 Hz. Keep
+the LAM checkpoint, LAM YAML, and horizon identical in Phase 1 and Phase 2.
+
+### Phase 1: distill the ConvPrior
+
+The fine-tuned Stage-1 LAM is loaded as a frozen iDM/fDM teacher. This phase
+trains only the ConvPrior and selects its best checkpoint using validation
+`loss_distill`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
+  --hdf5 dataset/vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5 \
+  --phase 1 \
+  --lam-ckpt latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/YOUR_BEST.ckpt \
+  --lam-yaml latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
+  --horizon 32 \
+  --steps 10000 --batch 32 \
+  --out results/mini_lawam/phase1_vr103_finetuned_lam.pt \
+  --csv-log results/mini_lawam/phase1_vr103_finetuned_lam.csv \
+  --wandb --wandb-project mini_lawam --run-name phase1_vr103_finetuned_lam
+```
+
+Before Phase 2, evaluate whether the prior learned sample-specific latent
+actions:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.eval_prior \
+  --ckpt results/mini_lawam/phase1_vr103_finetuned_lam.pt \
+  --hdf5 dataset/vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5
+```
+
+Proceed when the predicted world-model score is clearly above the copy
+baseline and reasonably close to the oracle score; the evaluator reports the
+recovered oracle-over-copy margin, with greater than 70% as a practical target.
+
+### Phase 2: train the downstream action head
+
+This command reloads the Phase-1 prior and freezes it by default. It trains the
+attention action head using table and wrist images, joystick XYZ targets, and a
+binary gripper target. `--include-tail-actions` keeps the end-of-episode release
+examples instead of dropping them.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
+  --hdf5 dataset/vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5 \
+  --phase 2 \
+  --prior-ckpt results/mini_lawam/phase1_vr103_finetuned_lam.pt \
+  --lam-ckpt latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/YOUR_BEST.ckpt \
+  --lam-yaml latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
+  --horizon 32 \
+  --head attn --use-wrist \
+  --target joystick --gripper-head binary \
+  --gripper-target-offset 1 --include-tail-actions \
+  --lambda-gripper 1.0 \
+  --steps 20000 --batch 32 --lr 1e-4 \
+  --out results/mini_lawam/phase2_vr103_finetuned_lam.pt \
+  --csv-log results/mini_lawam/phase2_vr103_finetuned_lam.csv \
+  --wandb --wandb-project mini_lawam --run-name phase2_vr103_finetuned_lam
+```
+
+Run `wandb login` once before using these online W&B commands. To keep the
+Phase-1 prior frozen, do not add `--finetune-prior`. Phase 2 checks that its LAM
+paths and horizon match the values saved by Phase 1 and exits before model
+loading if they differ. The final rollout checkpoint is:
+
+```text
+results/mini_lawam/phase2_vr103_finetuned_lam.pt
+```
+
+## Previous Training Commands (Preserved)
 
 Train in two phases: first distill the ConvPrior, then train the attention action head.
 The legacy pooled MLP action head has been removed.

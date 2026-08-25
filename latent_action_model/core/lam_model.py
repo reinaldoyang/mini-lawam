@@ -582,7 +582,17 @@ def load_latent_action_model(ckpt_path, yaml_path):
     # Build on CPU first so checkpoint loading works across GPU and non-GPU hosts.
     latent_action_model = LatentLAMModel(**init_kwargs).to("cpu")
 
-    lam_ckpt = torch.load(ckpt_path, map_location="cpu")['state_dict']
+    # Stage-1 fine-tuning produces a full Lightning checkpoint (including trainer
+    # metadata), so load it explicitly as a trusted local checkpoint rather than
+    # relying on PyTorch's version-dependent weights_only default.
+    checkpoint = torch.load(
+        ckpt_path, map_location="cpu", weights_only=False, mmap=True,
+    )
+    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("state_dict"), dict):
+        raise RuntimeError(
+            f"LAM checkpoint {ckpt_path!r} does not contain a `state_dict` mapping."
+        )
+    lam_ckpt = checkpoint["state_dict"]
     new_ckpt = {}
     model_state = latent_action_model.state_dict()
     for key in lam_ckpt.keys():

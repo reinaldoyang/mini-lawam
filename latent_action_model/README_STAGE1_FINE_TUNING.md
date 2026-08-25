@@ -335,7 +335,64 @@ python -m latent_action_model.main validate \
 This replaces the released initialization path for that command and still uses
 strict weights-only loading.
 
-## 10. Resume an interrupted run
+## 10. Evaluate LaWM rollout quality (`roll-init`)
+
+Lightning validation reports reconstruction and state losses. For the
+feature-space LaWM diagnostics used elsewhere in this repository, run
+`scripts/eval_lam_on_dataset.py`. It reports:
+
+- `rollout_vs_gt`: cosine similarity between the predicted and true future
+  visual features; higher is better.
+- `init_vs_gt`: the copy-current-frame baseline.
+- `shuffled_vs_gt`: prediction after assigning each sample another sample's
+  latent action; this should be lower than the correctly paired rollout.
+- `roll-init`: `rollout_vs_gt - init_vs_gt`; positive and larger means the
+  LaWM predicts future dynamics better than copying the current frame.
+
+Evaluate the fine-tuned epoch-9 checkpoint on the original VR HDF5:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+python -m scripts.eval_lam_on_dataset \
+  --hdf5 dataset/base_vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5 \
+  --ckpt "latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/epoch=epoch=09-val_loss=val_loss=0.21701.ckpt" \
+  --yaml latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
+  --gaps 16 24 32 48 \
+  --num-pairs 256 \
+  --batch 8 \
+  --topk 24 \
+  --seed 0
+```
+
+Run the released checkpoint with the same data, gaps, sample count, batch size,
+and seed for a before/after comparison:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+python -m scripts.eval_lam_on_dataset \
+  --hdf5 dataset/base_vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5 \
+  --ckpt latent_action_model/logs/dino_large_vae/lam_release/checkpoints/pytorch_model.pt \
+  --yaml latent_action_model/logs/dino_large_vae/lam_release/dino_large_vae.yaml \
+  --gaps 16 24 32 48 \
+  --num-pairs 256 \
+  --batch 8 \
+  --topk 24 \
+  --seed 0
+```
+
+Use the **MOTION-REGION** table for the main comparison because whole-frame
+similarity is diluted by the static background. Gap 32 corresponds to the
+fine-tuning interval of 1.6 seconds at 20 Hz. A useful fine-tuned model should
+improve `rollout_vs_gt` and `roll-init` over the released checkpoint while
+keeping `rollout_vs_gt` clearly above `shuffled_vs_gt`. `init_vs_gt` should be
+the same for both runs because it does not use the learned rollout.
+
+Run this command from the repository root with `python -m` as shown. Directly
+executing `python scripts/eval_lam_on_dataset.py` can fail to resolve the local
+`latent_action_model` package in environments where the repository has not
+been installed as a package.
+
+## 11. Resume an interrupted run
 
 Resuming is different from pretrained initialization. Set `CKPT_PATH` when you
 need to restore the full Lightning training state, including optimizer,
@@ -353,7 +410,7 @@ Do not set `CKPT_PATH` merely to start from the released checkpoint. The
 configuration's `model.pretrained_ckpt` already performs the correct
 weights-only initialization for a new run.
 
-## 11. Focused verification tests
+## 12. Focused verification tests
 
 The implementation includes standalone tests for checkpoint behavior and data
 conversion:

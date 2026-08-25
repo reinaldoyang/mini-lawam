@@ -79,9 +79,9 @@ trains only the ConvPrior and selects its best checkpoint using validation
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
-  --hdf5 dataset/vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5 \
+  --hdf5 dataset/base_vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5 \
   --phase 1 \
-  --lam-ckpt latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/YOUR_BEST.ckpt \
+  --lam-ckpt latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/epoch=epoch=09-val_loss=val_loss=0.21701.ckpt \
   --lam-yaml latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
   --horizon 32 \
   --steps 10000 --batch 32 \

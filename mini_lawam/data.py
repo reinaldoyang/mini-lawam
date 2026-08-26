@@ -11,13 +11,6 @@ The target is selected by ``target_mode``:
     delta    : [eef_pos[t+i+1] - eef_pos[t] (3), raw_gripper[t+i+1] (1)]
     joystick : [raw_actions[t+i, 0:3], raw_actions[t+i, 6]]
 
-<<<<<<< Updated upstream
-``gripper_target_offset`` can override the gripper clock independently of XYZ.
-For example, joystick XYZ can stay at ``actions[t+i, 0:3]`` while a value of 1
-trains the separate binary gripper output on ``actions[t+i+1, 6]``. Rotation
-columns 3:6 are omitted because Mini-LaWAM locks TCP orientation and predicts a
-four-dimensional [XYZ, gripper] chunk.
-=======
 With ``include_rz=True``, joystick targets become
 ``[raw_actions[t+i, 0:3], raw_actions[t+i, 5], raw_actions[t+i, 6]]``.
 With ``include_ry=True`` as well, RY is inserted before RZ:
@@ -29,7 +22,6 @@ trains the separate binary gripper output on ``actions[t+i+1, 6]``. Rotation
 column 3 (RX) is always omitted. Columns 4 (RY) and 5 (RZ) are optional for
 joystick targets; both are omitted by default so legacy four-dimensional
 checkpoints remain unchanged.
->>>>>>> Stashed changes
 
 Targets are z-scored per dimension using dataset statistics; the checkpoint
 keeps those statistics so deployment can restore the original physical scale.
@@ -49,11 +41,8 @@ from torchvision.transforms import v2
 
 POS_KEY_DEFAULT = "eef_pos_base"  # absolute EEF position (3), base frame
 GRIP_ACTION_COL = 6               # gripper command column in raw `actions` (no gripper obs here)
-<<<<<<< Updated upstream
-=======
 RY_ACTION_COL = 4                 # base-Y rotation command in raw joystick `actions`
 RZ_ACTION_COL = 5                 # base-Z rotation command in raw joystick `actions`
->>>>>>> Stashed changes
 WRIST_KEY_DEFAULT = "wrist_cam"   # arm-mounted aux view (action head only, current frame t)
 
 
@@ -98,22 +87,6 @@ def _read_target_delta(g, t: int, n: int, pos_key: str, grip_col: int) -> np.nda
     return np.concatenate([pos - anchor, grip], axis=1)            # [n,4]
 
 
-<<<<<<< Updated upstream
-def _read_target_joystick(g, t: int, n: int, grip_col: int) -> np.ndarray:
-    """Raw joystick [XYZ(3), gripper(1)] commands for indices [t, t+n).
-
-    The source HDF5 action layout is [XYZ(3), rotation(3), gripper(1)]. Mini-LaWAM
-    keeps its existing four-dimensional head and ignores rotation because the
-    real rollout uses a fixed TCP orientation.
-    """
-    raw = g["actions"][t:t + n].astype(np.float32)
-    if raw.ndim != 2 or raw.shape[1] <= max(2, grip_col):
-        raise ValueError(
-            f"expected HDF5 actions with XYZ columns 0:3 and gripper column "
-            f"{grip_col}, got shape {raw.shape}"
-        )
-    return np.concatenate([raw[:, :3], raw[:, grip_col:grip_col + 1]], axis=1)
-=======
 def _read_target_joystick(g, t: int, n: int, grip_col: int,
                           include_rz: bool = False,
                           include_ry: bool = False) -> np.ndarray:
@@ -145,7 +118,6 @@ def _read_target_joystick(g, t: int, n: int, grip_col: int,
         columns.append(raw[:, RZ_ACTION_COL:RZ_ACTION_COL + 1])
     columns.append(raw[:, grip_col:grip_col + 1])
     return np.concatenate(columns, axis=1)
->>>>>>> Stashed changes
 
 
 def _read_gripper_target(g, t: int, n: int, grip_col: int,
@@ -163,21 +135,14 @@ def _read_gripper_target(g, t: int, n: int, grip_col: int,
 
 def compute_action_stats(hdf5_path: str, pos_key: str, grip_col: int,
                          target_mode: str = "abs", horizon: int = 24,
-<<<<<<< Updated upstream
-=======
                          include_rz: bool = False,
                          include_ry: bool = False,
->>>>>>> Stashed changes
                          ) -> Tuple[np.ndarray, np.ndarray]:
     """Per-dim mean/std of the targets.
 
     abs     : over all [eef_pos_base, action_gripper] frames.
     delta   : over all chunk deltas pos[t+i]-pos[t], i=1..horizon (positions),
               with gripper stats from the raw gripper channel.
-<<<<<<< Updated upstream
-    joystick: over raw [action_xyz, action_gripper] rows; rotation is omitted.
-    """
-=======
     joystick: over raw [action_xyz, (optional action_ry), (optional action_rz),
               action_gripper] rows.
     """
@@ -185,7 +150,6 @@ def compute_action_stats(hdf5_path: str, pos_key: str, grip_col: int,
         raise ValueError(
             "include_rz/include_ry are only supported with target_mode='joystick'"
         )
->>>>>>> Stashed changes
     chunks = []
     with h5py.File(hdf5_path, "r") as f:
         for demo in f["data"].keys():
@@ -206,13 +170,9 @@ def compute_action_stats(hdf5_path: str, pos_key: str, grip_col: int,
                     d = pos[i:] - pos[:-i]                       # [T-i,3]
                     chunks.append(np.concatenate([d, grip[i:]], axis=1))
             elif target_mode == "joystick":
-<<<<<<< Updated upstream
-                chunks.append(_read_target_joystick(g, 0, T, grip_col))
-=======
                 chunks.append(_read_target_joystick(
                     g, 0, T, grip_col, include_rz=include_rz, include_ry=include_ry
                 ))
->>>>>>> Stashed changes
             else:
                 raise ValueError(
                     f"unknown target_mode {target_mode!r}; "
@@ -221,8 +181,6 @@ def compute_action_stats(hdf5_path: str, pos_key: str, grip_col: int,
     alla = np.concatenate(chunks, axis=0)
     mean = alla.mean(axis=0)
     std = alla.std(axis=0)
-<<<<<<< Updated upstream
-=======
     # Column order after XYZ(0:3): RY (if enabled) then RZ (if enabled).
     ry_col = 3 if include_ry else None
     rz_col = 3 + int(include_ry) if include_rz else None
@@ -236,7 +194,6 @@ def compute_action_stats(hdf5_path: str, pos_key: str, grip_col: int,
             "--include-rz requested, but HDF5 action column 5 has no RZ "
             "variation; use a VR dataset with nonzero RZ commands"
         )
->>>>>>> Stashed changes
     std[std < 1e-6] = 1.0
     return mean, std
 
@@ -257,11 +214,8 @@ class MiniLaWAMDataset(Dataset):
         wrist_key: str = WRIST_KEY_DEFAULT,
         use_state: bool = False,
         target_mode: str = "abs",    # "abs", cumulative EEF "delta", or raw "joystick"
-<<<<<<< Updated upstream
-=======
         include_rz: bool = False,     # joystick only: append raw action RZ before grip
         include_ry: bool = False,     # joystick only: append raw action RY before RZ/grip
->>>>>>> Stashed changes
         gripper_target_offset: Optional[int] = None,
         include_tail_actions: bool = False,
     ):
@@ -280,15 +234,12 @@ class MiniLaWAMDataset(Dataset):
                 "expected 'abs', 'delta', or 'joystick'"
             )
         self.target_mode = target_mode
-<<<<<<< Updated upstream
-=======
         self.include_rz = bool(include_rz)
         self.include_ry = bool(include_ry)
         if (self.include_rz or self.include_ry) and self.target_mode != "joystick":
             raise ValueError(
                 "include_rz/include_ry are only supported with target_mode='joystick'"
             )
->>>>>>> Stashed changes
         if gripper_target_offset is None:
             # Preserve the historical contracts unless training explicitly
             # decouples gripper timing from the XYZ target representation.
@@ -307,11 +258,6 @@ class MiniLaWAMDataset(Dataset):
         if action_mean is None or action_std is None:
             action_mean, action_std = compute_action_stats(
                 hdf5_path, pos_key, grip_col,
-<<<<<<< Updated upstream
-                target_mode=target_mode, horizon=self.horizon)
-        self.action_mean = np.asarray(action_mean, dtype=np.float32)
-        self.action_std = np.asarray(action_std, dtype=np.float32)
-=======
                 target_mode=target_mode, horizon=self.horizon,
                 include_rz=self.include_rz, include_ry=self.include_ry)
         self.action_mean = np.asarray(action_mean, dtype=np.float32)
@@ -322,7 +268,6 @@ class MiniLaWAMDataset(Dataset):
                 f"expected action stats shape ({expected_dim},), got "
                 f"{self.action_mean.shape}/{self.action_std.shape}"
             )
->>>>>>> Stashed changes
         self._file: Optional[h5py.File] = None  # opened lazily per worker
 
     def __len__(self) -> int:
@@ -349,14 +294,10 @@ class MiniLaWAMDataset(Dataset):
             raw = _read_target_delta(g, t, self.horizon, self.pos_key, self.grip_col)
         elif self.target_mode == "joystick":
             # Same-index alignment: observation[t] -> raw joystick action[t].
-<<<<<<< Updated upstream
-            raw = _read_target_joystick(g, t, self.horizon, self.grip_col)
-=======
             raw = _read_target_joystick(
                 g, t, self.horizon, self.grip_col,
                 include_rz=self.include_rz, include_ry=self.include_ry
             )
->>>>>>> Stashed changes
         else:
             raw = _read_target(g, t + 1, self.horizon, self.pos_key, self.grip_col)  # [h,4]
         # The chosen gripper offset can have fewer valid tail rows than XYZ.

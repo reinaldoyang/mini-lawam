@@ -63,9 +63,6 @@ def decode_action_prediction(pred, action_mean, action_std,
 
 
 class MiniLaWAMPolicy:
-<<<<<<< Updated upstream
-    """Loads a trained checkpoint and maps frames -> physical 4D action chunks."""
-=======
     """Loads a trained checkpoint and maps frames to physical action chunks."""
 
     # These fields determine the modules and tensor shapes constructed by
@@ -77,7 +74,6 @@ class MiniLaWAMPolicy:
         "gripper_head", "include_rz", "include_ry", "attn_hidden", "attn_layers",
         "attn_heads",
     )
->>>>>>> Stashed changes
 
     def __init__(self, ckpt_path: str, device: Optional[str] = None,
                  image_hw=(256, 256), train_frame_hw=(168, 224)):
@@ -249,11 +245,8 @@ if __name__ == "__main__":
     step = torch.load(args.ckpt, map_location="cpu", weights_only=False).get("step")
     H = policy.cfg.action_horizon
     target_mode = getattr(policy.cfg, "target_mode", "abs")
-<<<<<<< Updated upstream
-=======
     include_rz = bool(getattr(policy.cfg, "include_rz", False))
     include_ry = bool(getattr(policy.cfg, "include_ry", False))
->>>>>>> Stashed changes
     gripper_target_offset = int(
         getattr(policy.cfg, "gripper_target_offset", -1)
     )
@@ -261,10 +254,7 @@ if __name__ == "__main__":
         gripper_target_offset = 0 if target_mode == "joystick" else 1
     print(f"loaded ckpt (step {step}) | action_dim={policy.cfg.action_dim} horizon={H} "
           f"use_wrist={policy.cfg.use_wrist} target={target_mode} "
-<<<<<<< Updated upstream
-=======
           f"include_rz={include_rz} include_ry={include_ry} "
->>>>>>> Stashed changes
           f"gripper_head={getattr(policy.cfg, 'gripper_head', 'regression')} "
           f"gripper_target_offset={gripper_target_offset}")
     print(f"action_mean={np.round(policy.action_mean,4)} action_std={np.round(policy.action_std,4)}")
@@ -274,11 +264,7 @@ if __name__ == "__main__":
     def read_gt(g, t):
         """Ground truth in the same output convention as policy.act()."""
         if target_mode == "joystick":
-<<<<<<< Updated upstream
-            gt = _read_target_joystick(g, t, H, 6)
-=======
             gt = _read_target_joystick(g, t, H, 6, include_rz=include_rz, include_ry=include_ry)
->>>>>>> Stashed changes
         elif target_mode == "delta":
             gt = _read_target_delta(g, t, H, "eef_pos_base", 6)
             gt[:, :3] += g["obs"]["eef_pos_base"][t].astype(np.float32)
@@ -307,12 +293,6 @@ if __name__ == "__main__":
         chunk = policy.act(frame, wrist, state_xyz=st)
         print(f"\ndemo={demo} t={args.t}  chunk shape={chunk.shape}")
         xyz_name = "joystick_xyz" if target_mode == "joystick" else "eef_pos"
-<<<<<<< Updated upstream
-        print(f"pred step0 : {xyz_name}={np.round(chunk[0,:3],4)}  "
-              f"gripper={chunk[0,3]:+.3f}")
-        print(f"gt   step0 : {xyz_name}={np.round(gt[0,:3],4)}  "
-              f"gripper={gt[0,3]:+.3f}")
-=======
         ry_text = f"  ry={chunk[0,ry_idx]:+.4f}" if include_ry else ""
         gt_ry_text = f"  ry={gt[0,ry_idx]:+.4f}" if include_ry else ""
         rz_text = f"  rz={chunk[0,rz_idx]:+.4f}" if include_rz else ""
@@ -321,7 +301,6 @@ if __name__ == "__main__":
               f"{ry_text}{rz_text}  gripper={chunk[0,-1]:+.3f}")
         print(f"gt   step0 : {xyz_name}={np.round(gt[0,:3],4)}  "
               f"{gt_ry_text}{gt_rz_text}  gripper={gt[0,-1]:+.3f}")
->>>>>>> Stashed changes
         print(f"XYZ L2 err : {np.linalg.norm(chunk[0,:3]-gt[0,:3]):.4f} "
               f"{'action units' if target_mode == 'joystick' else 'm'}")
         raise SystemExit(0)
@@ -329,11 +308,7 @@ if __name__ == "__main__":
     # ---- eval mode: reproduce train.py's split, then measure error per split ----
     ds = MiniLaWAMDataset(
         args.hdf5, gap=H, horizon=H, sample_stride=args.sample_stride,
-<<<<<<< Updated upstream
-        target_mode=target_mode,
-=======
         target_mode=target_mode, include_rz=include_rz, include_ry=include_ry,
->>>>>>> Stashed changes
         gripper_target_offset=gripper_target_offset,
         include_tail_actions=bool(
             getattr(policy.cfg, "include_tail_actions", False)
@@ -372,16 +347,12 @@ if __name__ == "__main__":
             if target_mode == "joystick":
                 print(f"  XYZ action L2 (mean horizon)   : {pos_l2/cnt:.4f}")
                 print(f"  XYZ action L2 (step 0 only)    : {step0_l2/cnt:.4f}")
-<<<<<<< Updated upstream
-                print(f"  per-dim MAE [x y z] grip       : {np.round(mae/cnt,4)}")
-=======
                 labels = (
                     "[x y z ry rz] grip" if (include_ry and include_rz) else
                     "[x y z ry] grip" if include_ry else
                     "[x y z rz] grip" if include_rz else "[x y z] grip"
                 )
                 print(f"  per-dim MAE {labels:<17}: {np.round(mae/cnt,4)}")
->>>>>>> Stashed changes
             else:
                 print(f"  pos L2 err  (mean over horizon): {pos_l2/cnt*100:.2f} cm")
                 print(f"  pos L2 err  (step 0 only)      : {step0_l2/cnt*100:.2f} cm")

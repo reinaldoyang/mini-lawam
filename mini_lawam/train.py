@@ -126,8 +126,6 @@ def main():
                          "systematic absolute-position bias); 'joystick' = raw HDF5 "
                          "actions[t+i,0:3] plus actions[t+i,6] gripper. Joystick XYZ is "
                          "scaled and composed with the live TCP only at deployment.")
-<<<<<<< Updated upstream
-=======
     ap.add_argument(
         "--include-rz", action="store_true",
         help="Joystick target only: train a 5D [XYZ, RZ, gripper] action chunk "
@@ -141,7 +139,6 @@ def main():
              "action chunk (RY is inserted before RZ). Deployment remains "
              "orientation-locked unless rollout_ur7e also receives --enable-ry.",
     )
->>>>>>> Stashed changes
     ap.add_argument("--phase", choices=["1", "2", "joint"], default="joint",
                     help="1: train prior only (L_distill). 2: load --prior-ckpt, train "
                          "action head (L_act + 0.1*L_distill + 0.1*L_wm). joint: original "
@@ -223,12 +220,6 @@ def main():
         raise SystemExit(f"--use-state + --target {args.target} unsupported: the checkpoint "
                          "does not store absolute-position stats, so it cannot z-score "
                          "an absolute TCP state.")
-<<<<<<< Updated upstream
-
-    # One horizon for both the LaWM future pair and the action chunk.
-    state_dim = 3 if args.use_state else 0   # proprioception = current eef_pos [x,y,z]
-    cfg = MiniLaWAMConfig(use_wrist=args.use_wrist, head_type=args.head,
-=======
     if (args.include_rz or args.include_ry) and args.target != "joystick":
         raise SystemExit("--include-rz/--include-ry require --target joystick")
 
@@ -238,7 +229,6 @@ def main():
     cfg = MiniLaWAMConfig(use_wrist=args.use_wrist, head_type=args.head,
                           action_dim=action_dim, include_rz=args.include_rz,
                           include_ry=args.include_ry,
->>>>>>> Stashed changes
                           gripper_head=args.gripper_head,
                           use_state=args.use_state, state_dim=state_dim,
                           target_mode=args.target,
@@ -248,23 +238,16 @@ def main():
                           lambda_gripper=args.lambda_gripper,
                           lambda_distill=lambda_distill, lambda_wm=lambda_wm)
     print(f"head={args.head} | use_wrist={args.use_wrist} | use_state={args.use_state} "
-<<<<<<< Updated upstream
-          f"| gripper_head={args.gripper_head} | target={args.target}")
-=======
           f"| gripper_head={args.gripper_head} | target={args.target} "
           f"| include_rz={args.include_rz} | include_ry={args.include_ry} "
           f"| action_dim={action_dim}")
->>>>>>> Stashed changes
 
     # gap = future horizon (LaWM pair, o_{t+future_horizon}); horizon = action chunk.
     ds = MiniLaWAMDataset(
         args.hdf5, gap=cfg.future_horizon, horizon=cfg.action_horizon,
         sample_stride=args.sample_stride, use_wrist=args.use_wrist,
         use_state=args.use_state, target_mode=args.target,
-<<<<<<< Updated upstream
-=======
         include_rz=cfg.include_rz, include_ry=cfg.include_ry,
->>>>>>> Stashed changes
         gripper_target_offset=cfg.gripper_target_offset,
         include_tail_actions=cfg.include_tail_actions,
     )

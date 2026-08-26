@@ -36,12 +36,8 @@ from latent_action_model.core.lam_model import load_latent_action_model
 class MiniLaWAMConfig:
     lam_ckpt: str = "latent_action_model/logs/dino_large_vae/lam_release/checkpoints/pytorch_model.pt"
     lam_yaml: str = "latent_action_model/logs/dino_large_vae/lam_release/dino_large_vae.yaml"
-<<<<<<< Updated upstream
-    action_dim: int = 4              # target = absolute [eef_pos(3), gripper_pos(1)]
-=======
     action_dim: int = 4              # [XYZ, grip]; +RY with include_ry; +RZ with include_rz
                                       # (order after XYZ is [RY, RZ] when both are set)
->>>>>>> Stashed changes
     # Horizon in FRAMES = 1.2 s @ 20 Hz = 24 (paper §C.5 robot horizon). Same value
     # for the action chunk and the LaWM future pair (o_{t+H} ->
     # z_teacher, u_T, loss_wm).
@@ -59,11 +55,8 @@ class MiniLaWAMConfig:
     target_mode: str = "abs"         # "abs" = absolute eef positions;
                                       # "delta" = pos[t+i]-pos[t];
                                       # "joystick" = raw action XYZ + gripper
-<<<<<<< Updated upstream
-=======
     include_rz: bool = False          # joystick only: [XYZ, raw action RZ, gripper]
     include_ry: bool = False          # joystick only: inserts raw action RY before RZ/gripper
->>>>>>> Stashed changes
     gripper_target_offset: int = -1   # 0=same row, 1=one row ahead;
                                       # -1 preserves legacy target-mode behavior
     include_tail_actions: bool = False  # train terminal anchors with masked padding
@@ -251,8 +244,6 @@ class MiniLaWAM(nn.Module):
             raise ValueError(
                 f"unsupported head_type {cfg.head_type!r}; only 'attn' is supported"
             )
-<<<<<<< Updated upstream
-=======
         if (cfg.include_rz or cfg.include_ry) and cfg.target_mode != "joystick":
             raise ValueError(
                 "include_rz/include_ry are only supported with target_mode='joystick'"
@@ -263,7 +254,6 @@ class MiniLaWAM(nn.Module):
                 f"include_rz={cfg.include_rz} include_ry={cfg.include_ry} requires "
                 f"action_dim={expected_action_dim}, got {cfg.action_dim}"
             )
->>>>>>> Stashed changes
         self.cfg = cfg
         self.lam = load_latent_action_model(cfg.lam_ckpt, cfg.lam_yaml)  # frozen, eval
         vdim = int(self.lam.input_dim)   # DINOv3 ViT-B -> 768

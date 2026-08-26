@@ -233,12 +233,25 @@ forward/backward pass, and validation. It does not produce a usable checkpoint.
 
 ## 7. Start fine-tuning
 
+Stage-1 training consumes the converted LeRobot directory, not the source
+HDF5 file directly. The two data arguments below resolve to:
+
+```text
+data_root_dir (`dataset`) + mixture dataset name (`ur_lam_finetune`)
+= dataset/ur_lam_finetune
+```
+
+These values are already present in each YAML configuration, but they are
+repeated on the command line so the selected training dataset is explicit.
+
 Start with the `1e-5` run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 bash latent_action_model/train.sh \
-  --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml
+  --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
+  --data.data_root_dir dataset \
+  --data.data_mix ur_lam_finetune
 ```
 
 After reviewing that run, optionally launch the `3e-5` comparison:
@@ -246,7 +259,9 @@ After reviewing that run, optionally launch the `3e-5` comparison:
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 bash latent_action_model/train.sh \
-  --config latent_action_model/config/ur_lam_finetune_lr3e5.yaml
+  --config latent_action_model/config/ur_lam_finetune_lr3e5.yaml \
+  --data.data_root_dir dataset \
+  --data.data_mix ur_lam_finetune
 ```
 
 `train.sh` launches one process per CUDA device visible to PyTorch. For example,
@@ -255,7 +270,9 @@ to use GPUs 0 and 1:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
 bash latent_action_model/train.sh \
-  --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml
+  --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
+  --data.data_root_dir dataset \
+  --data.data_mix ur_lam_finetune
 ```
 
 The fine-tuning configurations use Lightning loggers for both TensorBoard and
@@ -321,19 +338,107 @@ last epoch is best. Compare it with the pretrained baseline from step 5.
 
 ## 9. Validate a fine-tuned checkpoint
 
-To load a fine-tuned checkpoint as weights only and evaluate it on the same
-validation split:
+Use both evaluations below. Lightning validation measures losses on the held-out
+episodes, while the HDF5 diagnostic checks whether the learned latent action
+actually improves future-feature prediction.
+
+### 9.1 Select the best checkpoint
+
+List the saved checkpoints:
+
+```bash
+ls -lh latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/
+```
+
+Choose the checkpoint with the lowest `val_loss` in its filename or training
+logs. Do not assume that `last.ckpt` is the best. Replace `YOUR_BEST.ckpt` in
+the commands below with that filename.
+
+### 9.2 Evaluate held-out validation losses
+
+Load the fine-tuned checkpoint as weights only and evaluate it on the same last
+10% of episodes held out during training:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 WANDB_MODE=offline \
 python -m latent_action_model.main validate \
   --config latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
-  --model.pretrained_ckpt "/path/to/best.ckpt"
+  --model.pretrained_ckpt \
+    "latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/YOUR_BEST.ckpt"
 ```
 
 This replaces the released initialization path for that command and still uses
-strict weights-only loading.
+strict weights-only loading. Compare `val_loss`, `val/recon_loss`, and
+`val/state_loss` with the released-checkpoint baseline from Step 5. Lower is
+better, and the comparison is meaningful only when both runs use the same YAML
+and validation split.
+
+### 9.3 Evaluate latent-action and world-model behavior
+
+Run the fine-tuned LAM directly on frame pairs from the original HDF5 dataset:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/eval_lam_on_dataset.py \
+  --hdf5 dataset/vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5 \
+  --ckpt \
+    "latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/YOUR_BEST.ckpt" \
+  --yaml latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
+  --gaps 32 \
+  --num-pairs 256 \
+  --batch 32 \
+  --seed 0
+```
+
+If evaluation runs out of GPU memory, reduce `--batch 32` to `--batch 8`.
+Focus on the `MOTION-REGION` table:
+
+- `rollout_vs_gt > init_vs_gt`: the fDM predicts the future better than copying
+  the current observation.
+- `rollout_vs_gt > shuffled_vs_gt`: the iDM latent action contains information
+  specific to the observed transition.
+- `roll-init` should be positive and preferably larger than for the released
+  checkpoint.
+
+This HDF5 diagnostic samples across the complete source dataset. Treat the
+held-out Lightning validation above as the primary generalization measurement.
+
+For an apples-to-apples pretrained comparison, keep `--gaps`, `--num-pairs`,
+and `--seed` unchanged and run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/eval_lam_on_dataset.py \
+  --hdf5 dataset/vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5 \
+  --ckpt latent_action_model/logs/dino_large_vae/lam_release/checkpoints/pytorch_model.pt \
+  --yaml latent_action_model/logs/dino_large_vae/lam_release/dino_large_vae.yaml \
+  --gaps 32 \
+  --num-pairs 256 \
+  --batch 32 \
+  --seed 0
+```
+
+### 9.4 Inspect predicted subgoals visually
+
+Generate six heatmap panels using the fine-tuned checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/eval_lam_on_dataset.py \
+  --hdf5 dataset/vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5 \
+  --ckpt \
+    "latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/YOUR_BEST.ckpt" \
+  --yaml latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
+  --gaps 32 \
+  --num-pairs 256 \
+  --batch 32 \
+  --seed 0 \
+  --dump-heatmaps 6 \
+  --heatmap-gap 32 \
+  --out-dir results/lam_check/ur_finetuned
+```
+
+The panels are written under `results/lam_check/ur_finetuned/`. Check that the
+predicted subgoal emphasizes the moving robot/egg regions instead of only the
+static background.
 
 ## 10. Evaluate LaWM rollout quality (`roll-init`)
 

@@ -730,8 +730,6 @@ class VJEPA_LAM(LightningModule):
 
             logs: Dict[str, Tensor] = {
                 "recon_loss": recon_loss,
-                "vq_loss": vq_loss,
-                "perplexity": perplexity,
                 "cos_sim_metric": cos_sim_metric,
                 "l1_loss_metric": l1_loss_metric,
                 # "dec_in": dec_in.mean(),
@@ -742,6 +740,14 @@ class VJEPA_LAM(LightningModule):
                 # "recon_std": recon.std(),
                 **aux_loss_logs,
             }
+            # Quantizer inference returns placeholder zeros for vq_loss and
+            # perplexity, so publishing them as validation metrics is misleading.
+            # Keep the actual training quantizer loss, and only report perplexity
+            # for discrete-codebook variants where that statistic is meaningful.
+            if vq_training:
+                logs["vq_loss"] = vq_loss
+                if self.lam.vq_type not in {"vae", "beta_vae", "ae"}:
+                    logs["perplexity"] = perplexity
             if getattr(self.lam, "vq", None) is not None:
                 vq_module = self.lam.vq
                 if hasattr(vq_module, "last_sample_entropy"):

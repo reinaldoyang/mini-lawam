@@ -20,6 +20,18 @@ class Phase2ContractTest(unittest.TestCase):
 
         validate_phase2_prior_contract(checkpoint, cfg)
 
+    def test_accepts_rz_phase2_with_legacy_four_dimensional_prior(self):
+        phase2_cfg = _config()
+        phase2_cfg.action_dim = 5
+        phase2_cfg.target_mode = "joystick"
+        phase2_cfg.include_rz = True
+        phase1_cfg = phase2_cfg.__dict__.copy()
+        phase1_cfg.update(action_dim=4, target_mode="joystick", include_rz=False)
+
+        validate_phase2_prior_contract(
+            {"prior": {}, "cfg": phase1_cfg}, phase2_cfg,
+        )
+
     def test_rejects_mismatched_stage1_contract(self):
         for key, different in (
             ("lam_ckpt", "other.ckpt"),

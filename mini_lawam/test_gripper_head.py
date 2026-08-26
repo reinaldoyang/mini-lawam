@@ -46,6 +46,34 @@ def test_attention_binary_head_has_independent_outputs_and_gradients():
     assert float(head.gripper_out.weight.grad.abs().sum()) > 0.0
 
 
+def test_binary_head_supports_xyz_rz_plus_final_gripper():
+    head = AttnActionHead(
+        token_dim=8, action_dim=5, horizon=3, n_views=2,
+        hidden=12, n_layers=1, n_heads=3,
+        gripper_head="binary",
+    )
+    pred = head([torch.randn(2, 5, 8), torch.randn(2, 5, 8)])
+    assert pred.shape == (2, 3, 5)
+
+    actions = torch.randn_like(pred)
+    mask = torch.ones_like(pred)
+    gripper_targets = torch.tensor(
+        [[[0.0], [1.0], [0.0]], [[1.0], [0.0], [1.0]]]
+    )
+    loss_act, loss_motion, loss_gripper, _ = compute_action_losses(
+        pred, actions, mask, gripper_targets,
+        gripper_head="binary", lambda_gripper=2.0,
+    )
+    torch.testing.assert_close(loss_act, loss_motion + 2.0 * loss_gripper)
+
+    raw = np.asarray([[1.0, 2.0, 3.0, 4.0, -0.1]], dtype=np.float32)
+    mean = np.asarray([0.1, 0.2, 0.3, 0.4, 99.0], dtype=np.float32)
+    std = np.asarray([1.0, 2.0, 3.0, 4.0, 99.0], dtype=np.float32)
+    decoded = decode_action_prediction(raw, mean, std, gripper_head="binary")
+    np.testing.assert_allclose(decoded[0, :4], [1.1, 4.2, 9.3, 16.4])
+    assert decoded[0, -1] == -1.0
+
+
 def test_mlp_action_head_config_is_rejected():
     try:
         MiniLaWAM(MiniLaWAMConfig(head_type="mlp"))
@@ -105,8 +133,9 @@ def test_regression_loss_preserves_legacy_four_dimensional_mse():
 
 if __name__ == "__main__":
     test_attention_binary_head_has_independent_outputs_and_gradients()
+    test_binary_head_supports_xyz_rz_plus_final_gripper()
     test_mlp_action_head_config_is_rejected()
     test_regression_attention_layout_remains_checkpoint_compatible()
     test_binary_decode_denormalizes_xyz_and_emits_exact_gripper_states()
     test_regression_loss_preserves_legacy_four_dimensional_mse()
-    print("5 focused binary-gripper-head tests passed")
+    print("6 focused binary-gripper-head tests passed")

@@ -79,7 +79,7 @@ trains only the ConvPrior and selects its best checkpoint using validation
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
-  --hdf5 dataset/base_vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5 \
+  --hdf5 dataset/vr_teleop/new_vr_teleop_egg_rz_103ep_256.hdf5 \
   --phase 1 \
   --lam-ckpt latent_action_model/logs/ur_lam_finetune_lr1e5/checkpoints/epoch=epoch=09-val_loss=val_loss=0.21701.ckpt \
   --lam-yaml latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
@@ -106,9 +106,10 @@ recovered oracle-over-copy margin, with greater than 70% as a practical target.
 ### Phase 2: train the downstream action head
 
 This command reloads the Phase-1 prior and freezes it by default. It trains the
-attention action head using table and wrist images, joystick XYZ targets, and a
-binary gripper target. `--include-tail-actions` keeps the end-of-episode release
-examples instead of dropping them.
+attention action head using table and wrist images, joystick XYZ+RZ targets, and
+a binary gripper target. `--include-rz` reads RZ from HDF5 action column 5 and
+creates a 5D `[XYZ, RZ, gripper]` checkpoint. `--include-tail-actions` keeps the
+end-of-episode release examples instead of dropping them.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
@@ -119,7 +120,7 @@ CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.train \
   --lam-yaml latent_action_model/config/ur_lam_finetune_lr1e5.yaml \
   --horizon 32 \
   --head attn --use-wrist \
-  --target joystick --gripper-head binary \
+  --target joystick --include-rz --gripper-head binary \
   --gripper-target-offset 1 --include-tail-actions \
   --lambda-gripper 1.0 \
   --steps 20000 --batch 32 --lr 1e-4 \
@@ -136,6 +137,11 @@ loading if they differ. The final rollout checkpoint is:
 ```text
 results/mini_lawam/phase2_vr103_finetuned_lam.pt
 ```
+
+RZ supervision changes only the Phase-2 action head. You can reuse an existing
+Phase-1 prior when it was trained with the same Stage-1 LAM and horizon and on a
+compatible robot-image domain. Otherwise, retrain Phase 1 as well; Phase 1 does
+not use action labels, but it does learn from robot observation pairs.
 
 ## Previous Training Commands (Preserved)
 
@@ -213,6 +219,29 @@ Experiment 2: add proprioception
 
 
 ## Real Robot Rollout
+
+### VR command-relative rollout with optional RZ
+
+Use `rollout_ur7e_vr` for VR datasets whose actions are forward deltas between
+commanded poses. It accumulates XYZ from the previous safety-clamped command.
+For a checkpoint trained with `--include-rz`, pass `--enable-rz`; roll and pitch
+remain locked. Start dry-run first by omitting `--execute`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e_vr \
+  --ckpt results/mini_lawam/phase2_vr103_finetuned_lam.pt \
+  --table-cam-serial 244422300964 \
+  --wrist-cam-serial 252122300792 \
+  --robot-ip 140.96.93.7 \
+  --execute --use-gripper-control \
+  --train-frame-hw 240 320 \
+  --temporal-ensemble --te-m 0.2 \
+  --action-scale 1.0 --max-reach 0.015 \
+  --gripper-open-lead-steps 0 \
+  --servol-max-pos-step 0.002 --servol-max-rot-step 0.005 \
+  --show-camera --enable-rz
+```
+
 ### Check camera serial number
 ```bash
 /home/iclu200/miniconda3/envs/lawam/bin/python -c "

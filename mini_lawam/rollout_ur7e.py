@@ -9,11 +9,12 @@ Pattern follows ur7e_ramen_il/scripts/real_world/lapa_latent_real_servoL.py:
   - DRY-RUN by default; add --execute to actually send servoL/gripper.
 
 mini_lawam-specific differences vs the LAPA baseline:
-  - policy output is an [H, 4] chunk whose checkpoint-stored target mode is:
+  - policy output is an [H, action_dim] chunk whose checkpoint-stored target mode is:
       abs/delta -> absolute [eef_pos_base(3), gripper(1)] targets
-      joystick  -> raw recorded [joystick_xyz(3), gripper(1)] commands
-    Joystick commands are multiplied by --action-scale and added to the measured
-    TCP at each execution tick. Rotation is always locked.
+      joystick  -> raw recorded [joystick_xyz(3), optional rz(1), gripper(1)] commands
+    Joystick motion commands are multiplied by --action-scale and composed with
+    the measured TCP at each execution tick. Roll/pitch stay locked; optional RZ
+    is applied only for a compatible checkpoint when --enable-rz is passed.
   - receding horizon: execute the first --exec-steps (default 8) waypoints of
     each chunk at --control-hz (default 20, matching training), then re-plan
     from a fresh frame.
@@ -64,9 +65,16 @@ DEMO_LOCKED_ROTVEC = np.array([0.0036, 3.14094, -0.00024], dtype=np.float64)
 TRACE_TRIAL_RE = re.compile(r"^trial_(\d+)(?:_|$)")
 
 
-def build_parser():
-    p = argparse.ArgumentParser(description=__doc__)
+def build_parser(description=None, *, command_relative=False):
+    p = argparse.ArgumentParser(description=description or __doc__)
     p.add_argument("--ckpt", default="results/mini_lawam/ckpt_114ep_wrist.pt")
+    p.add_argument(
+        "--task-profile", action="append", nargs=3,
+        metavar=("KEY", "CKPT", "CLOSE_MM"),
+        help="Bind a numeric key (1-9) to a checkpoint and gripper closing width. "
+             "Repeat for multiple tasks; press the key while IDLE to switch. "
+             "When omitted, --ckpt and --gripper-close-mm retain their usual behavior.",
+    )
     p.add_argument("--device", default="cuda")
     p.add_argument("--realworld-dir", default=DEFAULT_REALWORLD_DIR,
                    help="ur7e_ramen_il/scripts/real_world (real_servo_utils + rtde_gripper)")
@@ -93,9 +101,11 @@ def build_parser():
                         "translations. Applied before temporal ensembling and safety clamps. "
                         "Does not affect the gripper; non-default values require a "
                         "delta-target checkpoint.")
-    p.add_argument("--action-scale", type=float, default=0.3,
-                   help="Deployment gain for raw XYZ commands from a joystick-target "
-                        "checkpoint (default: 0.3). Applied after de-normalization and "
+    action_scale_default = 1.0 if command_relative else 0.3
+    p.add_argument("--action-scale", type=float, default=action_scale_default,
+                   help="Deployment gain for raw XYZ and optional RZ commands from a "
+                        "joystick-target checkpoint "
+                        f"(default: {action_scale_default:g}). Applied after de-normalization and "
                         "before temporal ensembling/TCP composition. Does not affect "
                         "the gripper and is ignored by abs/delta checkpoints.")
     p.add_argument("--max-steps", type=int, default=2000, help="max control steps per rollout")
@@ -128,12 +138,19 @@ def build_parser():
                    metavar=("X", "Y", "Z"), help="workspace box min (base frame, m)")
     p.add_argument("--ws-max", type=float, nargs=3, default=[0.523, 0.612, 0.518],
                    metavar=("X", "Y", "Z"), help="workspace box max (base frame, m)")
-    p.add_argument("--max-reach", type=float, default=0.06,
+    max_reach_default = 0.015 if command_relative else 0.06
+    p.add_argument("--max-reach", type=float, default=max_reach_default,
                    help="max distance (m) toward the predicted target per re-plan")
     p.add_argument("--locked-rotvec", type=float, nargs=3, default=None,
                    metavar=("RX", "RY", "RZ"),
                    help="override the fixed TCP orientation (axis-angle rotvec). "
                         "Default: DEMO_LOCKED_ROTVEC, measured from the demos.")
+    p.add_argument(
+        "--enable-rz", action="store_true",
+        help="Apply the policy's predicted joystick RZ deltas around base Z while "
+             "keeping roll/pitch locked. Requires a checkpoint trained with "
+             "--target joystick --include-rz. Default: disabled (fully locked).",
+    )
 
     # smoothing (kills prediction jitter between re-plans)
     p.add_argument("--target-ema", type=float, default=1.0,
@@ -152,7 +169,8 @@ def build_parser():
     p.add_argument("--gripper-speed", type=int, default=100)
     p.add_argument("--gripper-force", type=int, default=50)
     p.add_argument("--gripper-threshold", type=float, default=0.0,
-                   help="chunk[:,3] <= thr => open, > thr => close (open=-1, close=+1)")
+                   help="final action channel <= thr => open, > thr => close "
+                        "(open=-1, close=+1)")
     p.add_argument("--gripper-open-lead-steps", type=int, default=1,
                    help="When the commanded gripper is already closed, allow an open "
                         "prediction this many chunk steps ahead to trigger release now. "
@@ -381,24 +399,42 @@ class RealSenseTableReader:
 # ----------------------------------------------------------------------------
 class LatchedGripper:
     def __init__(self, RobotiqGripper, robot_ip, open_mm, close_mm, speed, force):
-        def mm_to_raw(v, open_ref):
-            open_ref = max(float(open_ref), 1e-6)
-            return int(np.clip(round(255.0 * (1.0 - float(v) / open_ref)), 0, 255))
-
         def pct_to_raw(v):
             v = float(v)
             return int(np.clip(round(v * 255.0 / 100.0 if v <= 100.0 else v), 0, 255))
 
         self._g = RobotiqGripper()
         self._g.connect(str(robot_ip), ROBOTIQ_SOCKET_PORT)
-        self.open_raw = mm_to_raw(open_mm, open_mm)
-        self.close_raw = mm_to_raw(close_mm, open_mm)
+        self.open_mm = float(open_mm)
+        self.close_mm = float(close_mm)
+        self.open_raw = self._mm_to_raw(self.open_mm)
+        self.close_raw = self._mm_to_raw(self.close_mm)
         self.speed_raw = pct_to_raw(speed)
         self.force_raw = pct_to_raw(force)
         self.state = None
         if hasattr(self._g, "activate"):
             print("[GRIPPER] activating")
             self._g.activate(auto_calibrate=False)
+
+    def _mm_to_raw(self, width_mm):
+        open_ref = max(self.open_mm, 1e-6)
+        return int(np.clip(round(255.0 * (1.0 - float(width_mm) / open_ref)), 0, 255))
+
+    def set_close_mm(self, close_mm):
+        """Change the width used by the next close command without moving now."""
+        close_mm = float(close_mm)
+        if not np.isfinite(close_mm) or not 0.0 <= close_mm <= self.open_mm:
+            raise ValueError(
+                f"gripper close width must be in [0, {self.open_mm:g}] mm, got {close_mm}"
+            )
+        self.close_mm = close_mm
+        self.close_raw = self._mm_to_raw(close_mm)
+        # If the prior task ended closed, ensure its cached command cannot suppress
+        # the first close command at the newly selected width.
+        if self.state == "close":
+            self.state = None
+        print(f"[GRIPPER] configured close width={self.close_mm:g} mm "
+              f"(raw={self.close_raw}); no movement until the next command")
 
     def command(self, cmd: str):
         if cmd == self.state:
@@ -436,14 +472,18 @@ def init_pygame(args, two_rows=False):
 
 
 def draw_status(pygame, screen, font, mode, extra="", frame_rgb=None,
-                wrist_rgb=None, subgoal_rgb=None, video_scale=1.0):
+                wrist_rgb=None, subgoal_rgb=None, video_scale=1.0,
+                task_keys=""):
     """Status text + policy inputs and optional predicted-subgoal overlay.
 
     `subgoal_rgb` is the table input overlaid with per-patch
     `||u_hat_T-u_t||`; it is already 256x256 RGB.
     """
     screen.fill((20, 20, 20))
-    for i, line in enumerate([f"Mode: {mode}", "S=start  E=end  H=home  Q=quit", extra]):
+    controls = "S=start  E=end  H=home  Q=quit"
+    if task_keys:
+        controls += f"  {task_keys}=task"
+    for i, line in enumerate([f"Mode: {mode}", controls, extra]):
         if line:
             screen.blit(font.render(line, True, (0, 255, 0)), (16, 18 + 26 * i))
     vs = float(video_scale)
@@ -472,9 +512,40 @@ def poll_cmd(pygame):
         if ev.type == pygame.QUIT:
             return "quit"
         if ev.type == pygame.KEYDOWN:
-            return {pygame.K_s: "start", pygame.K_e: "end",
-                    pygame.K_h: "home", pygame.K_q: "quit"}.get(ev.key)
+            cmd = {pygame.K_s: "start", pygame.K_e: "end",
+                   pygame.K_h: "home", pygame.K_q: "quit"}.get(ev.key)
+            if cmd is not None:
+                return cmd
+            if getattr(ev, "unicode", "") in "123456789":
+                return f"task:{ev.unicode}"
     return None
+
+
+def build_task_profiles(raw_profiles, default_ckpt, default_close_mm, open_mm):
+    """Parse repeatable CLI task profiles while preserving single-task behavior."""
+    open_mm = float(open_mm)
+    if not np.isfinite(open_mm) or open_mm <= 0.0:
+        raise ValueError(f"--gripper-open-mm must be finite and > 0, got {open_mm}")
+
+    entries = raw_profiles or [("1", default_ckpt, str(default_close_mm))]
+    profiles = {}
+    for raw_key, ckpt, raw_close_mm in entries:
+        key = str(raw_key)
+        if len(key) != 1 or key not in "123456789":
+            raise ValueError(f"task profile KEY must be one digit from 1 to 9, got {key!r}")
+        if key in profiles:
+            raise ValueError(f"duplicate task profile key {key!r}")
+        close_mm = float(raw_close_mm)
+        if not np.isfinite(close_mm) or not 0.0 <= close_mm <= open_mm:
+            raise ValueError(
+                f"task {key} CLOSE_MM must be in [0, {open_mm:g}], got {close_mm}"
+            )
+        profiles[key] = {
+            "key": key,
+            "ckpt": str(ckpt),
+            "close_mm": close_mm,
+        }
+    return profiles, bool(raw_profiles)
 
 
 # ----------------------------------------------------------------------------
@@ -500,27 +571,89 @@ def scale_delta_chunk(chunk, anchor_xyz, delta_scale):
     return scaled
 
 
-def scale_joystick_chunk(chunk, action_scale):
-    """Scale only raw joystick XYZ commands; preserve the gripper exactly."""
+def scale_joystick_chunk(chunk, action_scale, include_rz=False):
+    """Scale raw joystick motion (XYZ[+RZ]); preserve the final gripper channel."""
     scaled = np.asarray(chunk).copy()
-    if scaled.ndim != 2 or scaled.shape[1] != 4:
-        raise ValueError(f"joystick chunk must have shape [H,4], got {scaled.shape}")
-    scaled[:, :3] *= float(action_scale)
+    expected_dim = 5 if include_rz else 4
+    if scaled.ndim != 2 or scaled.shape[1] != expected_dim:
+        raise ValueError(
+            f"joystick chunk must have shape [H,{expected_dim}], got {scaled.shape}"
+        )
+    scaled[:, :-1] *= float(action_scale)
     return scaled
 
 
-def compose_target_xyz(pred_xyz, current_xyz, target_mode):
+def compose_target_xyz(
+    pred_xyz,
+    current_xyz,
+    target_mode,
+    joystick_command_xyz=None,
+):
     """Convert a policy XYZ row into an absolute TCP target.
 
     Joystick rows are incremental commands (already deployment-scaled);
-    abs/delta policy rows are already absolute by this boundary.
+    abs/delta policy rows are already absolute by this boundary. By default a
+    joystick row is anchored at the measured TCP. Passing joystick_command_xyz
+    instead advances from a persistent commanded target, matching the VR data
+    collector's forward-command action semantics.
     """
     pred = np.asarray(pred_xyz, dtype=np.float64)
     if target_mode == "joystick":
-        return np.asarray(current_xyz, dtype=np.float64) + pred
+        anchor = joystick_command_xyz
+        if anchor is None:
+            anchor = current_xyz
+        if anchor is None:
+            raise ValueError("joystick target composition requires an XYZ anchor")
+        return np.asarray(anchor, dtype=np.float64) + pred
     if target_mode in ("abs", "delta"):
         return pred
     raise ValueError(f"unsupported target_mode={target_mode!r}")
+
+
+def compose_locked_rotvec_with_rz(locked_rotvec, rz_offset):
+    """Apply an accumulated base-Z rotation to a locked tool-down orientation."""
+    from scipy.spatial.transform import Rotation
+
+    locked = np.asarray(locked_rotvec, dtype=np.float64).reshape(3)
+    rz_rotation = Rotation.from_rotvec(
+        np.asarray([0.0, 0.0, float(rz_offset)], dtype=np.float64)
+    )
+    return (rz_rotation * Rotation.from_rotvec(locked)).as_rotvec()
+
+
+def stop_servo_pipeline_for_idle(
+    shared_state,
+    servo_thread,
+    stop_servo_pipeline_fn,
+):
+    """Stop and join the servo worker before IDLE or a blocking moveJ.
+
+    Merely setting the worker's ``paused`` flag is not sufficient for a safety
+    boundary: it may already have read the old target and be about to issue one
+    more servoL call. Joining guarantees no background servoL call can race a
+    subsequent moveJ or reactivate a cached rollout target.
+    """
+    if shared_state is None and servo_thread is None:
+        return None, None
+    stop_servo_pipeline_fn(shared_state, servo_thread)
+    if servo_thread is not None and servo_thread.is_alive():
+        raise RuntimeError(
+            "servo worker did not stop; refusing to enter IDLE or execute moveJ"
+        )
+    return None, None
+
+
+def read_checked_actual_tcp(rtde_r):
+    """Read a finite six-axis TCP pose, failing closed on RTDE disconnect."""
+    if rtde_r is None:
+        raise RuntimeError("RTDE receive interface is unavailable")
+    is_connected = getattr(rtde_r, "isConnected", None)
+    if callable(is_connected) and not is_connected():
+        raise RuntimeError("RTDE receive connection is down; refusing robot command")
+    pose = np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)
+    if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+        raise RuntimeError(f"invalid actual TCP pose from RTDE: {pose!r}")
+    return pose
 
 
 def select_gripper_with_open_lookahead(
@@ -554,16 +687,16 @@ def select_gripper_with_open_lookahead(
     if release_latched:
         return -1.0, True, -1
 
-    immediate = float(rows[idx, 3])
+    immediate = float(rows[idx, -1])
     if last_cmd != "close":
         return immediate, False, idx
 
     end = min(rows.shape[0] - 1, idx + lead)
-    window = rows[idx:end + 1, 3]
+    window = rows[idx:end + 1, -1]
     open_offsets = np.flatnonzero(window <= float(threshold))
     if open_offsets.size:
         source_index = idx + int(open_offsets[0])
-        return float(rows[source_index, 3]), True, source_index
+        return float(rows[source_index, -1]), True, source_index
     return immediate, False, idx
 
 
@@ -604,6 +737,20 @@ def format_duration_hms(duration_sec: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
 
 
+def format_action_log(step, xyz, gripper_cmd, rz=None) -> str:
+    """Format one concise executed-action log line."""
+    x, y, z = np.asarray(xyz, dtype=np.float64).reshape(3)
+    fields = [
+        f"x={x:+.4f}",
+        f"y={y:+.4f}",
+        f"z={z:+.4f}",
+    ]
+    if rz is not None:
+        fields.append(f"rz={float(rz):+.4f}")
+    fields.append(f"gripper={gripper_cmd}")
+    return f"[STEP {int(step)}] " + "  ".join(fields)
+
+
 def load_offline_frame(path: str, cam: str = "table_cam") -> np.ndarray:
     p = Path(path)
     if p.suffix in (".hdf5", ".h5"):
@@ -618,8 +765,22 @@ def load_offline_frame(path: str, cam: str = "table_cam") -> np.ndarray:
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
-def main():
-    args = build_parser().parse_args()
+def main(*, joystick_anchor_mode="actual", description=None):
+    """Run a rollout using actual- or commanded-pose joystick anchoring.
+
+    ``actual`` preserves the keyboard-teleoperation semantics used by this
+    module historically. ``commanded`` is selected by rollout_ur7e_vr and
+    matches VR datasets whose actions are deltas between commanded poses.
+    """
+    if joystick_anchor_mode not in ("actual", "commanded"):
+        raise ValueError(
+            "joystick_anchor_mode must be 'actual' or 'commanded', got "
+            f"{joystick_anchor_mode!r}"
+        )
+    args = build_parser(
+        description=description,
+        command_relative=(joystick_anchor_mode == "commanded"),
+    ).parse_args()
     if not np.isfinite(args.delta_scale) or args.delta_scale < 0.0:
         raise ValueError("--delta-scale must be a finite value >= 0")
     if not np.isfinite(args.action_scale) or args.action_scale < 0.0:
@@ -636,6 +797,13 @@ def main():
         raise ValueError("--execute cannot be combined with --offline-image")
     if args.execute and not args.table_cam_serial:
         raise ValueError("--execute requires --table-cam-serial")
+    task_profiles, task_switching = build_task_profiles(
+        args.task_profile, args.ckpt, args.gripper_close_mm, args.gripper_open_mm
+    )
+    active_profile_key = next(iter(task_profiles))
+    initial_profile = task_profiles[active_profile_key]
+    active_ckpt = initial_profile["ckpt"]
+    active_close_mm = initial_profile["close_mm"]
 
     # Import the battle-tested hardware utils from the ur7e_ramen_il codebase.
     rw_dir = str(Path(args.realworld_dir).resolve())
@@ -651,7 +819,25 @@ def main():
 
     print(f"[INFO] execute={args.execute} ({'ROBOT COMMANDS ENABLED' if args.execute else 'dry-run'})")
     train_hw = None if args.train_frame_hw[0] <= 0 else tuple(args.train_frame_hw)
-    policy = MiniLaWAMPolicy(args.ckpt, device=args.device, train_frame_hw=train_hw)
+    policy = MiniLaWAMPolicy(active_ckpt, device=args.device, train_frame_hw=train_hw)
+    if task_switching:
+        print("[TASK] configured profiles:")
+        for key, profile in task_profiles.items():
+            cfg = MiniLaWAMPolicy.checkpoint_config(profile["ckpt"])
+            policy.assert_hot_swap_compatible(cfg)
+            profile_target_mode = getattr(cfg, "target_mode", "abs")
+            if profile_target_mode not in ("abs", "delta", "joystick"):
+                raise ValueError(
+                    f"task {key} has unsupported target_mode={profile_target_mode!r}"
+                )
+            if profile_target_mode != "delta" and args.delta_scale != 1.0:
+                raise ValueError(
+                    f"task {key} target_mode={profile_target_mode!r} is incompatible "
+                    "with non-default --delta-scale"
+                )
+            print(f"[TASK]   key {key}: ckpt={profile['ckpt']}  "
+                  f"close={profile['close_mm']:g} mm")
+        print(f"[TASK] active key {active_profile_key}")
     if train_hw:
         print(f"[POLICY] live frames matched to training resolution {train_hw} (h, w) "
               "before the 256x256 resize")
@@ -668,11 +854,62 @@ def main():
     wrist_reader = None
     rtde_c = rtde_r = servo_state = servo_thread = None
     gripper = None
-    locked_rotvec = None
+    locked_rotvec = (
+        np.asarray(args.locked_rotvec, dtype=np.float64)
+        if args.locked_rotvec is not None
+        else DEMO_LOCKED_ROTVEC.copy()
+    )
+    locked_source = "CLI override" if args.locked_rotvec is not None else "fixed, from demos"
+    print(f"[ROT] locked_rotvec ({locked_source}) = {np.round(locked_rotvec, 4)}")
     pygame = screen = font = clock = None
+
+    def start_rollout_servo():
+        """Create a fresh servo worker anchored at the current measured TCP."""
+        nonlocal servo_state, servo_thread
+        if not args.execute:
+            return
+        if servo_thread is not None and servo_thread.is_alive():
+            raise RuntimeError("servo worker is already active")
+        read_checked_actual_tcp(rtde_r)
+        servo_state, servo_thread = start_servo_pipeline(
+            rtde_r=rtde_r, rtde_c=rtde_c, control_hz=args.servo_hz,
+            speed=args.servol_speed, acc=args.servol_acc,
+            lookahead_time=args.servol_lookahead, gain=args.servol_gain,
+            interp_alpha=args.servol_interp_alpha,
+            max_pos_step=args.servol_max_pos_step,
+            max_rot_step=args.servol_max_rot_step,
+        )
+        print("[SERVO] armed for rollout from current TCP")
+
+    def stop_rollout_servo(reason):
+        """Disarm servoL and wait until its worker has fully exited."""
+        nonlocal servo_state, servo_thread
+        if servo_state is None and servo_thread is None:
+            return
+        servo_state, servo_thread = stop_servo_pipeline_for_idle(
+            servo_state, servo_thread, stop_servo_pipeline
+        )
+        print(f"[SERVO] disarmed ({reason}); no servo target is active")
+
+    def move_home_with_servo_off():
+        """Execute moveJ only after proving the background servo worker is gone."""
+        stop_rollout_servo("before home")
+        if gripper is not None:
+            gripper.command("open")
+        move_robot_home(
+            rtde_c, rtde_r, None,
+            args.home_movej_speed, args.home_movej_acc,
+            home_q=args.home_q,
+        )
+        # A held H may have queued keyboard-repeat events while blocking in
+        # moveJ. Drop them so one press cannot launch several home motions.
+        if pygame is not None:
+            pygame.event.clear(pygame.KEYDOWN)
+        print("[HOME] complete; servo remains off until S starts a new rollout")
 
     need_wrist = bool(policy.cfg.use_wrist)
     target_mode = getattr(policy.cfg, "target_mode", "abs")
+    include_rz = bool(getattr(policy.cfg, "include_rz", False))
     # current eef xyz is needed as proprioception (use_state) and/or as the
     # composition anchor for cumulative EEF-delta targets. Joystick commands are
     # composed with the live TCP later, at each execution tick.
@@ -681,11 +918,29 @@ def main():
         raise ValueError("--delta-scale only applies to a checkpoint with target_mode='delta'")
     if target_mode not in ("abs", "delta", "joystick"):
         raise ValueError(f"unsupported checkpoint target_mode={target_mode!r}")
+    if joystick_anchor_mode == "commanded" and target_mode != "joystick":
+        raise ValueError(
+            "the VR command-relative rollout requires a checkpoint with "
+            "target_mode='joystick'"
+        )
+    if args.enable_rz and not include_rz:
+        raise ValueError(
+            "--enable-rz requires a checkpoint trained with "
+            "--target joystick --include-rz"
+        )
     print(f"[INFO] checkpoint use_wrist={need_wrist} "
           f"use_state={getattr(policy.cfg, 'use_state', False)} target={target_mode} "
+          f"include_rz={include_rz} enable_rz={args.enable_rz} "
           f"gripper_head={getattr(policy.cfg, 'gripper_head', 'regression')} "
           f"delta_scale={args.delta_scale:g}"
-          + (f" action_scale={args.action_scale:g}" if target_mode == "joystick" else ""))
+          + (f" action_scale={args.action_scale:g}"
+             f" joystick_anchor={joystick_anchor_mode}"
+             if target_mode == "joystick" else ""))
+    if joystick_anchor_mode == "commanded" and args.max_reach > 0.03:
+        print(
+            f"[WARN] command-relative max target lead is {args.max_reach:.3f} m; "
+            "start near 0.015 m and increase only after checking actual TCP tracking"
+        )
     print(f"[INFO] gripper open lookahead={args.gripper_open_lead_steps} step(s) "
           "(release latches open for the rest of each rollout)")
     if args.show_subgoal:
@@ -696,12 +951,62 @@ def main():
     latest_subgoal_overlay = None
     subgoal_inference_index = 0
 
+    def update_runtime_policy_config():
+        """Refresh checkpoint-controlled rollout semantics after a hot swap."""
+        nonlocal target_mode, need_state, include_rz
+        target_mode = getattr(policy.cfg, "target_mode", "abs")
+        include_rz = bool(getattr(policy.cfg, "include_rz", False))
+        need_state = bool(getattr(policy.cfg, "use_state", False)) or target_mode == "delta"
+        if target_mode != "delta" and args.delta_scale != 1.0:
+            raise ValueError(
+                "--delta-scale only applies to a checkpoint with target_mode='delta'"
+            )
+        if target_mode not in ("abs", "delta", "joystick"):
+            raise ValueError(f"unsupported checkpoint target_mode={target_mode!r}")
+        if joystick_anchor_mode == "commanded" and target_mode != "joystick":
+            raise ValueError(
+                "the VR command-relative rollout requires every task checkpoint "
+                "to use target_mode='joystick'"
+            )
+        if args.enable_rz and not include_rz:
+            raise ValueError(
+                "--enable-rz requires every task checkpoint to be trained with "
+                "--target joystick --include-rz"
+            )
+
+    def activate_task_profile(key):
+        """Hot-swap model weights and gripper configuration while IDLE."""
+        nonlocal active_profile_key, active_ckpt, active_close_mm
+        nonlocal latest_subgoal_overlay, subgoal_inference_index
+        profile = task_profiles.get(str(key))
+        if profile is None:
+            print(f"[TASK] no profile is assigned to key {key}")
+            return False
+        if str(key) == active_profile_key:
+            print(f"[TASK] key {key} already active: {Path(active_ckpt).name}, "
+                  f"close={active_close_mm:g} mm")
+            return True
+
+        print(f"[TASK] loading key {key}: {profile['ckpt']}")
+        policy.reload_checkpoint(profile["ckpt"])
+        update_runtime_policy_config()
+        active_profile_key = str(key)
+        active_ckpt = profile["ckpt"]
+        active_close_mm = profile["close_mm"]
+        if gripper is not None:
+            gripper.set_close_mm(active_close_mm)
+        latest_subgoal_overlay = None
+        subgoal_inference_index = 0
+        print(f"[TASK] active key {active_profile_key}: {Path(active_ckpt).name}, "
+              f"close={active_close_mm:g} mm, target={target_mode}")
+        return True
+
     def cur_state():
         if not need_state:
             return None
         if not args.execute:
             return np.zeros(3, dtype=np.float64)   # dry-run: predictions print as deltas
-        return np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)[:3]
+        return read_checked_actual_tcp(rtde_r)[:3]
 
     def predict_chunk(frame, wrist_frame):
         """Run inference and apply the target-mode-specific deployment gain."""
@@ -726,7 +1031,9 @@ def main():
         if target_mode == "delta" and args.delta_scale != 1.0:
             chunk = scale_delta_chunk(chunk, anchor_xyz, args.delta_scale)
         elif target_mode == "joystick":
-            chunk = scale_joystick_chunk(chunk, args.action_scale)
+            chunk = scale_joystick_chunk(
+                chunk, args.action_scale, include_rz=include_rz
+            )
         return chunk
 
     try:
@@ -772,27 +1079,10 @@ def main():
             print(f"[RTDE] connecting to {args.robot_ip}")
             rtde_r = rtde_receive.RTDEReceiveInterface(args.robot_ip)
             rtde_c = rtde_control.RTDEControlInterface(args.robot_ip)
-            servo_state, servo_thread = start_servo_pipeline(
-                rtde_r=rtde_r, rtde_c=rtde_c, control_hz=args.servo_hz,
-                speed=args.servol_speed, acc=args.servol_acc,
-                lookahead_time=args.servol_lookahead, gain=args.servol_gain,
-                interp_alpha=args.servol_interp_alpha,
-                max_pos_step=args.servol_max_pos_step,
-                max_rot_step=args.servol_max_rot_step,
-            )
             if args.use_gripper_control:
                 gripper = LatchedGripper(RobotiqGripper, args.robot_ip,
-                                         args.gripper_open_mm, args.gripper_close_mm,
+                                         args.gripper_open_mm, active_close_mm,
                                          args.gripper_speed, args.gripper_force)
-
-            # Locked orientation: FIXED constant (the orientation every demo used),
-            # combined with the policy's predicted xyz at each waypoint.
-            if args.locked_rotvec is not None:
-                locked_rotvec = np.asarray(args.locked_rotvec, dtype=np.float64)
-                print(f"[ROT] locked_rotvec (CLI override) = {np.round(locked_rotvec, 4)}")
-            else:
-                locked_rotvec = DEMO_LOCKED_ROTVEC.copy()
-                print(f"[ROT] locked_rotvec (fixed, from demos) = {np.round(locked_rotvec, 4)}")
 
         pygame, screen, font, clock = init_pygame(args, two_rows=need_wrist)
 
@@ -806,23 +1096,31 @@ def main():
             latest_subgoal_overlay = None
             subgoal_inference_index = 0
             # ---- idle: wait for S / H / Q ----
-            print("[IDLE] S=start  H=home  Q=quit")
+            task_keys = "/".join(task_profiles) if task_switching else ""
+            task_status = (f"task {active_profile_key}: {Path(active_ckpt).stem}  "
+                           f"close={active_close_mm:g}mm")
+            print("[IDLE] S=start  H=home  Q=quit"
+                  + (f"  {task_keys}=task" if task_keys else ""))
             while True:
-                draw_status(pygame, screen, font, "IDLE", "waiting for S / H / Q",
+                draw_status(pygame, screen, font, "IDLE", task_status,
                             frame_rgb=live_frame(), wrist_rgb=live_wrist(),
                             subgoal_rgb=latest_subgoal_overlay,
-                            video_scale=args.video_scale)
+                            video_scale=args.video_scale, task_keys=task_keys)
                 cmd = poll_cmd(pygame)
+                if cmd is not None and cmd.startswith("task:"):
+                    if task_switching:
+                        activate_task_profile(cmd.split(":", 1)[1])
+                        task_status = (
+                            f"task {active_profile_key}: {Path(active_ckpt).stem}  "
+                            f"close={active_close_mm:g}mm"
+                        )
+                    continue
                 if cmd == "start":
                     rollout_started_wall = time.time()
                     rollout_started_perf = time.perf_counter()
                     break
                 if cmd == "home" and args.execute:
-                    if gripper is not None:
-                        gripper.command("open")
-                    move_robot_home(rtde_c, rtde_r, servo_state,
-                                    args.home_movej_speed, args.home_movej_acc,
-                                    home_q=args.home_q)
+                    move_home_with_servo_off()
                 if cmd == "quit":
                     quit_all = True
                     break
@@ -832,13 +1130,22 @@ def main():
 
             # ---- rollout ----
             print(f"\n[ROLLOUT] trial={trial}"
-                  + (f"  locked_rotvec={np.round(locked_rotvec, 4)}" if args.execute else ""))
+                  + f"  locked_rotvec={np.round(locked_rotvec, 4)}"
+                  + ("  RZ=enabled" if args.enable_rz else "  RZ=locked"))
             time.sleep(max(0.0, args.startup_wait_sec))
+            start_rollout_servo()
 
             rollout_stem = format_rollout_stem(trial, rollout_started_wall)
             first_table_frame = None
-            trace = {"ckpt": str(Path(args.ckpt).resolve()), "execute": args.execute,
+            trace = {"ckpt": str(Path(active_ckpt).resolve()), "execute": args.execute,
+                     "task_profile_key": active_profile_key if task_switching else None,
+                     "gripper_close_mm": active_close_mm,
                      "target_mode": target_mode,
+                     "joystick_anchor": (
+                         joystick_anchor_mode if target_mode == "joystick" else None
+                     ),
+                     "include_rz": include_rz,
+                     "enable_rz": args.enable_rz,
                      "delta_scale": args.delta_scale,
                      "action_scale": args.action_scale if target_mode == "joystick" else None,
                      "gripper_open_lead_steps": args.gripper_open_lead_steps,
@@ -847,6 +1154,18 @@ def main():
             step = 0
             smooth = {"ema_xyz": None, "last_cmd_xyz": None}  # per-rollout smoothing state
             grip_runtime = {"last_cmd": None, "release_latched": False}
+            rotation_runtime = {"rz_accum": 0.0}
+            joystick_runtime = {"command_xyz": None}
+            if target_mode == "joystick" and joystick_anchor_mode == "commanded":
+                joystick_runtime["command_xyz"] = (
+                    read_checked_actual_tcp(rtde_r)[:3]
+                    if args.execute else np.zeros(3, dtype=np.float64)
+                )
+                print(
+                    "[CONTROL] VR command-relative XYZ initialized at "
+                    f"{np.round(joystick_runtime['command_xyz'], 4)}; "
+                    f"max target lead={args.max_reach:g} m"
+                )
 
             def select_grip_value(chunk, step_index):
                 """Apply open-only lookahead and report the release transition once."""
@@ -867,19 +1186,35 @@ def main():
                           f"(open lookahead={lead} step{'s' if lead != 1 else ''})")
                 return grip_val
 
-            def apply_waypoint(pred_xyz, grip_val, step, sub):
+            def apply_waypoint(pred_xyz, pred_rz, grip_val, step, sub):
                 """One control tick: smooth -> clamp -> servo target + gripper + trace."""
                 pred_xyz = np.asarray(pred_xyz, dtype=np.float64)
+                pred_rz = float(pred_rz)
+                if not np.isfinite(pred_rz):
+                    raise ValueError(f"non-finite predicted RZ at step {step}: {pred_rz}")
                 grip_cmd = "open" if grip_val <= args.gripper_threshold else "close"
-                # For joystick checkpoints pred_xyz is now a scaled incremental
-                # command. Compose it from the live TCP at the moment this row is
-                # executed. abs/delta policy outputs are already absolute targets.
+                # Joystick checkpoints produce scaled incremental commands. The
+                # keyboard rollout anchors each row at the live TCP; the VR entry
+                # point advances from its previous safety-clamped command target.
+                # abs/delta policy outputs are already absolute targets.
+                cur = (
+                    read_checked_actual_tcp(rtde_r)
+                    if args.execute else None
+                )
                 if target_mode == "joystick":
                     current_xyz = (
-                        np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)[:3]
-                        if args.execute else np.zeros(3, dtype=np.float64)
+                        cur[:3] if cur is not None
+                        else np.zeros(3, dtype=np.float64)
                     )
-                    command_xyz = compose_target_xyz(pred_xyz, current_xyz, target_mode)
+                    command_xyz = compose_target_xyz(
+                        pred_xyz,
+                        current_xyz,
+                        target_mode,
+                        joystick_command_xyz=(
+                            joystick_runtime["command_xyz"]
+                            if joystick_anchor_mode == "commanded" else None
+                        ),
+                    )
                 else:
                     command_xyz = compose_target_xyz(pred_xyz, None, target_mode)
                 beta = float(args.target_ema)
@@ -890,12 +1225,22 @@ def main():
                         and np.linalg.norm(smoothed_xyz - smooth["last_cmd_xyz"])
                         < args.target_deadband):
                     smoothed_xyz = smooth["last_cmd_xyz"]
+                if args.enable_rz:
+                    rotation_runtime["rz_accum"] += pred_rz
+                    target_rotvec = compose_locked_rotvec_with_rz(
+                        locked_rotvec, rotation_runtime["rz_accum"]
+                    )
+                else:
+                    target_rotvec = locked_rotvec
                 if args.execute:
-                    cur = np.asarray(rtde_r.getActualTCPPose(), dtype=np.float64)
+                    if servo_state is None:
+                        raise RuntimeError(
+                            "servo worker is not armed; refusing to queue a robot target"
+                        )
                     tgt_xyz = clamp_abs_target(smoothed_xyz, cur[:3],
                                                args.ws_min, args.ws_max, args.max_reach)
                     update_shared_servo_target(servo_state,
-                                               np.concatenate([tgt_xyz, locked_rotvec]))
+                                               np.concatenate([tgt_xyz, target_rotvec]))
                     if gripper is not None:
                         try:
                             gripper.command(grip_cmd)
@@ -903,6 +1248,15 @@ def main():
                             print(f"[GRIPPER] failed: {exc}")
                 else:
                     tgt_xyz = smoothed_xyz
+                if target_mode == "joystick" and joystick_anchor_mode == "commanded":
+                    # Persist the target that survived smoothing and safety
+                    # clamps. Any tracking residual is therefore carried into
+                    # the next policy step without allowing the target lead to
+                    # exceed --max-reach.
+                    joystick_runtime["command_xyz"] = np.asarray(
+                        tgt_xyz, dtype=np.float64
+                    ).copy()
+                    smooth["ema_xyz"] = joystick_runtime["command_xyz"].copy()
                 smooth["last_cmd_xyz"] = np.asarray(tgt_xyz, dtype=np.float64)
                 grip_runtime["last_cmd"] = grip_cmd
                 trace["steps"].append({
@@ -913,6 +1267,9 @@ def main():
                         else "absolute_target"
                     ),
                     "tgt_xyz": np.asarray(tgt_xyz, dtype=float).tolist(),
+                    "pred_rz_delta": pred_rz if include_rz else None,
+                    "rz_accum": rotation_runtime["rz_accum"] if args.enable_rz else 0.0,
+                    "tgt_rotvec": np.asarray(target_rotvec, dtype=float).tolist(),
                     "grip": float(grip_val), "grip_cmd": grip_cmd,
                 })
                 return grip_cmd
@@ -952,6 +1309,9 @@ def main():
                             subgoal_rgb=latest_subgoal_overlay,
                             video_scale=args.video_scale)
                 cmd = poll_cmd(pygame)
+                if cmd is not None and cmd.startswith("task:"):
+                    print("[TASK] switch ignored during rollout; press E, then select "
+                          "the task from the IDLE screen")
                 if cmd in ("end", "home", "quit"):
                     stop_cmd = cmd
                     break
@@ -961,29 +1321,27 @@ def main():
                     # chunks' predictions for THIS timestep (newest weighted most).
                     frame, wrist_frame = read_frames()
                     dump_frames(step, frame, wrist_frame)
-                    t_inf = time.time()
                     chunk = predict_chunk(frame, wrist_frame)
-                    inf_ms = (time.time() - t_inf) * 1e3
                     for j in range(H):
                         ensemble.setdefault(step + j, []).append(chunk[j])
-                    preds = np.asarray(ensemble.pop(step, [chunk[0]]))   # [n,4] oldest..newest
+                    preds = np.asarray(ensemble.pop(step, [chunk[0]]))
                     n = len(preds)
                     age = np.arange(n - 1, -1, -1)                        # newest -> 0
                     w = np.exp(-float(args.te_m) * age)
                     w /= w.sum()
-                    avg = (preds * w[:, None]).sum(0)                     # [4]
-                    # Ensemble-average XYZ targets/commands, but use the newest
+                    avg = (preds * w[:, None]).sum(0)
+                    # Ensemble-average motion targets/commands, but use the newest
                     # chunk for gripper timing. Only release may look ahead.
                     grip_val = select_grip_value(chunk, step_index=0)
-                    grip_cmd = apply_waypoint(avg[:3], grip_val, step, sub=0)
+                    pred_rz = avg[3] if include_rz else 0.0
+                    grip_cmd = apply_waypoint(
+                        avg[:3], pred_rz, grip_val, step, sub=0
+                    )
                     if step % 8 == 0:
-                        print("gripper chunk:", chunk[:, 3])
-                        mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
-                        xyz_label = "avg_joy_delta" if target_mode == "joystick" else "avg_xyz"
-                        print(f"[STEP {step}] inf={inf_ms:.0f}ms te_n={n}  "
-                              f"{xyz_label}={np.round(avg[:3], 4)}  "
-                              f"grip={grip_val:+.2f}->{grip_cmd}  "
-                              f"chunk_span[0->{H - 1}]={mv_H:.0f}mm")
+                        print(format_action_log(
+                            step, avg[:3], grip_cmd,
+                            rz=pred_rz if args.enable_rz else None,
+                        ))
                     step += 1
                     sleep_t = dt - (time.time() - t0)
                     if sleep_t > 0:
@@ -993,9 +1351,7 @@ def main():
                 # --- default: receding horizon, execute k waypoints per re-plan ---
                 frame, wrist_frame = read_frames()
                 dump_frames(step, frame, wrist_frame)
-                t_inf = time.time()
                 chunk = predict_chunk(frame, wrist_frame)
-                inf_ms = (time.time() - t_inf) * 1e3
                 for i in range(k):
                     t0 = time.time()
                     if args.show_camera:
@@ -1005,21 +1361,22 @@ def main():
                                     subgoal_rgb=latest_subgoal_overlay,
                                     video_scale=args.video_scale)
                     cmd = poll_cmd(pygame)
+                    if cmd is not None and cmd.startswith("task:"):
+                        print("[TASK] switch ignored during rollout; press E, then select "
+                              "the task from the IDLE screen")
                     if cmd in ("end", "home", "quit"):
                         stop_cmd = cmd
                         break
                     grip_val = select_grip_value(chunk, step_index=i)
-                    grip_cmd = apply_waypoint(chunk[i, :3], grip_val, step, sub=i)
+                    pred_rz = chunk[i, 3] if include_rz else 0.0
+                    grip_cmd = apply_waypoint(
+                        chunk[i, :3], pred_rz, grip_val, step, sub=i
+                    )
                     if i == 0:
-                        print("gripper chunk:", chunk[:, 3])
-                        mv_k = np.linalg.norm(chunk[k - 1, :3] - chunk[0, :3]) * 1e3
-                        mv_H = np.linalg.norm(chunk[-1, :3] - chunk[0, :3]) * 1e3
-                        xyz_label = "joy_delta" if target_mode == "joystick" else "pred_xyz"
-                        print(f"[STEP {step}] inf={inf_ms:.0f}ms  "
-                              f"{xyz_label}={np.round(chunk[i, :3], 4)}  "
-                              f"grip={grip_val:+.2f}->{grip_cmd}  "
-                              f"chunk_span[0->{k - 1}]={mv_k:.0f}mm "
-                              f"[0->{H - 1}]={mv_H:.0f}mm")
+                        print(format_action_log(
+                            step, chunk[i, :3], grip_cmd,
+                            rz=pred_rz if args.enable_rz else None,
+                        ))
                     step += 1
                     if step >= args.max_steps:
                         break
@@ -1031,6 +1388,9 @@ def main():
 
             if stop_cmd is not None:
                 result = {"end": "ended", "home": "go_home", "quit": "quit"}[stop_cmd]
+
+            if args.execute:
+                stop_rollout_servo("rollout finished")
 
             trace["result"] = result
             rollout_finished_wall = time.time()
@@ -1049,7 +1409,13 @@ def main():
                 summary = {
                     "trial": trial,
                     "ckpt": trace["ckpt"],
+                    "task_profile_key": trace["task_profile_key"],
+                    "gripper_close_mm": trace["gripper_close_mm"],
                     "target_mode": target_mode,
+                    "joystick_anchor": trace["joystick_anchor"],
+                    "include_rz": include_rz,
+                    "enable_rz": args.enable_rz,
+                    "final_rz_accum": rotation_runtime["rz_accum"],
                     "delta_scale": args.delta_scale,
                     "action_scale": (
                         args.action_scale if target_mode == "joystick" else None
@@ -1069,18 +1435,17 @@ def main():
                 print(f"[SUMMARY] {fp}")
 
             if result == "go_home" and args.execute:
-                if gripper is not None:
-                    gripper.command("open")
-                move_robot_home(rtde_c, rtde_r, servo_state,
-                                args.home_movej_speed, args.home_movej_acc,
-                                home_q=args.home_q)
+                move_home_with_servo_off()
             if result == "quit":
                 quit_all = True
             trial += 1
             session_rollouts += 1
 
     finally:
-        stop_servo_pipeline(servo_state, servo_thread)
+        try:
+            stop_rollout_servo("shutdown")
+        except Exception as exc:
+            print(f"[SAFETY] failed to join servo worker during shutdown: {exc}")
         if gripper is not None:
             gripper.stop()
         if reader is not None:

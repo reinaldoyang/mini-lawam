@@ -32,6 +32,53 @@ CUDA_VISIBLE_DEVICES=0 /home/iclu200/miniconda3/envs/lawam/bin/python   scripts/
 - **shuffled_vs_gt**: decode uT with someone else's latent action (z from a different, unrelated clip)
 - **roll-init**: how much the world model beats plain copy (rollout_vs_gt − init_vs_gt)
 
+### Evaluate pretrained LaWM on LeRobot v3 data
+
+Use `scripts/eval_lam_on_lerobot.py` for offline metrics on a local LeRobot v3
+dataset. This preserves the metric definitions used by the HDF5 evaluator while
+reading LeRobot episode metadata, Parquet timestamps, and shared video shards.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/eval_lam_on_lerobot.py \
+  --lerobot dataset/0827_cardboard_box_50 \
+  --camera observation.images.cam_high \
+  --gaps 48 \
+  --num-pairs 256 \
+  --batch 32 \
+  --sampling episode \
+  --seed 0 \
+  --out-dir results/lam_check/lerobot_metrics/cardboard_box_pretrained_gap48
+```
+
+For this 30 FPS dataset, `--gaps 48` evaluates the released model's 1.6-second
+training interval. The console reports `rollout_vs_gt`, `init_vs_gt`,
+`shuffled_vs_gt`, and `roll-init` for the whole frame and the most-changing
+patches. Aggregate JSON/CSV metrics, per-sample metrics, and the deterministic
+sample plan are saved under `--out-dir`.
+
+### Qualitative pretrained-subgoal comparison on LeRobot v3 data
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.viz_pretrained_subgoal \
+  --lerobot dataset/0827_cardboard_box_50 \
+  --episode 0 \
+  --camera observation.images.cam_high \
+  --gap 24 \
+  --t 40 80 120
+```
+
+At 30 FPS, `--gap 24` compares frames 0.8 seconds apart. If `--gap` is omitted,
+the script uses the pretrained YAML interval, which is 1.6 seconds or 48 frames
+for this dataset.
+
+Each report shows the current RGB frame, ground-truth future RGB frame,
+predicted and true feature-change maps, PCA projections of `u_t`, `u_hat_T`,
+and `u_T`, and a patch-level cosine-agreement map. The predicted subgoal and
+ground truth are compared in DINO feature space; the LAM does not generate a
+future RGB image. This pretrained-LAM diagnostic infers the latent action from
+`(o_t, o_T)`. Use `mini_lawam.viz_subgoal` with a trained Phase-1/Phase-2
+checkpoint when evaluating a ConvPrior prediction made from `o_t` alone.
+
 ### Evaluate on our own data
 ```bash
 cd /home/iclu200/reinaldoyang/LaWAM
@@ -229,17 +276,77 @@ remain locked. Start dry-run first by omitting `--execute`.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e_vr \
-  --ckpt results/mini_lawam/phase2_vr103_finetuned_lam.pt \
+  --ckpt results/mini_lawam/checkpoint/lam_finetuned/phase2_vr103_finetuned_lam.pt \
   --table-cam-serial 244422300964 \
   --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 \
+  --wrist-exposure 100 --wrist-gain 16 \
   --robot-ip 140.96.93.7 \
   --execute --use-gripper-control \
   --train-frame-hw 240 320 \
-  --temporal-ensemble --te-m 0.2 \
-  --action-scale 1.0 --max-reach 0.015 \
+  --temporal-ensemble --te-m 1.0 \
   --gripper-open-lead-steps 0 \
-  --servol-max-pos-step 0.002 --servol-max-rot-step 0.005 \
-  --show-camera --enable-rz
+  --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.015 \
+  --ws-min -0.165 -0.164 0.158 \
+  --ws-max 0.54 0.63 0.518 \
+  --servol-max-pos-step 0.002 \
+  --servol-max-rot-step 0.005 \
+  --trace-dir results/mini_lawam/traces \
+  --show-camera --show-subgoal \
+  --subgoal-update-steps 8 \
+  --action-scale 1.0 \
+  --enable-rz
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e_vr \
+  --ckpt results/mini_lawam/checkpoint/vr_controller/ckpt_new_vr_teleop_egg_rz_103ep_256_attn_rz_binary_grip_t1.pt \
+  --table-cam-serial 244422300964 \
+  --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 \
+  --wrist-exposure 100 --wrist-gain 16 \
+  --robot-ip 140.96.93.7 \
+  --execute --use-gripper-control \
+  --train-frame-hw 240 320 \
+  --temporal-ensemble --te-m 1.0 \
+  --gripper-open-lead-steps 0 \
+  --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.015 \
+  --ws-min -0.165 -0.164 0.158 \
+  --ws-max 0.54 0.63 0.518 \
+  --servol-max-pos-step 0.002 \
+  --servol-max-rot-step 0.005 \
+  --trace-dir results/mini_lawam/traces \
+  --show-camera --show-subgoal \
+  --subgoal-update-steps 8 \
+  --action-scale 1.0 \
+  --enable-rz
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.rollout_ur7e_vr \
+  --ckpt results/mini_lawam/checkpoint/vr_controller/ckpt_new_vr_teleop_egg_rz_103ep_256_attn_rz_binary_grip_t1.pt \
+  --table-cam-serial 244422300964 \
+  --wrist-cam-serial 252122300792 \
+  --table-exposure 180 --table-gain 16 \
+  --wrist-exposure 100 --wrist-gain 16 \
+  --robot-ip 140.96.93.7 \
+  --execute --use-gripper-control \
+  --train-frame-hw 240 320 \
+  --exec-steps 24 \
+  --gripper-open-lead-steps 0 \
+  --target-ema 1.0 --target-deadband 0.0 \
+  --max-reach 0.015 \
+  --ws-min -0.165 -0.164 0.158 \
+  --ws-max 0.54 0.63 0.518 \
+  --servol-max-pos-step 0.002 \
+  --servol-max-rot-step 0.005 \
+  --trace-dir results/mini_lawam/traces \
+  --show-camera --show-subgoal \
+  --subgoal-update-steps 8 \
+  --action-scale 1.0 \
+  --enable-rz
 ```
 
 ### Check camera serial number

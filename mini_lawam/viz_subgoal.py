@@ -23,10 +23,17 @@ Example:
     CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.viz_subgoal \
         --ckpt results/mini_lawam/prior_phase1.pt --hdf5 dataset/multi_egg_114ep.hdf5 \
         --demo demo_0 --t 40
+
+LeRobot v3 example (only the requested frames are decoded):
+    CUDA_VISIBLE_DEVICES=0 python -m mini_lawam.viz_subgoal \
+        --ckpt results/mini_lawam/prior_phase1.pt \
+        --lerobot dataset/0827_cardboard_box_50 --episode 0 \
+        --camera observation.images.cam_high --t 40 80 120
 """
 
 import argparse
 import os
+from contextlib import ExitStack
 
 import h5py
 import matplotlib
@@ -38,9 +45,13 @@ import torch.nn.functional as F
 from torchvision.transforms import v2
 
 from latent_action_model.data_loader.video_aug import gpu_two_view_video_aug
+from mini_lawam.lerobot_video import LeRobotEpisodeSource
 from mini_lawam.model import MiniLaWAM, MiniLaWAMConfig
 
 GRID = 16  # DINO 256x256 / patch16 -> 16x16 tokens
+DEFAULT_HDF5 = "dataset/multi_egg.hdf5"
+DEFAULT_LEROBOT_CAMERA = "observation.images.cam_high"
+DEFAULT_LEROBOT_WRIST_CAMERA = "observation.images.cam_left_wrist"
 
 
 def to_grid(tok: torch.Tensor) -> np.ndarray:
@@ -64,8 +75,24 @@ def joint_pca_rgb(feats):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="results/mini_lawam/prior_phase1.pt")
-    ap.add_argument("--hdf5", default="dataset/multi_egg.hdf5")
-    ap.add_argument("--demo", default=None, help="demo key; default = first")
+    source_group = ap.add_mutually_exclusive_group()
+    source_group.add_argument(
+        "--hdf5",
+        default=None,
+        help=f"robomimic HDF5 dataset (default when no source is given: {DEFAULT_HDF5})",
+    )
+    source_group.add_argument(
+        "--lerobot",
+        default=None,
+        help="local LeRobot v3 dataset directory",
+    )
+    ap.add_argument("--demo", default=None, help="HDF5 demo key; default = first")
+    ap.add_argument("--episode", type=int, default=None,
+                    help="LeRobot episode_index; default = first episode")
+    ap.add_argument("--camera", default=DEFAULT_LEROBOT_CAMERA,
+                    help="LeRobot main camera video feature key")
+    ap.add_argument("--wrist-camera", default=DEFAULT_LEROBOT_WRIST_CAMERA,
+                    help="LeRobot wrist camera key (used when cfg.use_wrist=True)")
     ap.add_argument("--t", type=int, nargs="+", default=[0],
                     help="one or more start frames, e.g. --t 0 40 80")
     ap.add_argument("--wrist-key", default="wrist_cam",
@@ -76,6 +103,12 @@ def main():
     args = ap.parse_args()
     if args.dpi < 1:
         raise ValueError("--dpi must be >= 1")
+    if args.hdf5 is None and args.lerobot is None:
+        args.hdf5 = DEFAULT_HDF5
+    if args.lerobot is not None and args.demo is not None:
+        ap.error("--demo applies to --hdf5; use --episode with --lerobot")
+    if args.hdf5 is not None and args.episode is not None:
+        ap.error("--episode applies to --lerobot; use --demo with --hdf5")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -89,25 +122,62 @@ def main():
     print(f"ckpt: {args.ckpt} (phase={ck.get('phase', '?')}, step={ck.get('step', '?')}) "
           f"| future_horizon={H}")
 
-    with h5py.File(args.hdf5, "r") as f:
-        demo = args.demo or list(f["data"].keys())[0]
-        obs = f["data"][demo]["obs"]
-        cam = obs["table_cam"]
-        wrist_cam = None
-        if cfg.use_wrist:
-            if args.wrist_key not in obs:
-                raise KeyError(
-                    f"checkpoint uses wrist input, but demo {demo!r} has no "
-                    f"obs/{args.wrist_key!s}"
-                )
-            wrist_cam = obs[args.wrist_key]
-        T = cam.shape[0]
+    with ExitStack() as stack:
+        if args.lerobot is not None:
+            camera_keys = [args.camera]
+            if cfg.use_wrist:
+                camera_keys.append(args.wrist_camera)
+            source = LeRobotEpisodeSource.open(
+                args.lerobot,
+                episode_index=args.episode,
+                camera_keys=camera_keys,
+            )
+            sample_name = f"episode_{source.episode_index:06d}"
+            T = source.length
+
+            def load_main_frames(indices):
+                return source.frames(args.camera, indices)
+
+            def load_wrist_frame(index):
+                return source.frames(args.wrist_camera, [index])[0]
+
+            print(
+                f"dataset: {source.root} (LeRobot {source.info.get('codebase_version', '?')}) "
+                f"| episode={source.episode_index} | frames={T} | camera={args.camera}"
+            )
+        else:
+            hdf5_file = stack.enter_context(h5py.File(args.hdf5, "r"))
+            demo = args.demo or list(hdf5_file["data"].keys())[0]
+            obs = hdf5_file["data"][demo]["obs"]
+            cam = obs["table_cam"]
+            wrist_cam = None
+            if cfg.use_wrist:
+                if args.wrist_key not in obs:
+                    raise KeyError(
+                        f"checkpoint uses wrist input, but demo {demo!r} has no "
+                        f"obs/{args.wrist_key!s}"
+                    )
+                wrist_cam = obs[args.wrist_key]
+            sample_name = demo
+            T = cam.shape[0]
+
+            def load_main_frames(indices):
+                return np.asarray([cam[index] for index in indices])
+
+            def load_wrist_frame(index):
+                if wrist_cam is None:
+                    raise RuntimeError("wrist frame requested for a checkpoint without wrist input")
+                return wrist_cam[index]
+
         for t in args.t:
+            if t < 0:
+                print(f"skip t={t}: frame index must be non-negative")
+                continue
             if t + H >= T:
                 print(f"skip t={t}: t+{H} beyond episode length {T}")
                 continue
-            raw_t, raw_T = cam[t], cam[t + H]                     # (H,W,3) u8
-            raw_wrist = wrist_cam[t] if wrist_cam is not None else None
+            raw_t, raw_T = load_main_frames([t, t + H])          # (H,W,3) u8
+            raw_wrist = load_wrist_frame(t) if cfg.use_wrist else None
 
             def prep(img):
                 x = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)
@@ -152,7 +222,7 @@ def main():
             img_T = np.asarray(prep(raw_T).permute(1, 2, 0))
             if wt is None:
                 panels = [
-                    (img_t, None, f"table o_t ({demo} t={t})"),
+                    (img_t, None, f"table o_t ({sample_name} t={t})"),
                     (img_T, None, f"table o_T true (t={t + H})"),
                     (chg_pred, "pred change ||u_hat_T - u_t||",
                      "where model PREDICTS motion"),
@@ -167,7 +237,7 @@ def main():
                 ncols, figsize = 4, (18, 9)
             else:
                 panels = [
-                    (img_t, None, f"table o_t ({demo} t={t})"),
+                    (img_t, None, f"table o_t ({sample_name} t={t})"),
                     (img_wrist, None, "wrist o_t (action-head input)"),
                     (img_T, None, f"table o_T true (t={t + H})"),
                     (chg_pred, "pred change ||u_hat_T - u_t||",
@@ -196,11 +266,11 @@ def main():
                     fig.colorbar(m, ax=ax, fraction=0.046)
                 ax.set_title(title, fontsize=10)
                 ax.axis("off")
-            out = os.path.join(args.out_dir, f"{demo}_t{t}.png")
+            out = os.path.join(args.out_dir, f"{sample_name}_t{t}.png")
             wrist_note = " + wrist" if wt is not None else ""
             fig.suptitle(
                 f"Mini-LaWAM DINO feature-space report{wrist_note} — "
-                f"{demo}, t={t}, horizon={H}",
+                f"{sample_name}, t={t}, horizon={H}",
                 fontsize=15,
             )
             fig.tight_layout(rect=(0, 0, 1, 0.96), h_pad=2.4, w_pad=1.2)
